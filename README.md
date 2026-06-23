@@ -18,7 +18,7 @@ One storage engine, one cluster, two consistency regimes — chosen by the schem
 | **1** | Single-node storage engine — WAL, MVCC, SSTables, crash recovery, single-node Percolator | ✅ **implemented & tested** |
 | 1b | Storage hardening — leveled compaction, bloom filters, block cache, version-set | ⏳ non-blocking backlog |
 | 2 | gRPC/`tonic` network layer + client SDK | 🔜 next |
-| 3–6 | Regions + PD/TSO · per-region Raft · distributed Percolator + AP HLC/LWW · rebalance/anti-entropy/chaos | 📐 designed ([`arcux.md`](arcux.md)) |
+| 3–6 | Regions + PD/TSO · per-region Raft · distributed Percolator + AP HLC/LWW · rebalance/anti-entropy/chaos | 📐 designed |
 
 The single-node transactional engine is **correct and durable today**; the distributed layers are designed and in progress.
 
@@ -54,7 +54,6 @@ cargo test --features proptests   # include property tests
 ## Repository layout
 
 ```
-arcux.md                 # full design spec + 6-phase implementation plan
 Cargo.toml               # workspace
 rust-toolchain.toml
 engine/                  # Phase 1: the storage engine crate (arcux-engine)
@@ -71,11 +70,11 @@ engine/                  # Phase 1: the storage engine crate (arcux-engine)
   tests/                 # WAL, crash recovery, MVCC/SI, Percolator
 ```
 
-Later phases add `raft/`, `region/`, `pd/`, `rpc/`, `client/`, `server/`, and friends (see [`arcux.md`](arcux.md)).
+Later phases add `raft/`, `region/`, `pd/`, `rpc/`, `client/`, `server/`, and friends.
 
 ## Roadmap
 
-`P1 ✅ → P2 (RPC) → P3 (regions + PD/TSO) → P4 (per-region Raft) → P5 (distributed Percolator CP + HLC/LWW AP) → P6 (rebalance · anti-entropy · chaos · security)`, with **P1b** (compaction · bloom · cache · version-set) as a non-blocking hardening track. Full detail and rationale in [`arcux.md`](arcux.md).
+`P1 ✅ → P2 (RPC) → P3 (regions + PD/TSO) → P4 (per-region Raft) → P5 (distributed Percolator CP + HLC/LWW AP) → P6 (rebalance · anti-entropy · chaos · security)`, with **P1b** (compaction · bloom · cache · version-set) as a non-blocking hardening track.
 
 ## License
 
