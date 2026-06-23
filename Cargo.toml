@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["engine"]
+
+# Phase 1 populates only `engine/`. Later phases add `raft/`, `region/`, `txn/`,
+# `pd/`, `rpc/`, `client/`, `server/`, `obs/`, `bench/`, `chaos/` (see README).
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "arcux"
+
+[workspace.dependencies]
+crossbeam-skiplist = "0.1"
+crossbeam-channel = "0.5"
+crc32c = "0.6"
+thiserror = "2"
+parking_lot = "0.12"
+libc = "0.2"
+proptest = "1"
+tempfile = "3"
+
+[profile.release]
+debug = 1

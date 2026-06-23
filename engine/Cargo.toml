@@ -1,0 +1,23 @@
+[package]
+name = "arcux-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "arcux Phase 1: single-node LSM storage engine (WAL + MVCC + single-node Percolator)."
+
+[dependencies]
+crossbeam-skiplist.workspace = true
+crossbeam-channel.workspace = true
+crc32c.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+
+[features]
+# Opt-in property tests (slower). Run with: cargo test --features proptests
+# (named `proptests`, plural, to avoid colliding with the `proptest` dependency).
+proptests = []

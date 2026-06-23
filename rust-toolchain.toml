@@ -1,0 +1,6 @@
+# Pinned to the `stable` channel (currently 1.93.0 on this machine). For release
+# reproducibility this can be pinned to an exact version, e.g. channel = "1.93.0",
+# once that named toolchain is installed (`rustup toolchain install 1.93.0`).
+[toolchain]
+channel = "stable"
+profile = "minimal"
