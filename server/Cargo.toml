@@ -1,0 +1,26 @@
+[package]
+name = "arcux-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "arcux Phase 2: tonic gRPC server exposing the single-node engine."
+
+[lib]
+name = "arcux_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arcux-server"
+path = "src/main.rs"
+
+[dependencies]
+arcux-engine = { path = "../engine" }
+arcux-rpc = { path = "../rpc" }
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+prost.workspace = true
+
+[dev-dependencies]
+arcux-client = { path = "../client" }
+tempfile.workspace = true
