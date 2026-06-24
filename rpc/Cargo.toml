@@ -1,0 +1,15 @@
+[package]
+name = "arcux-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "arcux Phase 2: frozen gRPC wire contract (kv/raft/pd) + generated tonic/prost code."
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+protoc-bin-vendored.workspace = true

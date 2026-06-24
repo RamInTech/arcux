@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+// arcux Raft wire contract — v1 (frozen, implemented in Phase 4).
+//
+// All handlers return UNIMPLEMENTED in Phase 2; the shapes — including the
+// server-streaming AppendEntries pipeline — are fixed now so Phase 4 plugs in
+// without protocol churn. Field numbers are append-only; every message reserves 50-99.
+
+package raft;
+
+service RaftService {
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  // Server-streaming to establish the Phase-4 replication pipeline shape.
+  rpc AppendEntries(AppendEntriesRequest) returns (stream AppendEntriesResponse);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
+message LogEntry {
+  uint64 term = 1;
+  uint64 index = 2;
+  bytes data = 3;
+  reserved 50 to 99;
+}
+
+message RequestVoteRequest {
+  uint64 term = 1;
+  uint64 candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+  reserved 50 to 99;
+}
+message RequestVoteResponse {
+  uint64 term = 1;
+  bool vote_granted = 2;
+  reserved 50 to 99;
+}
+
+message AppendEntriesRequest {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated LogEntry entries = 5;
+  uint64 leader_commit = 6;
+  reserved 50 to 99;
+}
+message AppendEntriesResponse {
+  uint64 term = 1;
+  bool success = 2;
+  uint64 match_index = 3;
+  reserved 50 to 99;
+}
+
+message InstallSnapshotRequest {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  uint64 last_included_index = 3;
+  uint64 last_included_term = 4;
+  bytes data = 5;
+  reserved 50 to 99;
+}
+message InstallSnapshotResponse {
+  uint64 term = 1;
+  reserved 50 to 99;
+}

@@ -1,0 +1,158 @@
+syntax = "proto3";
+
+// arcux KV wire contract — v1 (frozen).
+//
+// Compatibility rules:
+//   * Field numbers are append-only — never renumber or reuse a removed number.
+//   * Removed fields move into a `reserved` range.
+//   * New fields must be optional/defaulted so existing peers stay compatible.
+// Every message reserves 50-99 for forward-compatible additions.
+
+package kv;
+
+service KvService {
+  // Allocate a transaction start timestamp.
+  rpc Begin(BeginRequest) returns (BeginResponse);
+  // Prewrite every mutation (primary first); conflicts come back as KeyErrors.
+  rpc Prewrite(PrewriteRequest) returns (PrewriteResponse);
+  // Commit a prewritten transaction; the server allocates commit_ts.
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  // Snapshot point read (read_ts = 0 => server picks "now").
+  rpc Get(GetRequest) returns (GetResponse);
+  // Autocommit single-key put.
+  rpc Put(PutRequest) returns (PutResponse);
+  // Autocommit single-key delete.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  // Snapshot range scan — wire frozen now; server returns UNIMPLEMENTED until the
+  // Phase 1b merging iterator lands.
+  rpc Scan(ScanRequest) returns (ScanResponse);
+}
+
+enum Op {
+  PUT = 0;
+  DELETE = 1;
+}
+
+message Mutation {
+  Op op = 1;
+  bytes key = 2;
+  bytes value = 3;  // empty for DELETE
+  reserved 50 to 99;
+}
+
+// --- structured per-key error model (frozen; some variants unused on a single node) ---
+
+message Conflict {
+  string detail = 1;
+}
+
+message Locked {
+  bytes primary = 1;
+  uint64 lock_ts = 2;
+  uint64 ttl = 3;
+  string detail = 4;
+}
+
+message NotLeader {
+  bytes leader_hint = 1;  // unused on a single node (always leader)
+}
+
+message RegionStale {
+  uint64 new_epoch = 1;   // unused until regions exist (Phase 3+)
+}
+
+message KeyError {
+  oneof kind {
+    Conflict conflict = 1;        // write-after-snapshot / concurrent prewrite
+    Locked locked = 2;            // structured lock info (reserved for richer prewrite)
+    string invalid = 3;           // bad argument
+    string retryable = 4;         // key locked by an in-flight txn => back off & retry
+    NotLeader not_leader = 5;     // frozen; not emitted single-node
+    RegionStale region_stale = 6; // frozen; not emitted single-node
+  }
+  reserved 50 to 99;
+}
+
+// --- RPC messages ---
+
+message BeginRequest {
+  reserved 50 to 99;
+}
+message BeginResponse {
+  uint64 start_ts = 1;
+  reserved 50 to 99;
+}
+
+message PrewriteRequest {
+  uint64 start_ts = 1;
+  bytes primary = 2;
+  repeated Mutation mutations = 3;
+  uint64 ttl = 4;
+  reserved 50 to 99;
+}
+message PrewriteResponse {
+  repeated KeyError errors = 1;  // empty => all keys prewritten
+  reserved 50 to 99;
+}
+
+message CommitRequest {
+  uint64 start_ts = 1;
+  bytes primary = 2;
+  repeated bytes keys = 3;  // all keys in the txn (primary + secondaries)
+  reserved 50 to 99;
+}
+message CommitResponse {
+  uint64 commit_ts = 1;
+  KeyError error = 2;
+  reserved 50 to 99;
+}
+
+message GetRequest {
+  bytes key = 1;
+  uint64 read_ts = 2;  // 0 => server allocates "now"
+  reserved 50 to 99;
+}
+message GetResponse {
+  bool found = 1;
+  bytes value = 2;
+  KeyError error = 3;
+  uint64 read_ts = 4;  // the snapshot actually used
+  reserved 50 to 99;
+}
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+  reserved 50 to 99;
+}
+message PutResponse {
+  uint64 commit_ts = 1;
+  KeyError error = 2;
+  reserved 50 to 99;
+}
+
+message DeleteRequest {
+  bytes key = 1;
+  reserved 50 to 99;
+}
+message DeleteResponse {
+  uint64 commit_ts = 1;
+  KeyError error = 2;
+  reserved 50 to 99;
+}
+
+message Kv {
+  bytes key = 1;
+  bytes value = 2;
+}
+message ScanRequest {
+  bytes start_key = 1;
+  bytes end_key = 2;
+  uint32 limit = 3;
+  uint64 read_ts = 4;
+  reserved 50 to 99;
+}
+message ScanResponse {
+  repeated Kv pairs = 1;
+  reserved 50 to 99;
+}

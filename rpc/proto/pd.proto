@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+// arcux Placement Driver wire contract — v1 (frozen).
+//
+// GetTimestamp is served from the node's local TSO stand-in in Phase 2; GetRegion
+// and Heartbeat are frozen but UNIMPLEMENTED until regions/PD exist (Phase 3+).
+// Field numbers are append-only; every message reserves 50-99.
+
+package pd;
+
+service PdService {
+  rpc GetTimestamp(GetTimestampRequest) returns (GetTimestampResponse);
+  rpc GetRegion(GetRegionRequest) returns (GetRegionResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message GetTimestampRequest {
+  uint32 count = 1;  // number of timestamps requested (>= 1)
+  reserved 50 to 99;
+}
+message GetTimestampResponse {
+  uint64 timestamp = 1;  // first allocated ts; [timestamp, timestamp+count) are reserved
+  uint32 count = 2;
+  reserved 50 to 99;
+}
+
+message GetRegionRequest {
+  bytes key = 1;
+  reserved 50 to 99;
+}
+message GetRegionResponse {
+  uint64 region_id = 1;
+  bytes start_key = 2;
+  bytes end_key = 3;
+  uint64 epoch = 4;
+  reserved 50 to 99;
+}
+
+message HeartbeatRequest {
+  uint64 node_id = 1;
+  reserved 50 to 99;
+}
+message HeartbeatResponse {
+  reserved 50 to 99;
+}

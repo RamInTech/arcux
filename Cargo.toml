@@ -1,9 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["engine"]
+members = ["engine", "rpc", "server", "client"]
 
-# Phase 1 populates only `engine/`. Later phases add `raft/`, `region/`, `txn/`,
-# `pd/`, `rpc/`, `client/`, `server/`, `obs/`, `bench/`, `chaos/` (see README).
+# Phase 1 populated `engine/`. Phase 2 adds the network layer: `rpc/` (frozen wire
+# contract), `server/` (tonic server over the engine), `client/` (async SDK). Later
+# phases add `raft/`, `region/`, `txn/`, `pd/`, `obs/`, `bench/`, `chaos/` (see README).
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +13,7 @@ license = "MIT OR Apache-2.0"
 repository = "arcux"
 
 [workspace.dependencies]
+# Phase 1 — engine
 crossbeam-skiplist = "0.1"
 crossbeam-channel = "0.5"
 crc32c = "0.6"
@@ -20,6 +22,16 @@ parking_lot = "0.12"
 libc = "0.2"
 proptest = "1"
 tempfile = "3"
+
+# Phase 2 — network layer (tonic 0.14 splits prost codegen into tonic-prost-build /
+# tonic-prost; keep tonic / tonic-prost(-build) / prost on the same 0.14 line).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [profile.release]
 debug = 1
