@@ -54,6 +54,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcux-raft"
+version = "0.1.0"
+
+[[package]]
 name = "arcux-rpc"
 version = "0.1.0"
 dependencies = [

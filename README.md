@@ -21,13 +21,17 @@ One storage engine, one cluster, two consistency regimes — chosen by the schem
 | 2b | RPC hardening — idempotency dedup, backpressure/`Overloaded`, blocking client, soak test | ⏳ non-blocking backlog |
 | **3** | Range-sharding foundations (single-node slice) — regions + epochs, the Placement Driver (cluster TSO + routing), region-aware client with `RegionStale` retry | ✅ **implemented & tested** |
 | 3b | Multi-node distribution — regions placed across nodes · region merge · membership/failure detector · HLC TSO | ⏳ pending (remainder of P3 DoD) |
-| 4–6 | Per-region Raft · distributed Percolator + AP HLC/LWW · rebalance/anti-entropy/chaos | 📐 designed |
+| **4** | Consensus core — hand-rolled Raft: leader election · log replication · commit safety · persistence, proven on a deterministic in-process cluster | ✅ **core implemented & tested** |
+| 4b | Raft integration — bind regions to groups · leader routing/`NotLeader` · WAL-backed log · snapshots · membership · MultiRaft · PD-on-Raft | ⏳ pending (remainder of P4 DoD) |
+| 5–6 | distributed Percolator + AP HLC/LWW · rebalance · anti-entropy · chaos | 📐 designed |
 
-A region-aware client now routes through a Placement Driver to a **single** data node,
+A region-aware client routes through a Placement Driver to a **single** data node,
 with epoch-versioned regions, a restart-safe cluster timestamp oracle, and transparent
-`RegionStale` recovery on split. Spreading regions **across** nodes (plus merge and
-membership) is the remaining Phase-3 work, tracked as **3b**; replication (Raft) and
-cross-region transactions (4–6) are designed.
+`RegionStale` recovery on split. The Phase-4 **Raft core** — leader election, log
+replication, and the commit-safety rules — is now implemented as a standalone,
+deterministically-tested crate. Spreading regions **across** nodes (**3b**) and binding
+each region to a Raft group (the P4 integration step) are the next moves; the
+cross-region transaction layer (5–6) is designed.
 
 ## What's implemented (Phase 1)
 
@@ -59,14 +63,28 @@ awareness in the server and client:
 - **Routing** — PD aggregates the regions nodes report via heartbeat and serves `GetRegion`/`ListRegions`. The region-aware client caches routes, stamps a `Context` (region id + epoch) on every request, and on a `RegionStale` reply re-resolves from PD and retries — so a split is invisible to application code.
 - **Compatibility** — all additive on the frozen wire contract (`VERSION` 2): a `Context` on the KV requests, a node `SplitRegion`, and `pd.Region`/`ListRegions`. The Phase-2 direct path (no `Context`) is unchanged, so single-node callers need no PD.
 
+## What's implemented (Phase 4)
+
+The hand-rolled consensus core — the [`raft/`](raft/) crate (`arcux-raft`) — built
+transport-free so the whole protocol can be proven deterministically before it is wired
+into regions:
+
+- **Raft state machine (Figure 2)** — follower/candidate/leader roles, randomized election timeouts, `RequestVote` with the up-to-date-log restriction, and `AppendEntries` enforcing the **Log Matching** property on every append.
+- **Commit safety** — `commit_index` advances only to an entry of the leader's *current* term backed by a majority `match_index` (the Figure-8 rule), so a stale leader can never commit a divergent entry; **State Machine Safety** is asserted continuously by the harness.
+- **Persistence & restart** — term, vote, and log are written through a `Storage` trait before the node acts on them; a node rebuilt from persisted state recovers term/vote/log and never double-votes.
+- **Two clean integration seams** — a `Storage` trait (an engine/WAL-backed impl drops in later) and a `Message`/`Entry` model that maps 1:1 onto the frozen [`raft.proto`](rpc/proto/raft.proto) RPCs, so binding a region to a group, routing to the leader, and applying committed entries into the region's engine is wiring, not a rewrite.
+
+Snapshots / log compaction (`InstallSnapshot`) and single-server membership changes are
+the next Phase-4 milestone; the wire contract already reserves room for both.
+
 ### Tested
 
 ```
-cargo test                       # 60 tests (39 engine + 3 rpc schema + 10 PD + 8 server e2e)
+cargo test                       # 70 tests (39 engine + 3 rpc schema + 10 PD + 10 raft + 8 server e2e)
 cargo test --features proptests  # + property tests
 ```
 
-Phase 1 highlights: a process-`SIGKILL` recovery oracle (zero acknowledged-write loss across random kill points), and a concurrent **bank-transfer conserved-sum** test proving Snapshot Isolation under contention (which surfaced — and the code now guards against — two subtle concurrency bugs: cross-CF read atomicity and conditional lock ownership). Phase 2 adds in-process gRPC end-to-end tests: full-transaction visibility, cross-network prewrite conflict, snapshot-`commit_ts` reads, and a frozen-but-`Unimplemented` `Scan`. Phase 3 stands up an in-process cluster (PD + node + routed client) and proves the routing path: a TSO restart-safety check, a region split bumping the epoch, and a stale client transparently recovering via `RegionStale` → refresh → retry.
+Phase 1 highlights: a process-`SIGKILL` recovery oracle (zero acknowledged-write loss across random kill points), and a concurrent **bank-transfer conserved-sum** test proving Snapshot Isolation under contention (which surfaced — and the code now guards against — two subtle concurrency bugs: cross-CF read atomicity and conditional lock ownership). Phase 2 adds in-process gRPC end-to-end tests: full-transaction visibility, cross-network prewrite conflict, snapshot-`commit_ts` reads, and a frozen-but-`Unimplemented` `Scan`. Phase 3 stands up an in-process cluster (PD + node + routed client) and proves the routing path: a TSO restart-safety check, a region split bumping the epoch, and a stale client transparently recovering via `RegionStale` → refresh → retry. Phase 4 drives a deterministic in-process Raft cluster through election, replication, isolated-follower catch-up, a minority-partition liveness/safety split, restart-persistence, and a randomized partition/heal fuzz (24 seeds) that asserts State Machine Safety after every step.
 
 ## Build & test
 
@@ -102,15 +120,20 @@ pd/                      # Phase 3: Placement Driver (arcux-pd) — cluster TSO 
   src/tso.rs             # restart-safe timestamp oracle
   src/region.rs          # regions + epoch-versioned registry (route/split/persist)
   src/service.rs         # the pd.PdService gRPC impl
+raft/                    # Phase 4: hand-rolled Raft consensus core (arcux-raft)
+  src/node.rs            # the RaftNode state machine (Figure 2): election + replication + commit
+  src/storage.rs         # Storage trait + in-memory impl (term/vote/log persistence)
+  src/message.rs         # wire-agnostic Message/Entry (maps onto raft.proto)
+  tests/cluster.rs       # deterministic in-process cluster: partitions, restart, safety fuzz
 server/                  # Phase 2/3: tonic server (arcux-server) over the engine + region routing
 client/                  # Phase 2/3: async client SDK (arcux-client), region-aware via PD
 ```
 
-Later phases add `raft/` and friends.
+Later phases add `txn/` and friends.
 
 ## Roadmap
 
-`P1 ✅ → P2 ✅ (RPC) → P3 ✅ (regions + PD/TSO, single-node slice) → P3b (multi-node distribution) → P4 (per-region Raft) → P5 (distributed Percolator CP + HLC/LWW AP) → P6 (rebalance · anti-entropy · chaos · security)`, with **P1b** (compaction · bloom · cache · version-set) and **P2b** (RPC hardening) as non-blocking tracks.
+`P1 ✅ → P2 ✅ (RPC) → P3 ✅ (regions + PD/TSO, single-node slice) → P3b (multi-node distribution) → P4 ✅ (Raft consensus core, in isolation) → P4b (bind regions to groups · WAL-backed log · snapshots · membership · MultiRaft) → P5 (distributed Percolator CP + HLC/LWW AP) → P6 (rebalance · anti-entropy · chaos · security)`, with **P1b** (compaction · bloom · cache · version-set) and **P2b** (RPC hardening) as non-blocking tracks.
 
 ## License
 

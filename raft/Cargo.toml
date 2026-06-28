@@ -1,0 +1,15 @@
+[package]
+name = "arcux-raft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Phase 4 — the hand-rolled Raft consensus core, built transport-free so it can be
+# proven with a deterministic in-process cluster. No async, no network, no engine:
+# inputs are `tick`/`step`/`propose`, outputs are messages + committed entries. The
+# Phase-4 integration step binds these to the frozen `raft.proto` and the engine.
+
+[dependencies]
+
+[dev-dependencies]

@@ -1,11 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["engine", "rpc", "pd", "server", "client"]
+members = ["engine", "rpc", "pd", "raft", "server", "client"]
 
 # Phase 1 populated `engine/`. Phase 2 added the network layer: `rpc/` (frozen wire
 # contract), `server/` (tonic server over the engine), `client/` (async SDK). Phase 3
-# adds `pd/` — the Placement Driver: the cluster TSO + region registry/router. Later
-# phases add `raft/`, `txn/`, `obs/`, `bench/`, `chaos/` (see README).
+# adds `pd/` — the Placement Driver: the cluster TSO + region registry/router. Phase 4
+# adds `raft/` — the hand-rolled consensus core. Later phases add `txn/`, `obs/`,
+# `bench/`, `chaos/` (see README).
 
 [workspace.package]
 version = "0.1.0"
