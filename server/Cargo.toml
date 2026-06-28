@@ -3,7 +3,7 @@ name = "arcux-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "arcux Phase 2: tonic gRPC server exposing the single-node engine."
+description = "arcux Phase 2/3: tonic gRPC server exposing the engine, with region routing."
 
 [lib]
 name = "arcux_server"
@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 arcux-engine = { path = "../engine" }
 arcux-rpc = { path = "../rpc" }
+arcux-pd = { path = "../pd" }
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true

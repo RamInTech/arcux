@@ -42,6 +42,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcux-pd"
+version = "0.1.0"
+dependencies = [
+ "arcux-rpc",
+ "prost",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
 name = "arcux-rpc"
 version = "0.1.0"
 dependencies = [
@@ -58,6 +70,7 @@ version = "0.1.0"
 dependencies = [
  "arcux-client",
  "arcux-engine",
+ "arcux-pd",
  "arcux-rpc",
  "prost",
  "tempfile",
