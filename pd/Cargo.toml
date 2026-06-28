@@ -1,0 +1,24 @@
+[package]
+name = "arcux-pd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "arcux Phase 3: Placement Driver — the cluster TSO + region registry/router."
+
+[lib]
+name = "arcux_pd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arcux-pd"
+path = "src/main.rs"
+
+[dependencies]
+arcux-rpc = { path = "../rpc" }
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+prost.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
