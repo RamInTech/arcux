@@ -26,6 +26,21 @@ service KvService {
   // Snapshot range scan — wire frozen now; server returns UNIMPLEMENTED until the
   // Phase 1b merging iterator lands.
   rpc Scan(ScanRequest) returns (ScanResponse);
+  // Split the region owning `split_key` at that key (Phase 3, operational). The data
+  // node is authoritative for its region epochs, so the split takes effect here and is
+  // reported to PD on the next heartbeat.
+  rpc SplitRegion(SplitRegionRequest) returns (SplitRegionResponse);
+}
+
+// Routing context a region-aware client attaches to every data request: the region
+// (and epoch) it believes owns the key(s). The server validates it and replies with a
+// RegionStale KeyError if the epoch is out of date or the key is out of range. A zero
+// `region_id` means "no routing" (direct single-node access) and skips validation —
+// the Phase-2 client behaviour, preserved for compatibility.
+message Context {
+  uint64 region_id = 1;
+  uint64 region_epoch = 2;
+  reserved 50 to 99;
 }
 
 enum Op {
@@ -88,6 +103,7 @@ message PrewriteRequest {
   bytes primary = 2;
   repeated Mutation mutations = 3;
   uint64 ttl = 4;
+  Context context = 5;
   reserved 50 to 99;
 }
 message PrewriteResponse {
@@ -99,6 +115,7 @@ message CommitRequest {
   uint64 start_ts = 1;
   bytes primary = 2;
   repeated bytes keys = 3;  // all keys in the txn (primary + secondaries)
+  Context context = 4;
   reserved 50 to 99;
 }
 message CommitResponse {
@@ -110,6 +127,7 @@ message CommitResponse {
 message GetRequest {
   bytes key = 1;
   uint64 read_ts = 2;  // 0 => server allocates "now"
+  Context context = 3;
   reserved 50 to 99;
 }
 message GetResponse {
@@ -123,6 +141,7 @@ message GetResponse {
 message PutRequest {
   bytes key = 1;
   bytes value = 2;
+  Context context = 3;
   reserved 50 to 99;
 }
 message PutResponse {
@@ -133,6 +152,7 @@ message PutResponse {
 
 message DeleteRequest {
   bytes key = 1;
+  Context context = 2;
   reserved 50 to 99;
 }
 message DeleteResponse {
@@ -150,9 +170,29 @@ message ScanRequest {
   bytes end_key = 2;
   uint32 limit = 3;
   uint64 read_ts = 4;
+  Context context = 5;
   reserved 50 to 99;
 }
 message ScanResponse {
   repeated Kv pairs = 1;
+  reserved 50 to 99;
+}
+
+// --- region split (Phase 3) ---
+
+message RegionInfo {
+  uint64 id = 1;
+  bytes start_key = 2;
+  bytes end_key = 3;
+  uint64 epoch = 4;
+  reserved 50 to 99;
+}
+message SplitRegionRequest {
+  bytes split_key = 1;  // must fall strictly inside an existing region
+  reserved 50 to 99;
+}
+message SplitRegionResponse {
+  RegionInfo left = 1;   // original id, range [start, split_key), epoch bumped
+  RegionInfo right = 2;  // fresh id, range [split_key, end), epoch bumped
   reserved 50 to 99;
 }

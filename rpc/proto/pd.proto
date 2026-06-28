@@ -1,10 +1,12 @@
 syntax = "proto3";
 
-// arcux Placement Driver wire contract — v1 (frozen).
+// arcux Placement Driver wire contract — v2.
 //
-// GetTimestamp is served from the node's local TSO stand-in in Phase 2; GetRegion
-// and Heartbeat are frozen but UNIMPLEMENTED until regions/PD exist (Phase 3+).
-// Field numbers are append-only; every message reserves 50-99.
+// Phase 3 implements all of PdService: GetTimestamp is served from the authoritative
+// cluster TSO; GetRegion/ListRegions route from PD's aggregated region view; Heartbeat
+// carries the regions a data node owns, which PD aggregates. (GetTimestamp was served
+// from a node-local stand-in in Phase 2.) Field numbers are append-only; every message
+// reserves 50-99.
 
 package pd;
 
@@ -12,6 +14,17 @@ service PdService {
   rpc GetTimestamp(GetTimestampRequest) returns (GetTimestampResponse);
   rpc GetRegion(GetRegionRequest) returns (GetRegionResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // Phase 3: the whole aggregated region view, for client routing caches + tooling.
+  rpc ListRegions(ListRegionsRequest) returns (ListRegionsResponse);
+}
+
+// A region as PD sees it (the canonical placement record).
+message Region {
+  uint64 id = 1;
+  bytes start_key = 2;  // empty => -inf
+  bytes end_key = 3;    // empty => +inf
+  uint64 epoch = 4;
+  reserved 50 to 99;
 }
 
 message GetTimestampRequest {
@@ -38,8 +51,17 @@ message GetRegionResponse {
 
 message HeartbeatRequest {
   uint64 node_id = 1;
+  repeated Region regions = 2;  // the regions this node currently owns
   reserved 50 to 99;
 }
 message HeartbeatResponse {
+  reserved 50 to 99;
+}
+
+message ListRegionsRequest {
+  reserved 50 to 99;
+}
+message ListRegionsResponse {
+  repeated Region regions = 1;  // all regions PD knows about, sorted by start_key
   reserved 50 to 99;
 }

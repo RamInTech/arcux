@@ -5,7 +5,10 @@
 //! depend on this crate so they share identical generated message types.
 
 /// Wire-contract version. Bump only for compatible (append-only) schema changes.
-pub const VERSION: u32 = 1;
+/// v2 (Phase 3): added `kv.Context` routing + `kv.SplitRegion`, and `pd.Region` /
+/// `pd.ListRegions` / regions on `pd.Heartbeat`. All additions are field-/RPC-additive,
+/// so v1 peers stay wire-compatible.
+pub const VERSION: u32 = 2;
 
 /// KV API v1 — the transactional + autocommit surface (fully implemented in Phase 2).
 pub mod kv {
