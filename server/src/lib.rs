@@ -21,11 +21,14 @@
 //! Phase 4 will move region ownership under per-region Raft; the `Context`/`RegionStale`
 //! contract here is unchanged by that.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
-use arcux_engine::{Engine, Error, Mutation, Options, Transaction};
+use arcux_engine::keys::{encode_data_key, encode_write_value};
+use arcux_engine::{Cf, Engine, Error, Mutation, Options, Transaction, Value, WriteBatch};
 use arcux_pd::{Region, RegionRegistry, Tso};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -34,11 +37,19 @@ use tonic::{Request, Response, Status};
 
 use arcux_rpc::kv::key_error::Kind;
 use arcux_rpc::kv::kv_service_server::{KvService, KvServiceServer};
-use arcux_rpc::kv::{self, Context, KeyError, RegionInfo, RegionStale};
+use arcux_rpc::kv::{self, Context, KeyError, NotLeader, RegionInfo, RegionStale};
 use arcux_rpc::pd;
 use arcux_rpc::pd::pd_service_client::PdServiceClient;
 use arcux_rpc::raft::raft_service_server::{RaftService, RaftServiceServer};
 use arcux_rpc::raft;
+
+pub mod raft_cmd;
+pub mod raft_group;
+pub mod raft_transport;
+pub mod wal_storage;
+
+use raft_cmd::Command;
+use raft_group::{ApplyFn, GroupOptions, ProposeResult, RaftGroup};
 
 /// A logical lease (in TSO ticks) added to `start_ts` to form a lock's expiry. The TSO
 /// is a monotonic counter (not wall-clock), so a generous lease keeps autocommit locks
@@ -136,10 +147,13 @@ struct PdHandle {
 /// Default period between liveness heartbeats to PD (PD-connected mode).
 const DEFAULT_HEARTBEAT_MS: u64 = 1_000;
 
+/// Default Raft logical-tick period (one heartbeat per tick; election timeout ~10–20).
+const DEFAULT_RAFT_TICK_MS: u64 = 30;
+
 /// Shared node state behind an `Arc`: the storage engine, the timestamp source, the
 /// authoritative region table, and (when PD-connected) a heartbeat handle.
 pub struct AppState {
-    pub engine: Engine,
+    pub engine: Arc<Engine>,
     clock: Arc<dyn TimestampSource>,
     regions: Arc<RegionRegistry>,
     pd: Option<PdHandle>,
@@ -147,6 +161,10 @@ pub struct AppState {
     /// PD-connected. Settable so tests can heartbeat faster than PD's failure-detector
     /// timeout. Ignored in direct mode.
     hb_interval_ms: std::sync::atomic::AtomicU64,
+    /// The per-region Raft group when this node runs **replicated** (Phase 4b). `None` ⇒
+    /// the unreplicated direct/PD path. Writes route through this group's log; reads and
+    /// writes on a non-leader reply `NotLeader`.
+    raft: Option<RaftGroup>,
 }
 
 impl AppState {
@@ -155,13 +173,14 @@ impl AppState {
     /// is the Phase-2 path used by the in-process tests and demos.
     pub fn open(opts: Options) -> arcux_engine::Result<Arc<AppState>> {
         let regions = Arc::new(RegionRegistry::open(&opts.data_dir).map_err(arcux_engine::Error::from)?);
-        let engine = Engine::open(opts)?;
+        let engine = Arc::new(Engine::open(opts)?);
         Ok(Arc::new(AppState {
             engine,
             clock: Arc::new(LocalClock::new()),
             regions,
             pd: None,
             hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
+            raft: None,
         }))
     }
 
@@ -176,7 +195,7 @@ impl AppState {
         address: String,
     ) -> Result<Arc<AppState>, Box<dyn std::error::Error + Send + Sync>> {
         let regions = Arc::new(RegionRegistry::open_empty(&opts.data_dir, node_id)?);
-        let engine = Engine::open(opts)?;
+        let engine = Arc::new(Engine::open(opts)?);
         let client = PdServiceClient::connect(pd_endpoint).await?;
         let clock: Arc<dyn TimestampSource> = Arc::new(PdClock::new(client.clone()));
         let state = Arc::new(AppState {
@@ -185,9 +204,124 @@ impl AppState {
             regions,
             pd: Some(PdHandle { client, node_id, address }),
             hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
+            raft: None,
         });
         state.heartbeat().await?; // register, adopt our assignment, become routable
         Ok(state)
+    }
+
+    /// **Replicated** mode (Phase 4b): the node hosts one whole-keyspace Raft group across
+    /// `voters`, replicating writes to `peers` (peer id → serving address) over the real
+    /// `RaftService` transport, with a durable [`WalStorage`](wal_storage::WalStorage) log
+    /// under `data_dir/raft`. `clock` is the timestamp source — share one across the group
+    /// (or a PD-backed clock) so `commit_ts` is globally monotonic across a leader change.
+    /// Writes route through the log; a non-leader replies `NotLeader`.
+    pub fn open_replicated(
+        opts: Options,
+        node_id: u64,
+        voters: Vec<u64>,
+        peers: HashMap<u64, String>,
+        clock: Arc<dyn TimestampSource>,
+    ) -> Result<Arc<AppState>, Box<dyn std::error::Error + Send + Sync>> {
+        let regions = Arc::new(RegionRegistry::open(&opts.data_dir)?);
+        let storage = wal_storage::WalStorage::open(opts.data_dir.join("raft"))?;
+        let engine = Arc::new(Engine::open(opts)?);
+        let group = raft_group::start(GroupOptions {
+            id: node_id,
+            voters,
+            peers,
+            storage,
+            apply: make_apply(engine.clone()),
+            tick: Duration::from_millis(DEFAULT_RAFT_TICK_MS),
+        });
+        Ok(Arc::new(AppState {
+            engine,
+            clock,
+            regions,
+            pd: None,
+            hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
+            raft: Some(group),
+        }))
+    }
+
+    /// Run a single autocommit write (`Put`/`Delete`) through the Raft log on the leader:
+    /// allocate `start_ts`/`commit_ts`, build the **committed** `WriteBatch` (the Default
+    /// value and the Write record — no lock, since it's atomically committed), propose it,
+    /// and ack only once it has committed (majority-durable) and applied on every replica.
+    /// A non-leader returns `NotLeader`. Returns `(commit_ts, error)`.
+    async fn replicated_autocommit(
+        &self,
+        group: &RaftGroup,
+        key: Vec<u8>,
+        value: Value,
+    ) -> Result<(u64, Option<KeyError>), Status> {
+        if !group.is_leader() {
+            return Ok((0, Some(not_leader(group.leader_id()))));
+        }
+        let clock = self.clock.clone();
+        let (commit_ts, data) = run_blocking(move || {
+            let start_ts = clock.now();
+            let commit_ts = clock.now();
+            let cmd = Command::Autocommit(committed_batch(&key, &value, start_ts, commit_ts));
+            (commit_ts, cmd.encode())
+        })
+        .await?;
+        match group.propose(data).await {
+            ProposeResult::Applied(Ok(())) => Ok((commit_ts, None)),
+            ProposeResult::Applied(Err(e)) => Ok((0, Some(classify_to_key(e)?))),
+            ProposeResult::NotLeader { leader_hint } => Ok((0, Some(not_leader(leader_hint)))),
+        }
+    }
+
+    /// Replicate a transaction **prewrite** through the log: propose a `Prewrite` command;
+    /// the conflict-check runs at apply on every replica. Returns the first per-key error
+    /// (`None` ⇒ all prewritten).
+    async fn replicated_prewrite(
+        &self,
+        group: &RaftGroup,
+        req: kv::PrewriteRequest,
+    ) -> Result<Option<KeyError>, Status> {
+        if !group.is_leader() {
+            return Ok(Some(not_leader(group.leader_id())));
+        }
+        let mutations: Vec<Mutation> = req.mutations.iter().map(to_engine_mutation).collect();
+        let cmd = Command::Prewrite {
+            mutations,
+            primary: req.primary,
+            start_ts: req.start_ts,
+            ttl: req.ttl,
+        };
+        match group.propose(cmd.encode()).await {
+            ProposeResult::Applied(Ok(())) => Ok(None),
+            ProposeResult::Applied(Err(e)) => Ok(Some(classify_to_key(e)?)),
+            ProposeResult::NotLeader { leader_hint } => Ok(Some(not_leader(leader_hint))),
+        }
+    }
+
+    /// Replicate a transaction **commit** through the log: allocate `commit_ts` on the leader
+    /// (so every replica commits at the same timestamp), then propose a `Commit` command.
+    /// Returns `(commit_ts, error)`.
+    async fn replicated_commit(
+        &self,
+        group: &RaftGroup,
+        req: kv::CommitRequest,
+    ) -> Result<(u64, Option<KeyError>), Status> {
+        if !group.is_leader() {
+            return Ok((0, Some(not_leader(group.leader_id()))));
+        }
+        let clock = self.clock.clone();
+        let commit_ts = run_blocking(move || clock.now()).await?;
+        let cmd = Command::Commit {
+            primary: req.primary,
+            keys: req.keys,
+            start_ts: req.start_ts,
+            commit_ts,
+        };
+        match group.propose(cmd.encode()).await {
+            ProposeResult::Applied(Ok(())) => Ok((commit_ts, None)),
+            ProposeResult::Applied(Err(e)) => Ok((0, Some(classify_to_key(e)?))),
+            ProposeResult::NotLeader { leader_hint } => Ok((0, Some(not_leader(leader_hint)))),
+        }
     }
 
     /// Set the background heartbeat period (ms). Must be shorter than PD's failure-detector
@@ -243,6 +377,58 @@ fn region_stale(new_epoch: u64) -> KeyError {
     KeyError { kind: Some(Kind::RegionStale(RegionStale { new_epoch })) }
 }
 
+/// Build a `NotLeader` key-error; `leader_hint` carries the leader's node id (big-endian),
+/// empty when unknown — a redirect signal the region-aware client retries on.
+fn not_leader(leader: Option<u64>) -> KeyError {
+    let leader_hint = leader.map(|id| id.to_be_bytes().to_vec()).unwrap_or_default();
+    KeyError { kind: Some(Kind::NotLeader(NotLeader { leader_hint })) }
+}
+
+/// The durable, already-committed state of a single-key write: the value in the Default CF
+/// at `start_ts` and the commit pointer in the Write CF at `commit_ts`. Atomic and
+/// lock-free (it represents a *finished* transaction), so applying it on every replica via
+/// `Engine::write` is deterministic and idempotent on replay (MVCC keys embed the ts).
+fn committed_batch(key: &[u8], value: &Value, start_ts: u64, commit_ts: u64) -> WriteBatch {
+    let mut b = WriteBatch::new();
+    b.put(Cf::Default, encode_data_key(key, start_ts), value.encode());
+    b.put(Cf::Write, encode_data_key(key, commit_ts), encode_write_value(start_ts).to_vec());
+    b
+}
+
+/// The state-machine apply function for a replicated group: decode the committed entry's
+/// [`Command`] and execute it against `engine`, **deterministically** (every replica applies
+/// the same log prefix against identical state) by reusing the single-node Percolator. The
+/// returned engine `Result` answers the leader's proposer; a Percolator conflict is an
+/// `Err` here, surfaced to the client as a `KeyError`. An empty entry is the election no-op.
+fn make_apply(engine: Arc<Engine>) -> ApplyFn {
+    Arc::new(move |data: &[u8]| -> Result<(), Error> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        match Command::decode(data) {
+            Some(Command::Autocommit(batch)) => {
+                engine.write(batch)?;
+                Ok(())
+            }
+            Some(Command::Prewrite { mutations, start_ts, ttl, .. }) => {
+                Transaction::new(&engine, start_ts, mutations)?.prewrite(ttl)
+            }
+            Some(Command::Commit { primary, keys, start_ts, commit_ts }) => {
+                // Commit reads each mutation's *key* only; values are placeholders, with the
+                // primary first (mirrors the direct commit path).
+                let mut muts = vec![Mutation::delete(primary.clone())];
+                for k in &keys {
+                    if k != &primary {
+                        muts.push(Mutation::delete(k.clone()));
+                    }
+                }
+                Transaction::new(&engine, start_ts, muts)?.commit(commit_ts)
+            }
+            None => Err(Error::corruption("undecodable raft command")),
+        }
+    })
+}
+
 fn region_info(r: &Region) -> RegionInfo {
     RegionInfo { id: r.id, start_key: r.start.clone(), end_key: r.end.clone(), epoch: r.epoch }
 }
@@ -253,6 +439,15 @@ fn region_info(r: &Region) -> RegionInfo {
 enum Classified {
     Key(KeyError),
     Status(Status),
+}
+
+/// Map an engine error to a per-key `KeyError` (an expected protocol outcome) or propagate
+/// an RPC-level `Status` failure. Used by the replicated write paths.
+fn classify_to_key(e: Error) -> Result<KeyError, Status> {
+    match classify(e) {
+        Classified::Key(ke) => Ok(ke),
+        Classified::Status(s) => Err(s),
+    }
 }
 
 /// Conflicts and live locks are *expected* protocol outcomes → `KeyError`. Bad
@@ -315,6 +510,10 @@ impl KvService for KvApi {
         request: Request<kv::PrewriteRequest>,
     ) -> Result<Response<kv::PrewriteResponse>, Status> {
         let req = request.into_inner();
+        if let Some(g) = &self.state.raft {
+            let error = self.state.replicated_prewrite(g, req).await?;
+            return Ok(Response::new(kv::PrewriteResponse { errors: error.into_iter().collect() }));
+        }
         if let Some(ke) = self.state.check_context(&req.context, &req.primary) {
             return Ok(Response::new(kv::PrewriteResponse { errors: vec![ke] }));
         }
@@ -340,6 +539,10 @@ impl KvService for KvApi {
         request: Request<kv::CommitRequest>,
     ) -> Result<Response<kv::CommitResponse>, Status> {
         let req = request.into_inner();
+        if let Some(g) = &self.state.raft {
+            let (commit_ts, error) = self.state.replicated_commit(g, req).await?;
+            return Ok(Response::new(kv::CommitResponse { commit_ts, error }));
+        }
         if let Some(ke) = self.state.check_context(&req.context, &req.primary) {
             return Ok(Response::new(kv::CommitResponse { commit_ts: 0, error: Some(ke) }));
         }
@@ -383,12 +586,32 @@ impl KvService for KvApi {
                 read_ts: 0,
             }));
         }
+        // Replicated mode: read on the leader (it has applied every committed write), so a
+        // read is linearizable; a follower redirects with `NotLeader`.
+        if let Some(g) = &self.state.raft {
+            if !g.is_leader() {
+                return Ok(Response::new(kv::GetResponse {
+                    found: false,
+                    value: vec![],
+                    error: Some(not_leader(g.leader_id())),
+                    read_ts: 0,
+                }));
+            }
+        }
         let state = self.state.clone();
+        // In a replicated region, reads must not mutate (lock resolution is a write that
+        // would bypass Raft), so use the non-resolving read; the direct path resolves.
+        let replicated = self.state.raft.is_some();
         // Allocate read_ts and read in one blocking hop so the (possibly PD-backed)
         // clock is never touched from the reactor, and read_ts is known on every path.
         let (res, read_ts) = run_blocking(move || {
             let read_ts = if req.read_ts == 0 { state.clock.now() } else { req.read_ts };
-            (state.engine.mvcc_get(&req.key, read_ts), read_ts)
+            let res = if replicated {
+                state.engine.mvcc_get_unresolved(&req.key, read_ts)
+            } else {
+                state.engine.mvcc_get(&req.key, read_ts)
+            };
+            (res, read_ts)
         })
         .await?;
 
@@ -422,6 +645,11 @@ impl KvService for KvApi {
         if let Some(ke) = self.state.check_context(&req.context, &req.key) {
             return Ok(Response::new(kv::PutResponse { commit_ts: 0, error: Some(ke) }));
         }
+        if let Some(g) = &self.state.raft {
+            let (commit_ts, error) =
+                self.state.replicated_autocommit(g, req.key, Value::Put(req.value)).await?;
+            return Ok(Response::new(kv::PutResponse { commit_ts, error }));
+        }
         let res = self.autocommit(Mutation::put(req.key, req.value)).await?;
         match res {
             Ok(commit_ts) => Ok(Response::new(kv::PutResponse { commit_ts, error: None })),
@@ -439,6 +667,11 @@ impl KvService for KvApi {
         let req = request.into_inner();
         if let Some(ke) = self.state.check_context(&req.context, &req.key) {
             return Ok(Response::new(kv::DeleteResponse { commit_ts: 0, error: Some(ke) }));
+        }
+        if let Some(g) = &self.state.raft {
+            let (commit_ts, error) =
+                self.state.replicated_autocommit(g, req.key, Value::Delete).await?;
+            return Ok(Response::new(kv::DeleteResponse { commit_ts, error }));
         }
         let res = self.autocommit(Mutation::delete(req.key)).await?;
         match res {
@@ -521,7 +754,9 @@ impl KvApi {
 // ------------------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub struct RaftApi;
+pub struct RaftApi {
+    state: Arc<AppState>,
+}
 
 #[tonic::async_trait]
 impl RaftService for RaftApi {
@@ -536,23 +771,36 @@ impl RaftService for RaftApi {
 
     async fn request_vote(
         &self,
-        _request: Request<raft::RequestVoteRequest>,
+        request: Request<raft::RequestVoteRequest>,
     ) -> Result<Response<raft::RequestVoteResponse>, Status> {
-        Err(Status::unimplemented("Raft arrives in Phase 4"))
+        match &self.state.raft {
+            Some(g) => Ok(Response::new(g.handle_request_vote(request.into_inner()).await)),
+            None => Err(Status::unimplemented("this node is not running a Raft group")),
+        }
     }
 
     async fn append_entries(
         &self,
-        _request: Request<raft::AppendEntriesRequest>,
+        request: Request<raft::AppendEntriesRequest>,
     ) -> Result<Response<Self::AppendEntriesStream>, Status> {
-        Err(Status::unimplemented("Raft arrives in Phase 4"))
+        match &self.state.raft {
+            Some(g) => {
+                // The frozen contract is server-streaming; one append yields one response.
+                let resp = g.handle_append_entries(request.into_inner()).await;
+                let stream = tokio_stream::once(Ok(resp));
+                Ok(Response::new(Box::pin(stream)))
+            }
+            None => Err(Status::unimplemented("this node is not running a Raft group")),
+        }
     }
 
     async fn install_snapshot(
         &self,
         _request: Request<raft::InstallSnapshotRequest>,
     ) -> Result<Response<raft::InstallSnapshotResponse>, Status> {
-        Err(Status::unimplemented("Raft arrives in Phase 4"))
+        // Snapshots / log compaction are a later Phase-4b milestone (the log is unbounded
+        // for now); the wire contract already reserves room.
+        Err(Status::unimplemented("InstallSnapshot lands with Phase-4b log compaction"))
     }
 }
 
@@ -591,15 +839,22 @@ where
         })
     });
 
+    // When the server stops, also stop the Raft group — otherwise a "killed" node keeps
+    // heartbeating peers and suppresses the re-election that should follow.
+    let group = state.raft.clone();
+
     let incoming = TcpListenerStream::new(listener);
     let result = Server::builder()
-        .add_service(KvServiceServer::new(KvApi { state }))
-        .add_service(RaftServiceServer::new(RaftApi))
+        .add_service(KvServiceServer::new(KvApi { state: state.clone() }))
+        .add_service(RaftServiceServer::new(RaftApi { state }))
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
 
     if let Some(h) = hb_handle {
         h.abort();
+    }
+    if let Some(g) = group {
+        g.shutdown();
     }
     result
 }

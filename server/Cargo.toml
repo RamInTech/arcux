@@ -17,6 +17,7 @@ path = "src/main.rs"
 arcux-engine = { path = "../engine" }
 arcux-rpc = { path = "../rpc" }
 arcux-pd = { path = "../pd" }
+arcux-raft = { path = "../raft" }
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true

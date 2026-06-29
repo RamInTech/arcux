@@ -75,6 +75,7 @@ dependencies = [
  "arcux-client",
  "arcux-engine",
  "arcux-pd",
+ "arcux-raft",
  "arcux-rpc",
  "prost",
  "tempfile",
