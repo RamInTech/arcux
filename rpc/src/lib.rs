@@ -8,9 +8,10 @@
 /// v2 (Phase 3): added `kv.Context` routing + `kv.SplitRegion`, and `pd.Region` /
 /// `pd.ListRegions` / regions on `pd.Heartbeat`. v3 (Phase 3b): added node addressing
 /// (`node_id`/`address` on `pd.Region` + `GetRegionResponse`, `address` on
-/// `HeartbeatRequest`) and the assigned-regions list on `HeartbeatResponse`. All
-/// additions are field-additive, so older peers stay wire-compatible.
-pub const VERSION: u32 = 3;
+/// `HeartbeatRequest`) and the assigned-regions list on `HeartbeatResponse`. v4 (Phase 4b++):
+/// added `group_id` to the Raft RPC requests so one `RaftService` multiplexes many region
+/// groups (MultiRaft). All additions are field-additive, so older peers stay wire-compatible.
+pub const VERSION: u32 = 4;
 
 /// KV API v1 — the transactional + autocommit surface (fully implemented in Phase 2).
 pub mod kv {

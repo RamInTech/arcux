@@ -51,6 +51,17 @@ impl WalWriter {
         Ok(WalWriter { file, path, written: 0 })
     }
 
+    /// Open an existing segment (creating it if absent) for **append**, preserving its
+    /// contents — so a restarted writer continues after the last record rather than
+    /// truncating. `written` resumes from the current file size. Used by the Phase-4
+    /// `WalStorage` to reopen a Raft log on restart.
+    pub fn open_append(path: impl Into<PathBuf>) -> Result<WalWriter> {
+        let path = path.into();
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let written = file.metadata()?.len() as usize;
+        Ok(WalWriter { file, path, written })
+    }
+
     /// Append one framed record carrying `seq` and `payload`.
     pub fn append(&mut self, seq: u64, payload: &[u8]) -> Result<()> {
         let body_len = SEQ_LEN + payload.len();
