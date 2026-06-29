@@ -40,13 +40,17 @@ impl Cluster {
         });
         let pd_ep = format!("http://{pd_addr}");
 
-        // The node connects to PD, registers its (single, whole-keyspace) region, and
-        // serves KV. open_with_pd performs the initial heartbeat synchronously.
-        let state = AppState::open_with_pd(Options::new(dir.path()), pd_ep.clone(), 1)
-            .await
-            .expect("open node with pd");
+        // Bind the node first so it can advertise its real (ephemeral) address to PD, then
+        // connect to PD: open_with_pd registers the node, adopts its assigned region
+        // (the whole keyspace, for a fresh single-node cluster), and heartbeats — all
+        // synchronously, so the region is routable before we serve.
         let node_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind node");
         let node_addr: SocketAddr = node_listener.local_addr().unwrap();
+        let node_ep = format!("http://{node_addr}");
+        let state =
+            AppState::open_with_pd(Options::new(dir.path()), pd_ep.clone(), 1, node_ep.clone())
+                .await
+                .expect("open node with pd");
         let (node_tx, node_rx) = tokio::sync::oneshot::channel::<()>();
         let node_handle = tokio::spawn(async move {
             let _ = serve_on(state, node_listener, async {
@@ -54,7 +58,6 @@ impl Cluster {
             })
             .await;
         });
-        let node_ep = format!("http://{node_addr}");
 
         Cluster {
             node_ep,

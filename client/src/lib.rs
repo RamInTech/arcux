@@ -1,20 +1,23 @@
-//! arcux Phase 2/3 — async gRPC client SDK.
+//! arcux Phase 2/3/3b — async gRPC client SDK.
 //!
-//! A thin async wrapper over the generated `KvServiceClient` holding one shared HTTP/2
-//! [`Channel`] (multiplexed; the connection-pool-per-peer generalization arrives later).
-//! It mirrors the KV RPCs and adds a [`Client::transact`] convenience that runs
-//! `begin → prewrite → commit`. Application-level conflicts/locks surface as a typed
-//! [`ClientError::Key`]; the blocking client is deferred to Phase 2b.
+//! A thin async wrapper over the generated `KvServiceClient`. It mirrors the KV RPCs and
+//! adds a [`Client::transact`] convenience that runs `begin → prewrite → commit`.
+//! Application-level conflicts/locks surface as a typed [`ClientError::Key`]; the blocking
+//! client is deferred to Phase 2b.
 //!
-//! ## Phase 3 — region routing
+//! ## Phase 3 / 3b — region routing across nodes
 //!
-//! Constructed with [`Client::connect_with_pd`], the client becomes region-aware: it
-//! resolves each key's region from PD (caching the result), stamps the routing
-//! [`kv::Context`] on every request, and — when the server reports `RegionStale`
-//! (the region split out from under a cached route) — invalidates the cache, re-resolves
-//! from PD, and retries. [`Client::connect`] keeps the Phase-2 direct behaviour (no
-//! routing context), so single-node callers need no PD.
+//! Constructed with [`Client::connect_with_pd`], the client is region-aware. It resolves
+//! each key's region **and owning node** from PD (caching the result, ordered by start key
+//! and **binary-searched**), opens one channel **per node** (a pool keyed by address), and
+//! dispatches each request to the region's owner. When the server reports `RegionStale`
+//! (the region split/merged out from under a cached route) **or** `NotLeader` (the owning
+//! replica is no longer the leader — meaningful once Phase 4 adds per-region Raft), it
+//! invalidates the cached route, re-resolves from PD, and retries. [`Client::connect`]
+//! keeps the Phase-2 direct behaviour (no routing context, one node), so single-node
+//! callers need no PD.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -32,8 +35,8 @@ pub use arcux_rpc::kv::Mutation;
 /// keeps a transaction's locks from ever looking expired mid-flight.
 const DEFAULT_LEASE: u64 = 1 << 32;
 
-/// How many times a routed call re-resolves and retries after a `RegionStale` before
-/// giving up. A handful is plenty: each retry follows a real topology change.
+/// How many times a routed call re-resolves and retries after a `RegionStale`/`NotLeader`
+/// before giving up. A handful is plenty: each retry follows a real topology change.
 const MAX_ROUTING_ATTEMPTS: usize = 5;
 
 pub type Result<T> = std::result::Result<T, ClientError>;
@@ -74,9 +77,10 @@ fn key_error(ke: kv::KeyError) -> ClientError {
     ClientError::Key(msg)
 }
 
-/// Whether a key-error is a `RegionStale` (the signal to re-route and retry).
-fn is_region_stale(ke: &kv::KeyError) -> bool {
-    matches!(ke.kind, Some(Kind::RegionStale(_)))
+/// Whether a key-error means "your route is wrong — re-resolve and retry": a `RegionStale`
+/// (epoch moved under us) or a `NotLeader` (the owning replica isn't the leader anymore).
+fn is_reroute(ke: &kv::KeyError) -> bool {
+    matches!(ke.kind, Some(Kind::RegionStale(_)) | Some(Kind::NotLeader(_)))
 }
 
 /// Build a PUT mutation for use with [`Client::transact`].
@@ -93,30 +97,50 @@ pub fn delete_mutation(key: impl Into<Vec<u8>>) -> Mutation {
 // Region routing
 // ------------------------------------------------------------------------------------
 
-fn region_contains(r: &pd::Region, key: &[u8]) -> bool {
-    key >= r.start_key.as_slice() && (r.end_key.is_empty() || key < r.end_key.as_slice())
-}
-
-/// Do two half-open key ranges intersect? (Empty `end_key` is +∞.)
-fn ranges_overlap(a: &pd::Region, b: &pd::Region) -> bool {
-    let a_ends_at_or_before_b = !a.end_key.is_empty() && a.end_key.as_slice() <= b.start_key.as_slice();
-    let b_ends_at_or_before_a = !b.end_key.is_empty() && b.end_key.as_slice() <= a.start_key.as_slice();
-    !(a_ends_at_or_before_b || b_ends_at_or_before_a)
-}
-
-/// A PD-backed routing cache: resolves a key to its owning region and remembers it.
-/// Shared across `Client` clones, so all handles benefit from a warm cache.
+/// A cached region descriptor, including the address of the node that owns it.
 #[derive(Clone)]
-struct Router {
-    pd: PdServiceClient<Channel>,
-    cache: Arc<Mutex<Vec<pd::Region>>>,
+struct CachedRegion {
+    id: u64,
+    start: Vec<u8>,
+    end: Vec<u8>,
+    epoch: u64,
+    address: String,
 }
 
-impl Router {
-    /// The routing context for `key`: from cache, or resolved from PD on a miss.
-    async fn context_for(&self, key: &[u8]) -> Result<kv::Context> {
+impl CachedRegion {
+    fn contains(&self, key: &[u8]) -> bool {
+        key >= self.start.as_slice() && (self.end.is_empty() || key < self.end.as_slice())
+    }
+}
+
+/// Do two half-open key ranges intersect? (Empty `end` is +∞.)
+fn ranges_overlap(a: &CachedRegion, b: &CachedRegion) -> bool {
+    let a_before_b = !a.end.is_empty() && a.end.as_slice() <= b.start.as_slice();
+    let b_before_a = !b.end.is_empty() && b.end.as_slice() <= a.start.as_slice();
+    !(a_before_b || b_before_a)
+}
+
+/// A PD-backed routing layer: resolves a key to its owning region + node (caching the
+/// result, binary-searched) and pools one KV channel per node. Shared across `Client`
+/// clones, so all handles benefit from a warm cache and a shared connection pool.
+#[derive(Clone)]
+struct Routing {
+    pd: PdServiceClient<Channel>,
+    /// Cached regions, kept sorted by `start` so lookup is a binary search.
+    cache: Arc<Mutex<Vec<CachedRegion>>>,
+    /// One KV client per node address (multiplexed HTTP/2 channels).
+    pool: Arc<Mutex<HashMap<String, KvServiceClient<Channel>>>>,
+    /// A seed KV endpoint used when PD reports a region with no address (legacy/unplaced).
+    fallback_kv: Option<String>,
+}
+
+impl Routing {
+    /// Resolve `key` to `(routing context, the owning node's KV client)`, from cache or —
+    /// on a miss — from PD.
+    async fn resolve(&self, key: &[u8]) -> Result<(kv::Context, KvServiceClient<Channel>)> {
         if let Some(r) = self.lookup(key) {
-            return Ok(kv::Context { region_id: r.id, region_epoch: r.epoch });
+            let client = self.client_for(&r.address)?;
+            return Ok((kv::Context { region_id: r.id, region_epoch: r.epoch }, client));
         }
         let mut pd = self.pd.clone();
         let resp = pd
@@ -124,41 +148,77 @@ impl Router {
             .await
             .map_err(ClientError::Rpc)?
             .into_inner();
-        let region = pd::Region {
+        let region = CachedRegion {
             id: resp.region_id,
-            start_key: resp.start_key,
-            end_key: resp.end_key,
+            start: resp.start_key,
+            end: resp.end_key,
             epoch: resp.epoch,
+            address: resp.address,
         };
+        let client = self.client_for(&region.address)?;
         let ctx = kv::Context { region_id: region.id, region_epoch: region.epoch };
         self.insert(region);
-        Ok(ctx)
+        Ok((ctx, client))
     }
 
-    fn lookup(&self, key: &[u8]) -> Option<pd::Region> {
-        self.cache.lock().unwrap().iter().find(|r| region_contains(r, key)).cloned()
+    /// Binary-search the cache for the region containing `key`.
+    fn lookup(&self, key: &[u8]) -> Option<CachedRegion> {
+        let c = self.cache.lock().unwrap();
+        // Rightmost region whose start is <= key; it's the only one that can contain key.
+        let idx = c.partition_point(|r| r.start.as_slice() <= key);
+        if idx == 0 {
+            return None;
+        }
+        let r = &c[idx - 1];
+        if r.contains(key) {
+            Some(r.clone())
+        } else {
+            None // a gap (e.g. an evicted/stale neighbour) — force a PD re-resolve
+        }
     }
 
-    fn insert(&self, region: pd::Region) {
+    /// Insert a freshly-resolved region, dropping any range it supersedes and keeping the
+    /// cache sorted by start key.
+    fn insert(&self, region: CachedRegion) {
         let mut c = self.cache.lock().unwrap();
-        // Drop any cached range the fresh one supersedes (e.g. the pre-split parent).
         c.retain(|r| !ranges_overlap(r, &region));
-        c.push(region);
+        let pos = c.partition_point(|r| r.start < region.start);
+        c.insert(pos, region);
     }
 
-    /// Forget every cached region covering `key` (after a `RegionStale`).
+    /// Forget every cached region covering `key` (after a `RegionStale`/`NotLeader`).
     fn invalidate(&self, key: &[u8]) {
-        self.cache.lock().unwrap().retain(|r| !region_contains(r, key));
+        self.cache.lock().unwrap().retain(|r| !r.contains(key));
+    }
+
+    /// The pooled KV client for `address` (lazily connected), or the fallback endpoint
+    /// when PD reported no address.
+    fn client_for(&self, address: &str) -> Result<KvServiceClient<Channel>> {
+        let address = if address.is_empty() {
+            self.fallback_kv
+                .clone()
+                .ok_or_else(|| ClientError::Key("region has no node address and no fallback".into()))?
+        } else {
+            address.to_string()
+        };
+        let mut pool = self.pool.lock().unwrap();
+        if let Some(c) = pool.get(&address) {
+            return Ok(c.clone());
+        }
+        let client = KvServiceClient::new(lazy_channel(&address)?);
+        pool.insert(address, client.clone());
+        Ok(client)
     }
 }
 
-/// An async client over one multiplexed HTTP/2 channel. Cheap to `clone` (the channel
-/// and routing cache are shared), so concurrent callers each take their own handle.
+/// An async, region-aware client. Cheap to `clone` (the channel pool and routing cache are
+/// shared), so concurrent callers each take their own handle.
 #[derive(Clone)]
 pub struct Client {
-    kv: KvServiceClient<Channel>,
-    /// `Some` ⇒ region-aware (routes via PD); `None` ⇒ direct single-node access.
-    router: Option<Router>,
+    /// `Some` ⇒ region-aware (routes per node via PD); `None` ⇒ direct single-node access.
+    routing: Option<Routing>,
+    /// The single KV client used in direct mode (`None` when region-aware).
+    direct: Option<KvServiceClient<Channel>>,
 }
 
 impl Client {
@@ -167,49 +227,54 @@ impl Client {
     /// established on the first request, so there is no startup race with a server that
     /// is still binding.
     pub fn connect(uri: impl Into<String>) -> Result<Client> {
-        let channel = lazy_channel(uri)?;
-        Ok(Client { kv: KvServiceClient::new(channel), router: None })
+        let channel = lazy_channel(&uri.into())?;
+        Ok(Client { routing: None, direct: Some(KvServiceClient::new(channel)) })
     }
 
-    /// Connect lazily to a KV node and a PD, in **region-aware** mode: requests carry a
-    /// routing context resolved (and cached) from PD, and `RegionStale` responses are
-    /// transparently re-routed and retried.
+    /// Connect lazily to PD in **region-aware** mode: requests are routed per key to the
+    /// owning node (resolved + cached from PD), carry a routing context, and are
+    /// transparently re-routed on `RegionStale`/`NotLeader`. `kv_uri` is kept only as a
+    /// fallback for regions PD reports without an address.
     pub fn connect_with_pd(kv_uri: impl Into<String>, pd_uri: impl Into<String>) -> Result<Client> {
-        let kv = KvServiceClient::new(lazy_channel(kv_uri)?);
-        let pd = PdServiceClient::new(lazy_channel(pd_uri)?);
-        let router = Router { pd, cache: Arc::new(Mutex::new(Vec::new())) };
-        Ok(Client { kv, router: Some(router) })
+        let pd = PdServiceClient::new(lazy_channel(&pd_uri.into())?);
+        let routing = Routing {
+            pd,
+            cache: Arc::new(Mutex::new(Vec::new())),
+            pool: Arc::new(Mutex::new(HashMap::new())),
+            fallback_kv: Some(kv_uri.into()),
+        };
+        Ok(Client { routing: Some(routing), direct: None })
     }
 
-    /// The routing context to stamp on a request for `key` (`None` in direct mode).
-    async fn context_for(&self, key: &[u8]) -> Result<Option<kv::Context>> {
-        match &self.router {
-            Some(r) => Ok(Some(r.context_for(key).await?)),
-            None => Ok(None),
+    /// Resolve `key` to `(optional routing context, the KV client to send to)`. In direct
+    /// mode the context is `None` and the single node is always used.
+    async fn prepare(&self, key: &[u8]) -> Result<(Option<kv::Context>, KvServiceClient<Channel>)> {
+        match &self.routing {
+            Some(r) => {
+                let (ctx, client) = r.resolve(key).await?;
+                Ok((Some(ctx), client))
+            }
+            None => Ok((None, self.direct.clone().expect("direct client present"))),
         }
     }
 
-    /// Drop `key`'s cached route after a `RegionStale` (a no-op in direct mode).
+    /// Drop `key`'s cached route after a `RegionStale`/`NotLeader` (a no-op in direct mode).
     fn invalidate(&self, key: &[u8]) {
-        if let Some(r) = &self.router {
+        if let Some(r) = &self.routing {
             r.invalidate(key);
         }
     }
 
-    /// Allocate a transaction `start_ts`. (Timestamps are global, so begin needs no
-    /// routing context.)
+    /// Allocate a transaction `start_ts`. Timestamps are global; in routed mode this is
+    /// served by the node owning the start of the keyspace, in direct mode by the node.
     pub async fn begin(&mut self) -> Result<u64> {
-        let resp = self
-            .kv
-            .begin(kv::BeginRequest {})
-            .await
-            .map_err(ClientError::Rpc)?
-            .into_inner();
+        let (_ctx, mut kv) = self.prepare(b"").await?;
+        let resp = kv.begin(kv::BeginRequest {}).await.map_err(ClientError::Rpc)?.into_inner();
         Ok(resp.start_ts)
     }
 
     /// Prewrite all mutations (primary first). Returns the first per-key error if any.
-    /// Routed on the primary key; retried on `RegionStale`.
+    /// Routed on the primary key; retried on `RegionStale`/`NotLeader`.
     pub async fn prewrite(
         &mut self,
         start_ts: u64,
@@ -218,9 +283,8 @@ impl Client {
         ttl: u64,
     ) -> Result<()> {
         for _ in 0..MAX_ROUTING_ATTEMPTS {
-            let context = self.context_for(&primary).await?;
-            let resp = self
-                .kv
+            let (context, mut kv) = self.prepare(&primary).await?;
+            let resp = kv
                 .prewrite(kv::PrewriteRequest {
                     start_ts,
                     primary: primary.clone(),
@@ -232,7 +296,7 @@ impl Client {
                 .map_err(ClientError::Rpc)?
                 .into_inner();
             match resp.errors.into_iter().next() {
-                Some(ke) if is_region_stale(&ke) => {
+                Some(ke) if is_reroute(&ke) => {
                     self.invalidate(&primary);
                     continue;
                 }
@@ -244,7 +308,7 @@ impl Client {
     }
 
     /// Commit a prewritten transaction; returns the server-assigned `commit_ts`. Routed
-    /// on the primary key; retried on `RegionStale`.
+    /// on the primary key; retried on `RegionStale`/`NotLeader`.
     pub async fn commit(
         &mut self,
         start_ts: u64,
@@ -252,9 +316,8 @@ impl Client {
         keys: Vec<Vec<u8>>,
     ) -> Result<u64> {
         for _ in 0..MAX_ROUTING_ATTEMPTS {
-            let context = self.context_for(&primary).await?;
-            let resp = self
-                .kv
+            let (context, mut kv) = self.prepare(&primary).await?;
+            let resp = kv
                 .commit(kv::CommitRequest {
                     start_ts,
                     primary: primary.clone(),
@@ -265,7 +328,7 @@ impl Client {
                 .map_err(ClientError::Rpc)?
                 .into_inner();
             match resp.error {
-                Some(ke) if is_region_stale(&ke) => {
+                Some(ke) if is_reroute(&ke) => {
                     self.invalidate(&primary);
                     continue;
                 }
@@ -285,15 +348,14 @@ impl Client {
     pub async fn get_at(&mut self, key: impl Into<Vec<u8>>, read_ts: u64) -> Result<Option<Vec<u8>>> {
         let key = key.into();
         for _ in 0..MAX_ROUTING_ATTEMPTS {
-            let context = self.context_for(&key).await?;
-            let resp = self
-                .kv
+            let (context, mut kv) = self.prepare(&key).await?;
+            let resp = kv
                 .get(kv::GetRequest { key: key.clone(), read_ts, context })
                 .await
                 .map_err(ClientError::Rpc)?
                 .into_inner();
             match resp.error {
-                Some(ke) if is_region_stale(&ke) => {
+                Some(ke) if is_reroute(&ke) => {
                     self.invalidate(&key);
                     continue;
                 }
@@ -309,15 +371,14 @@ impl Client {
         let key = key.into();
         let value = value.into();
         for _ in 0..MAX_ROUTING_ATTEMPTS {
-            let context = self.context_for(&key).await?;
-            let resp = self
-                .kv
+            let (context, mut kv) = self.prepare(&key).await?;
+            let resp = kv
                 .put(kv::PutRequest { key: key.clone(), value: value.clone(), context })
                 .await
                 .map_err(ClientError::Rpc)?
                 .into_inner();
             match resp.error {
-                Some(ke) if is_region_stale(&ke) => {
+                Some(ke) if is_reroute(&ke) => {
                     self.invalidate(&key);
                     continue;
                 }
@@ -332,15 +393,14 @@ impl Client {
     pub async fn delete(&mut self, key: impl Into<Vec<u8>>) -> Result<u64> {
         let key = key.into();
         for _ in 0..MAX_ROUTING_ATTEMPTS {
-            let context = self.context_for(&key).await?;
-            let resp = self
-                .kv
+            let (context, mut kv) = self.prepare(&key).await?;
+            let resp = kv
                 .delete(kv::DeleteRequest { key: key.clone(), context })
                 .await
                 .map_err(ClientError::Rpc)?
                 .into_inner();
             match resp.error {
-                Some(ke) if is_region_stale(&ke) => {
+                Some(ke) if is_reroute(&ke) => {
                     self.invalidate(&key);
                     continue;
                 }
@@ -354,15 +414,32 @@ impl Client {
     /// Split the region owning `split_key` at that key (operational). Returns the
     /// `(left, right)` region ids the node created.
     pub async fn split_region(&mut self, split_key: impl Into<Vec<u8>>) -> Result<(u64, u64)> {
-        let resp = self
-            .kv
-            .split_region(kv::SplitRegionRequest { split_key: split_key.into() })
+        let split_key = split_key.into();
+        let (_ctx, mut kv) = self.prepare(&split_key).await?;
+        let resp = kv
+            .split_region(kv::SplitRegionRequest { split_key: split_key.clone() })
             .await
             .map_err(ClientError::Rpc)?
             .into_inner();
+        // The topology changed; drop the now-stale cached route for this range.
+        self.invalidate(&split_key);
         let left = resp.left.map(|r| r.id).unwrap_or(0);
         let right = resp.right.map(|r| r.id).unwrap_or(0);
         Ok((left, right))
+    }
+
+    /// Merge the region starting at `boundary_key` into its left neighbour (operational,
+    /// the inverse of [`split_region`](Self::split_region)). Returns the merged region id.
+    pub async fn merge_region(&mut self, boundary_key: impl Into<Vec<u8>>) -> Result<u64> {
+        let boundary_key = boundary_key.into();
+        let (_ctx, mut kv) = self.prepare(&boundary_key).await?;
+        let resp = kv
+            .merge_region(kv::MergeRegionRequest { boundary_key: boundary_key.clone() })
+            .await
+            .map_err(ClientError::Rpc)?
+            .into_inner();
+        self.invalidate(&boundary_key);
+        Ok(resp.merged.map(|r| r.id).unwrap_or(0))
     }
 
     /// Range scan — frozen in the wire contract, but the server returns `Unimplemented`
@@ -374,9 +451,8 @@ impl Client {
         limit: u32,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let start_key = start_key.into();
-        let context = self.context_for(&start_key).await?;
-        let resp = self
-            .kv
+        let (context, mut kv) = self.prepare(&start_key).await?;
+        let resp = kv
             .scan(kv::ScanRequest { start_key, end_key: end_key.into(), limit, read_ts: 0, context })
             .await
             .map_err(ClientError::Rpc)?
@@ -399,8 +475,8 @@ impl Client {
     }
 }
 
-fn lazy_channel(uri: impl Into<String>) -> Result<Channel> {
-    Ok(Channel::from_shared(uri.into())
+fn lazy_channel(uri: &str) -> Result<Channel> {
+    Ok(Channel::from_shared(uri.to_string())
         .map_err(|e| ClientError::Key(format!("invalid endpoint: {e}")))?
         .connect_lazy())
 }

@@ -123,11 +123,18 @@ impl TimestampSource for PdClock {
 // Node state
 // ------------------------------------------------------------------------------------
 
-/// PD connection used for heartbeats (reporting this node's regions).
+/// PD connection used for heartbeats (reporting this node's regions + serving address,
+/// and adopting the regions PD assigns back).
 struct PdHandle {
     client: PdServiceClient<Channel>,
     node_id: u64,
+    /// This node's advertised serving endpoint, handed to clients via PD for per-node
+    /// routing (e.g. `"http://127.0.0.1:50051"`).
+    address: String,
 }
+
+/// Default period between liveness heartbeats to PD (PD-connected mode).
+const DEFAULT_HEARTBEAT_MS: u64 = 1_000;
 
 /// Shared node state behind an `Arc`: the storage engine, the timestamp source, the
 /// authoritative region table, and (when PD-connected) a heartbeat handle.
@@ -136,6 +143,10 @@ pub struct AppState {
     clock: Arc<dyn TimestampSource>,
     regions: Arc<RegionRegistry>,
     pd: Option<PdHandle>,
+    /// Period (ms) of the background liveness heartbeat [`serve_on`] runs when
+    /// PD-connected. Settable so tests can heartbeat faster than PD's failure-detector
+    /// timeout. Ignored in direct mode.
+    hb_interval_ms: std::sync::atomic::AtomicU64,
 }
 
 impl AppState {
@@ -145,17 +156,26 @@ impl AppState {
     pub fn open(opts: Options) -> arcux_engine::Result<Arc<AppState>> {
         let regions = Arc::new(RegionRegistry::open(&opts.data_dir).map_err(arcux_engine::Error::from)?);
         let engine = Engine::open(opts)?;
-        Ok(Arc::new(AppState { engine, clock: Arc::new(LocalClock::new()), regions, pd: None }))
+        Ok(Arc::new(AppState {
+            engine,
+            clock: Arc::new(LocalClock::new()),
+            regions,
+            pd: None,
+            hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
+        }))
     }
 
     /// PD-connected mode: timestamps come from the cluster TSO, and the node registers
-    /// its regions with PD (an initial synchronous heartbeat) so clients can route.
+    /// with PD (an initial synchronous heartbeat advertising `address`) — PD is the
+    /// placement authority, so a fresh node starts with no regions and **adopts** the set
+    /// PD assigns it, making them routable before it serves.
     pub async fn open_with_pd(
         opts: Options,
         pd_endpoint: String,
         node_id: u64,
+        address: String,
     ) -> Result<Arc<AppState>, Box<dyn std::error::Error + Send + Sync>> {
-        let regions = Arc::new(RegionRegistry::open(&opts.data_dir)?);
+        let regions = Arc::new(RegionRegistry::open_empty(&opts.data_dir, node_id)?);
         let engine = Engine::open(opts)?;
         let client = PdServiceClient::connect(pd_endpoint).await?;
         let clock: Arc<dyn TimestampSource> = Arc::new(PdClock::new(client.clone()));
@@ -163,19 +183,38 @@ impl AppState {
             engine,
             clock,
             regions,
-            pd: Some(PdHandle { client, node_id }),
+            pd: Some(PdHandle { client, node_id, address }),
+            hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
         });
-        state.heartbeat().await?; // make our regions routable before we start serving
+        state.heartbeat().await?; // register, adopt our assignment, become routable
         Ok(state)
     }
 
-    /// Report this node's current regions to PD (a no-op when not PD-connected).
-    async fn heartbeat(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// Set the background heartbeat period (ms). Must be shorter than PD's failure-detector
+    /// timeout or a live node will be marked down between beats; tests use a small value.
+    pub fn set_heartbeat_interval_ms(&self, ms: u64) {
+        self.hb_interval_ms.store(ms.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Report this node's current regions + address to PD and adopt the regions PD
+    /// assigns back (a no-op when not PD-connected). The two-way exchange seeds a fresh
+    /// node's region set and keeps PD's placement view authoritative. Public so the
+    /// background heartbeat loop (and tests) can drive it.
+    pub async fn heartbeat(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let Some(pd) = &self.pd else { return Ok(()) };
         let regions: Vec<pd::Region> =
             self.regions.list().iter().map(arcux_pd::convert::to_proto).collect();
         let mut client = pd.client.clone();
-        client.heartbeat(pd::HeartbeatRequest { node_id: pd.node_id, regions }).await?;
+        let resp = client
+            .heartbeat(pd::HeartbeatRequest {
+                node_id: pd.node_id,
+                regions,
+                address: pd.address.clone(),
+            })
+            .await?
+            .into_inner();
+        let assigned: Vec<Region> = resp.regions.iter().map(arcux_pd::convert::from_proto).collect();
+        self.regions.adopt(assigned)?;
         Ok(())
     }
 
@@ -442,6 +481,23 @@ impl KvService for KvApi {
             right: Some(region_info(&right)),
         }))
     }
+
+    async fn merge_region(
+        &self,
+        request: Request<kv::MergeRegionRequest>,
+    ) -> Result<Response<kv::MergeRegionResponse>, Status> {
+        let boundary = request.into_inner().boundary_key;
+        let regions = self.state.regions.clone();
+        // Authoritative here (the node owns both halves' epochs); persist off the reactor.
+        let merged = run_blocking(move || regions.merge(&boundary))
+            .await?
+            .map_err(|e| Status::invalid_argument(format!("merge: {e}")))?;
+        // Tell PD about the new topology so clients re-routing after a RegionStale see it.
+        if let Err(e) = self.state.heartbeat().await {
+            return Err(Status::internal(format!("merge applied but PD heartbeat failed: {e}")));
+        }
+        Ok(Response::new(kv::MergeRegionResponse { merged: Some(region_info(&merged)) }))
+    }
 }
 
 impl KvApi {
@@ -516,12 +572,36 @@ pub async fn serve_on<F>(
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    // When PD-connected, keep PD's view of this node fresh with periodic heartbeats (which
+    // also re-adopt our placement). Splits/merges heartbeat inline; this is just liveness.
+    // The task is tied to serve_on's lifetime — stopping the node stops its heartbeats, so
+    // PD's failure detector can notice.
+    let hb_handle = state.pd.as_ref().map(|_| {
+        let hb = state.clone();
+        tokio::spawn(async move {
+            let ms = hb.hb_interval_ms.load(std::sync::atomic::Ordering::Relaxed).max(1);
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(ms));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if let Err(e) = hb.heartbeat().await {
+                    eprintln!("heartbeat to PD failed: {e}");
+                }
+            }
+        })
+    });
+
     let incoming = TcpListenerStream::new(listener);
-    Server::builder()
+    let result = Server::builder()
         .add_service(KvServiceServer::new(KvApi { state }))
         .add_service(RaftServiceServer::new(RaftApi))
         .serve_with_incoming_shutdown(incoming, shutdown)
-        .await
+        .await;
+
+    if let Some(h) = hb_handle {
+        h.abort();
+    }
+    result
 }
 
 /// Open the engine in direct mode, bind `addr`, and serve until Ctrl-C.
@@ -537,30 +617,24 @@ pub async fn serve(
 }
 
 /// Open the engine connected to PD at `pd_endpoint`, bind `addr`, and serve until
-/// Ctrl-C, heartbeating the node's regions to PD periodically.
+/// Ctrl-C, heartbeating the node's regions to PD periodically. `advertise` is the
+/// endpoint clients should reach this node at (defaults to the bound address when empty).
 pub async fn serve_with_pd(
     opts: Options,
     addr: SocketAddr,
     pd_endpoint: String,
     node_id: u64,
+    advertise: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let state = AppState::open_with_pd(opts, pd_endpoint.clone(), node_id).await?;
+    // Bind first so the advertised address reflects the real (possibly ephemeral) port.
     let listener = TcpListener::bind(addr).await?;
-    eprintln!("arcux-server listening on {} (node {node_id}, PD {pd_endpoint})", listener.local_addr()?);
+    let bound = listener.local_addr()?;
+    let address = advertise.unwrap_or_else(|| format!("http://{bound}"));
+    let state =
+        AppState::open_with_pd(opts, pd_endpoint.clone(), node_id, address.clone()).await?;
+    eprintln!("arcux-server listening on {bound} as {address} (node {node_id}, PD {pd_endpoint})");
 
-    // Keep PD's view of this node fresh. Splits also heartbeat inline, so this is just
-    // liveness; failures are logged and retried on the next tick.
-    let hb_state = state.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
-        loop {
-            tick.tick().await;
-            if let Err(e) = hb_state.heartbeat().await {
-                eprintln!("heartbeat to PD failed: {e}");
-            }
-        }
-    });
-
+    // The periodic liveness heartbeat is run by `serve_on` (tied to the serve lifetime).
     serve_on(state, listener, shutdown_signal()).await?;
     Ok(())
 }

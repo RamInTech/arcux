@@ -2,10 +2,13 @@
 //!
 //! Usage:
 //!   arcux-server [--data <dir>] [--listen <addr:port>] [--pd <addr:port>] [--node-id <n>]
+//!                [--address <uri>]
 //!
 //! Without `--pd` the node runs in direct single-node mode (a local timestamp oracle,
 //! no routing enforcement). With `--pd` it joins a cluster: timestamps come from PD's
-//! TSO and the node reports its regions to PD for client routing.
+//! TSO and the node reports its regions to PD for client routing. `--address` is the
+//! endpoint clients should reach this node at (defaults to the bound `--listen` address);
+//! set it when the listen address isn't reachable as-is (e.g. behind NAT / `0.0.0.0`).
 //!
 //! Defaults: --data ./arcux-data, --listen 127.0.0.1:50051, --node-id 1
 
@@ -19,6 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut listen = String::from("127.0.0.1:50051");
     let mut pd: Option<String> = None;
     let mut node_id: u64 = 1;
+    let mut address: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -37,9 +41,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .parse()
                     .map_err(|_| "--node-id must be a u64")?;
             }
+            "--address" => {
+                let a = args.next().ok_or("--address requires a uri")?;
+                address = Some(if a.contains("://") { a } else { format!("http://{a}") });
+            }
             "--help" | "-h" => {
                 println!(
-                    "arcux-server [--data <dir>] [--listen <addr:port>] [--pd <addr:port>] [--node-id <n>]"
+                    "arcux-server [--data <dir>] [--listen <addr:port>] [--pd <addr:port>] \
+                     [--node-id <n>] [--address <uri>]"
                 );
                 return Ok(());
             }
@@ -50,7 +59,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = listen.parse()?;
     let opts = Options::new(data_dir);
     match pd {
-        Some(pd_endpoint) => arcux_server::serve_with_pd(opts, addr, pd_endpoint, node_id).await,
+        Some(pd_endpoint) => {
+            arcux_server::serve_with_pd(opts, addr, pd_endpoint, node_id, address).await
+        }
         None => arcux_server::serve(opts, addr).await,
     }
 }
