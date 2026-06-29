@@ -6,9 +6,11 @@
 
 /// Wire-contract version. Bump only for compatible (append-only) schema changes.
 /// v2 (Phase 3): added `kv.Context` routing + `kv.SplitRegion`, and `pd.Region` /
-/// `pd.ListRegions` / regions on `pd.Heartbeat`. All additions are field-/RPC-additive,
-/// so v1 peers stay wire-compatible.
-pub const VERSION: u32 = 2;
+/// `pd.ListRegions` / regions on `pd.Heartbeat`. v3 (Phase 3b): added node addressing
+/// (`node_id`/`address` on `pd.Region` + `GetRegionResponse`, `address` on
+/// `HeartbeatRequest`) and the assigned-regions list on `HeartbeatResponse`. All
+/// additions are field-additive, so older peers stay wire-compatible.
+pub const VERSION: u32 = 3;
 
 /// KV API v1 — the transactional + autocommit surface (fully implemented in Phase 2).
 pub mod kv {

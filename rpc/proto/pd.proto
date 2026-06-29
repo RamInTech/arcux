@@ -1,12 +1,17 @@
 syntax = "proto3";
 
-// arcux Placement Driver wire contract — v2.
+// arcux Placement Driver wire contract — v3.
 //
 // Phase 3 implements all of PdService: GetTimestamp is served from the authoritative
 // cluster TSO; GetRegion/ListRegions route from PD's aggregated region view; Heartbeat
 // carries the regions a data node owns, which PD aggregates. (GetTimestamp was served
 // from a node-local stand-in in Phase 2.) Field numbers are append-only; every message
 // reserves 50-99.
+//
+// Phase 3b distributes regions across nodes: a region now carries its owning node's id
+// and serving address, Heartbeat advertises the reporting node's address and (in its
+// response) the regions PD authoritatively assigns back to that node. All additions use
+// fresh field numbers, so v2 peers stay wire-compatible.
 
 package pd;
 
@@ -24,6 +29,8 @@ message Region {
   bytes start_key = 2;  // empty => -inf
   bytes end_key = 3;    // empty => +inf
   uint64 epoch = 4;
+  uint64 node_id = 5;   // owning data node (Phase 3b); 0 => unplaced/legacy
+  string address = 6;   // owning node's serving endpoint, e.g. "http://127.0.0.1:50051"
   reserved 50 to 99;
 }
 
@@ -46,15 +53,22 @@ message GetRegionResponse {
   bytes start_key = 2;
   bytes end_key = 3;
   uint64 epoch = 4;
+  uint64 node_id = 5;   // owning data node (Phase 3b)
+  string address = 6;   // owning node's serving endpoint, for per-node routing
   reserved 50 to 99;
 }
 
 message HeartbeatRequest {
   uint64 node_id = 1;
   repeated Region regions = 2;  // the regions this node currently owns
+  string address = 3;           // this node's serving endpoint (Phase 3b)
   reserved 50 to 99;
 }
 message HeartbeatResponse {
+  // The regions PD authoritatively assigns to this node (Phase 3b). On first
+  // heartbeat of a fresh cluster this seeds the node's region set; thereafter it
+  // reflects PD's placement view, making Heartbeat a two-way sync.
+  repeated Region regions = 1;
   reserved 50 to 99;
 }
 

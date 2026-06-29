@@ -30,6 +30,10 @@ service KvService {
   // node is authoritative for its region epochs, so the split takes effect here and is
   // reported to PD on the next heartbeat.
   rpc SplitRegion(SplitRegionRequest) returns (SplitRegionResponse);
+  // Merge the region starting at `boundary_key` into its left neighbour (Phase 3b, the
+  // inverse of SplitRegion). Both halves must live on this node; the epoch is bumped and
+  // the new topology reported to PD on the next heartbeat.
+  rpc MergeRegion(MergeRegionRequest) returns (MergeRegionResponse);
 }
 
 // Routing context a region-aware client attaches to every data request: the region
@@ -194,5 +198,13 @@ message SplitRegionRequest {
 message SplitRegionResponse {
   RegionInfo left = 1;   // original id, range [start, split_key), epoch bumped
   RegionInfo right = 2;  // fresh id, range [split_key, end), epoch bumped
+  reserved 50 to 99;
+}
+message MergeRegionRequest {
+  bytes boundary_key = 1;  // the start key of the right region to fold into its left neighbour
+  reserved 50 to 99;
+}
+message MergeRegionResponse {
+  RegionInfo merged = 1;   // left id, range [left.start, right.end), epoch bumped
   reserved 50 to 99;
 }

@@ -71,20 +71,46 @@ fn pd_messages_roundtrip() {
     roundtrip(&pd::GetTimestampResponse { timestamp: 1000, count: 16 });
 
     let regions = vec![
-        pd::Region { id: 1, start_key: vec![], end_key: b"m".to_vec(), epoch: 2 },
-        pd::Region { id: 2, start_key: b"m".to_vec(), end_key: vec![], epoch: 2 },
+        pd::Region {
+            id: 1,
+            start_key: vec![],
+            end_key: b"m".to_vec(),
+            epoch: 2,
+            node_id: 1,
+            address: "http://n1".into(),
+        },
+        pd::Region {
+            id: 2,
+            start_key: b"m".to_vec(),
+            end_key: vec![],
+            epoch: 2,
+            node_id: 2,
+            address: "http://n2".into(),
+        },
     ];
     roundtrip(&pd::ListRegionsResponse { regions: regions.clone() });
-    roundtrip(&pd::HeartbeatRequest { node_id: 7, regions });
+    roundtrip(&pd::HeartbeatRequest { node_id: 7, regions, address: "http://n7".into() });
+    roundtrip(&pd::HeartbeatResponse {
+        regions: vec![pd::Region {
+            id: 1,
+            start_key: vec![],
+            end_key: vec![],
+            epoch: 1,
+            node_id: 7,
+            address: "http://n7".into(),
+        }],
+    });
     roundtrip(&pd::GetRegionResponse {
         region_id: 2,
         start_key: b"m".to_vec(),
         end_key: vec![],
         epoch: 2,
+        node_id: 2,
+        address: "http://n2".into(),
     });
 }
 
 #[test]
 fn version_is_pinned() {
-    assert_eq!(arcux_rpc::VERSION, 2);
+    assert_eq!(arcux_rpc::VERSION, 3);
 }
