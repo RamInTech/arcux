@@ -15,6 +15,7 @@
 //! Phase 4 will move region ownership under per-region Raft, but the PD contract — one
 //! TSO, epoch-versioned routing — is unchanged by that.
 
+pub mod cluster;
 pub mod convert;
 mod persist;
 pub mod region;
@@ -22,7 +23,8 @@ pub mod server;
 pub mod service;
 pub mod tso;
 
-pub use region::{Region, RegionRegistry};
+pub use cluster::{Membership, PlacedRegion};
+pub use region::{region_id, Region, RegionRegistry};
 pub use server::Pd;
 pub use service::PdApi;
 pub use tso::Tso;

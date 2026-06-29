@@ -1,5 +1,5 @@
 //! The `pd.PdService` gRPC implementation, backed by the [`Tso`](crate::Tso) and the
-//! aggregated [`RegionRegistry`](crate::RegionRegistry).
+//! per-node [`Membership`](crate::Membership) registry.
 
 use std::sync::Arc;
 
@@ -11,19 +11,20 @@ use arcux_rpc::pd::{
     HeartbeatRequest, HeartbeatResponse, ListRegionsRequest, ListRegionsResponse,
 };
 
-use crate::convert::{from_proto, to_proto};
-use crate::{RegionRegistry, Tso};
+use crate::cluster::now_ms;
+use crate::convert::{from_proto, placed_to_proto, to_proto};
+use crate::{Membership, Tso};
 
-/// The PD service handler. Cheap to clone (shares the oracle + registry).
+/// The PD service handler. Cheap to clone (shares the oracle + membership).
 #[derive(Clone)]
 pub struct PdApi {
     tso: Arc<Tso>,
-    regions: Arc<RegionRegistry>,
+    members: Arc<Membership>,
 }
 
 impl PdApi {
-    pub fn new(tso: Arc<Tso>, regions: Arc<RegionRegistry>) -> PdApi {
-        PdApi { tso, regions }
+    pub fn new(tso: Arc<Tso>, members: Arc<Membership>) -> PdApi {
+        PdApi { tso, members }
     }
 }
 
@@ -42,42 +43,47 @@ impl PdService for PdApi {
         Ok(Response::new(GetTimestampResponse { timestamp: first, count }))
     }
 
-    /// Route a single key to its owning region (from PD's aggregated view).
+    /// Route a single key to its owning region **and node** (from PD's live view).
     async fn get_region(
         &self,
         request: Request<GetRegionRequest>,
     ) -> Result<Response<GetRegionResponse>, Status> {
         let key = request.into_inner().key;
-        match self.regions.route(&key) {
-            Some(r) => Ok(Response::new(GetRegionResponse {
-                region_id: r.id,
-                start_key: r.start,
-                end_key: r.end,
-                epoch: r.epoch,
+        match self.members.route(&key) {
+            Some(p) => Ok(Response::new(GetRegionResponse {
+                region_id: p.region.id,
+                start_key: p.region.start,
+                end_key: p.region.end,
+                epoch: p.region.epoch,
+                node_id: p.node_id,
+                address: p.address,
             })),
-            // No node has reported a region covering this key yet.
-            None => Err(Status::not_found("no region covers the key (no node has reported it)")),
+            // No live node owns a region covering this key (none reported, or it is down).
+            None => Err(Status::not_found("no live region covers the key")),
         }
     }
 
-    /// A node reports the regions it currently owns; PD adopts them as its view.
+    /// A node reports the regions it owns + its serving address; PD records its liveness
+    /// and returns the regions it should authoritatively own (seeding a fresh node).
     async fn heartbeat(
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let req = request.into_inner();
-        if !req.regions.is_empty() {
-            self.regions.replace(req.regions.iter().map(from_proto).collect());
-        }
-        Ok(Response::new(HeartbeatResponse {}))
+        let reported = req.regions.iter().map(from_proto).collect();
+        let assigned =
+            self.members.heartbeat(req.node_id, req.address, reported, now_ms());
+        Ok(Response::new(HeartbeatResponse {
+            regions: assigned.iter().map(to_proto).collect(),
+        }))
     }
 
-    /// The whole aggregated region view (for client routing caches and tooling).
+    /// The whole live region view, tagged with owners (for client routing caches/tooling).
     async fn list_regions(
         &self,
         _request: Request<ListRegionsRequest>,
     ) -> Result<Response<ListRegionsResponse>, Status> {
-        let regions = self.regions.list().iter().map(to_proto).collect();
+        let regions = self.members.list().iter().map(placed_to_proto).collect();
         Ok(Response::new(ListRegionsResponse { regions }))
     }
 }

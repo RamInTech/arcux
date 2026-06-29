@@ -73,16 +73,37 @@ impl RegionRegistry {
     /// Open a persistent registry under `dir`, loading the saved region table or, on
     /// first start, bootstrapping a single whole-keyspace region.
     pub fn open(dir: impl AsRef<Path>) -> std::io::Result<RegionRegistry> {
+        Self::open_inner(dir, true, 2)
+    }
+
+    /// Like [`open`](Self::open), but a fresh node starts with **no** regions instead of
+    /// bootstrapping the whole keyspace. Used in PD-connected (multi-node) mode, where PD
+    /// is the placement authority and the node [`adopt`](Self::adopt)s its assignment from
+    /// the heartbeat response — so independent nodes never each claim `[-inf, +inf)`.
+    ///
+    /// `node_id` namespaces the region ids this node mints on split: ids are
+    /// `(node_id << 32) | local`, so two nodes splitting concurrently can never produce
+    /// the same region id without any cross-node coordination. (See [`region_id`].)
+    pub fn open_empty(dir: impl AsRef<Path>, node_id: u64) -> std::io::Result<RegionRegistry> {
+        Self::open_inner(dir, false, region_id(node_id, 1))
+    }
+
+    fn open_inner(
+        dir: impl AsRef<Path>,
+        bootstrap: bool,
+        empty_next_id: u64,
+    ) -> std::io::Result<RegionRegistry> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
         let path = dir.join(REGIONS_FILE);
         let state = match read_optional(&path)? {
             Some(bytes) => decode_state(&bytes)
                 .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "region table corrupt"))?,
-            None => State { regions: vec![whole_keyspace(1)], next_id: 2 },
+            None if bootstrap => State { regions: vec![whole_keyspace(1)], next_id: 2 },
+            None => State { regions: Vec::new(), next_id: empty_next_id },
         };
         let reg = RegionRegistry { state: Mutex::new(state), path: Some(path) };
-        reg.persist()?; // materialize the bootstrap table on first start
+        reg.persist()?; // materialize the table on first start
         Ok(reg)
     }
 
@@ -141,9 +162,41 @@ impl RegionRegistry {
         Ok(result)
     }
 
-    /// Replace the entire view with `regions` (PD applying a node's heartbeat report).
-    /// Keeps the table sorted and advances `next_id` past every id seen so a later
-    /// local split (if any) never collides.
+    /// Merge the region starting exactly at `boundary` into its left neighbour (the
+    /// inverse of [`split`](Self::split)): the two adjacent halves `[a, boundary)` and
+    /// `[boundary, b)` become one region `[a, b)`, keeping the left id and bumping the
+    /// epoch. Returns the merged region. Errors if `boundary` is not a region start or has
+    /// no left neighbour to merge with.
+    pub fn merge(&self, boundary: &[u8]) -> std::io::Result<Region> {
+        let merged = {
+            let mut g = self.state.lock().expect("registry poisoned");
+            let Some(idx) = g.regions.iter().position(|r| r.start.as_slice() == boundary) else {
+                return Err(invalid("boundary is not a region start"));
+            };
+            if idx == 0 {
+                return Err(invalid("the left-most region has no left neighbour to merge with"));
+            }
+            let left = g.regions[idx - 1].clone();
+            let right = g.regions[idx].clone();
+            // Contiguity is an invariant of the table, but assert the shared boundary.
+            debug_assert_eq!(left.end, right.start, "merge requires adjacent regions");
+            let merged = Region {
+                id: left.id,
+                start: left.start,
+                end: right.end,
+                epoch: left.epoch.max(right.epoch) + 1,
+            };
+            g.regions[idx - 1] = merged.clone();
+            g.regions.remove(idx);
+            merged
+        };
+        self.persist()?;
+        Ok(merged)
+    }
+
+    /// Replace the entire view with `regions` (an aggregated, in-memory adoption). Keeps
+    /// the table sorted and advances `next_id` past every id seen so a later local split
+    /// never collides. Does **not** persist — see [`adopt`](Self::adopt).
     pub fn replace(&self, mut regions: Vec<Region>) {
         regions.sort_by(|a, b| a.start.cmp(&b.start));
         let mut g = self.state.lock().expect("registry poisoned");
@@ -151,11 +204,26 @@ impl RegionRegistry {
         g.regions = regions;
     }
 
+    /// Adopt PD's authoritative region assignment (from a heartbeat response) and persist
+    /// it, so the node's owned regions survive a restart. A persisting [`replace`].
+    pub fn adopt(&self, regions: Vec<Region>) -> std::io::Result<()> {
+        self.replace(regions);
+        self.persist()
+    }
+
     fn persist(&self) -> std::io::Result<()> {
         let Some(path) = &self.path else { return Ok(()) };
         let g = self.state.lock().expect("registry poisoned");
         atomic_write(path, &encode_state(&g))
     }
+}
+
+/// Compose a globally-unique region id from the owning node and a node-local counter:
+/// the node id occupies the high 32 bits, the counter the low 32. This lets each node
+/// mint ids on split independently (no allocator round-trip) while guaranteeing no two
+/// nodes ever collide.
+pub fn region_id(node_id: u64, local: u64) -> u64 {
+    (node_id << 32) | (local & 0xFFFF_FFFF)
 }
 
 fn whole_keyspace(id: u64) -> Region {
@@ -241,6 +309,64 @@ mod tests {
         assert!(reg.split(b"m").is_err());
         // Empty key cannot split (it equals every region's −∞ start).
         assert!(reg.split(b"").is_err());
+    }
+
+    #[test]
+    fn merge_is_the_inverse_of_split() {
+        let reg = RegionRegistry::in_memory();
+        let (_l, _r) = reg.split(b"m").unwrap(); // [-inf,m) epoch2 | [m,+inf) epoch2
+        assert_eq!(reg.list().len(), 2);
+
+        let merged = reg.merge(b"m").unwrap();
+        assert_eq!(merged.start, b"");
+        assert_eq!(merged.end, b"");
+        assert_eq!(merged.id, 1, "merge keeps the left id");
+        assert_eq!(merged.epoch, 3, "merge bumps the epoch past both halves");
+
+        // Coverage is whole again, with no gap/overlap.
+        assert_eq!(reg.list().len(), 1);
+        assert_eq!(reg.route(b"a").unwrap().id, 1);
+        assert_eq!(reg.route(b"z").unwrap().id, 1);
+    }
+
+    #[test]
+    fn merge_rejects_non_boundary_and_leftmost() {
+        let reg = RegionRegistry::in_memory();
+        reg.split(b"m").unwrap();
+        // "a" is not a region start.
+        assert!(reg.merge(b"a").is_err());
+        // The left-most region (start "") has no left neighbour.
+        assert!(reg.merge(b"").is_err());
+    }
+
+    #[test]
+    fn split_ids_are_node_namespaced() {
+        // Two nodes splitting independently must never mint the same region id.
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let n1 = RegionRegistry::open_empty(dir1.path(), 1).unwrap();
+        let n2 = RegionRegistry::open_empty(dir2.path(), 2).unwrap();
+        n1.adopt(vec![Region { id: region_id(1, 1), start: vec![], end: b"m".to_vec(), epoch: 1 }])
+            .unwrap();
+        n2.adopt(vec![Region { id: region_id(2, 1), start: b"m".to_vec(), end: vec![], epoch: 1 }])
+            .unwrap();
+
+        let (_l1, r1) = n1.split(b"f").unwrap();
+        let (_l2, r2) = n2.split(b"t").unwrap();
+        assert_eq!(r1.id >> 32, 1, "node 1's new id is in node 1's namespace");
+        assert_eq!(r2.id >> 32, 2, "node 2's new id is in node 2's namespace");
+        assert_ne!(r1.id, r2.id, "independent splits never collide");
+    }
+
+    #[test]
+    fn open_empty_starts_with_no_regions() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = RegionRegistry::open_empty(dir.path(), 1).unwrap();
+        assert!(reg.list().is_empty(), "a fresh PD-mode node owns nothing until assigned");
+        // Adopting PD's assignment persists it.
+        reg.adopt(vec![Region { id: 4, start: b"m".to_vec(), end: vec![], epoch: 2 }]).unwrap();
+        let reloaded = RegionRegistry::open_empty(dir.path(), 1).unwrap();
+        assert_eq!(reloaded.route(b"z").unwrap().id, 4, "adopted regions survive restart");
     }
 
     #[test]

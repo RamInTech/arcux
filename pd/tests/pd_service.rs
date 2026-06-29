@@ -69,17 +69,21 @@ async fn heartbeat_populates_routing() {
     // Before any node reports in, PD cannot route.
     assert!(c.get_region(pd::GetRegionRequest { key: b"k".to_vec() }).await.is_err());
 
-    // A node reports the two regions it owns.
+    // A node reports the two regions it owns, along with its serving address.
     let regions = vec![
         to_proto(&Region { id: 1, start: vec![], end: b"m".to_vec(), epoch: 2 }),
         to_proto(&Region { id: 2, start: b"m".to_vec(), end: vec![], epoch: 2 }),
     ];
-    c.heartbeat(pd::HeartbeatRequest { node_id: 1, regions }).await.unwrap();
+    c.heartbeat(pd::HeartbeatRequest { node_id: 1, regions, address: "http://node1".into() })
+        .await
+        .unwrap();
 
-    // Now routing reflects the reported topology.
+    // Now routing reflects the reported topology, tagged with the owning node.
     let r = c.get_region(pd::GetRegionRequest { key: b"z".to_vec() }).await.unwrap().into_inner();
     assert_eq!(r.region_id, 2);
     assert_eq!(r.epoch, 2);
+    assert_eq!(r.node_id, 1, "PD attributes the region to the reporting node");
+    assert_eq!(r.address, "http://node1", "and carries its serving address for routing");
 
     let all = c.list_regions(pd::ListRegionsRequest {}).await.unwrap().into_inner();
     assert_eq!(all.regions.len(), 2);
