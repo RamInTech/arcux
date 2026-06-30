@@ -63,6 +63,10 @@ enum Cmd {
 struct Observable {
     role: Role,
     leader_id: Option<u64>,
+    /// `true` once this leader has applied an entry of its **current** term (its election
+    /// no-op). Until then it hasn't re-applied prior-term committed entries, so a read would
+    /// not be linearizable — the read barrier (`readIndex`).
+    read_ready: bool,
 }
 
 /// A handle to a running Raft group. Cheap to clone (shares the command channel + the
@@ -98,6 +102,12 @@ pub struct GroupOptions {
 impl RaftGroup {
     pub fn is_leader(&self) -> bool {
         self.obs.lock().unwrap().role == Role::Leader
+    }
+
+    /// Whether this node is a leader that has applied its current-term no-op, so reads it
+    /// serves are linearizable (it has re-applied every prior committed entry).
+    pub fn read_ready(&self) -> bool {
+        self.obs.lock().unwrap().read_ready
     }
 
     pub fn leader_id(&self) -> Option<u64> {
@@ -154,7 +164,8 @@ impl RaftGroup {
 pub fn start(opts: GroupOptions) -> RaftGroup {
     let (cmd_tx, cmd_rx) = smpsc::channel::<Cmd>();
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-    let obs = Arc::new(Mutex::new(Observable { role: Role::Follower, leader_id: None }));
+    let obs =
+        Arc::new(Mutex::new(Observable { role: Role::Follower, leader_id: None, read_ready: false }));
 
     // Pre-build lazy clients for each peer (connect_lazy does no I/O until first call).
     let mut clients: HashMap<u64, RaftServiceClient<Channel>> = HashMap::new();
@@ -212,6 +223,8 @@ fn run_actor(
     let mut pending: BTreeMap<u64, tokio::sync::oneshot::Sender<ProposeResult>> = BTreeMap::new();
     // Tracks leadership so we can commit a no-op on each election (see below).
     let mut was_leader = false;
+    // Term of the last entry applied — drives the read barrier (`read_ready`).
+    let mut applied_term = 0u64;
 
     while let Ok(cmd) = cmd_rx.recv() {
         // A StepReply expects exactly one reply message (addressed back to `from`).
@@ -266,6 +279,7 @@ fn run_actor(
         // Apply newly-committed entries in order; answer each one's parked proposer (if we
         // are the leader that proposed it) with the apply outcome.
         for e in node.take_committed() {
+            applied_term = e.term;
             let outcome = apply(&e.data);
             if let Some(tx) = pending.remove(&e.index) {
                 let _ = tx.send(ProposeResult::Applied(outcome));
@@ -282,7 +296,10 @@ fn run_actor(
             }
         }
 
-        *obs.lock().unwrap() = Observable { role, leader_id: node.leader_id() };
+        // A leader is read-ready once it has applied an entry of its current term (its
+        // no-op) — only then has it re-applied every prior committed entry.
+        let read_ready = role == Role::Leader && applied_term == node.current_term();
+        *obs.lock().unwrap() = Observable { role, leader_id: node.leader_id(), read_ready };
     }
 }
 

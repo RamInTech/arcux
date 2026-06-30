@@ -43,11 +43,13 @@ use arcux_rpc::pd::pd_service_client::PdServiceClient;
 use arcux_rpc::raft::raft_service_server::{RaftService, RaftServiceServer};
 use arcux_rpc::raft;
 
+pub mod multiraft;
 pub mod raft_cmd;
 pub mod raft_group;
 pub mod raft_transport;
 pub mod wal_storage;
 
+use multiraft::{MultiRaft, RegionPlacement};
 use raft_cmd::Command;
 use raft_group::{ApplyFn, GroupOptions, ProposeResult, RaftGroup};
 
@@ -161,10 +163,10 @@ pub struct AppState {
     /// PD-connected. Settable so tests can heartbeat faster than PD's failure-detector
     /// timeout. Ignored in direct mode.
     hb_interval_ms: std::sync::atomic::AtomicU64,
-    /// The per-region Raft group when this node runs **replicated** (Phase 4b). `None` ⇒
-    /// the unreplicated direct/PD path. Writes route through this group's log; reads and
-    /// writes on a non-leader reply `NotLeader`.
-    raft: Option<RaftGroup>,
+    /// The node's region Raft groups when running **replicated** (Phase 4b/4b+/4b++). `None`
+    /// ⇒ the unreplicated direct/PD path. A request routes by key to its region's group;
+    /// writes go through that group's log, and a non-leader replies `NotLeader`.
+    raft: Option<MultiRaft>,
 }
 
 impl AppState {
@@ -210,12 +212,8 @@ impl AppState {
         Ok(state)
     }
 
-    /// **Replicated** mode (Phase 4b): the node hosts one whole-keyspace Raft group across
-    /// `voters`, replicating writes to `peers` (peer id → serving address) over the real
-    /// `RaftService` transport, with a durable [`WalStorage`](wal_storage::WalStorage) log
-    /// under `data_dir/raft`. `clock` is the timestamp source — share one across the group
-    /// (or a PD-backed clock) so `commit_ts` is globally monotonic across a leader change.
-    /// Writes route through the log; a non-leader replies `NotLeader`.
+    /// **Replicated** mode, single whole-keyspace group (Phase 4b) — the degenerate
+    /// one-region [`open_multiraft`](Self::open_multiraft).
     pub fn open_replicated(
         opts: Options,
         node_id: u64,
@@ -223,25 +221,81 @@ impl AppState {
         peers: HashMap<u64, String>,
         clock: Arc<dyn TimestampSource>,
     ) -> Result<Arc<AppState>, Box<dyn std::error::Error + Send + Sync>> {
-        let regions = Arc::new(RegionRegistry::open(&opts.data_dir)?);
-        let storage = wal_storage::WalStorage::open(opts.data_dir.join("raft"))?;
-        let engine = Arc::new(Engine::open(opts)?);
-        let group = raft_group::start(GroupOptions {
-            id: node_id,
+        let placement = RegionPlacement {
+            region_id: 1,
+            start: Vec::new(),
+            end: Vec::new(),
+            epoch: 1,
             voters,
             peers,
-            storage,
-            apply: make_apply(engine.clone()),
-            tick: Duration::from_millis(DEFAULT_RAFT_TICK_MS),
-        });
+        };
+        Self::open_multiraft(opts, node_id, vec![placement], clock)
+    }
+
+    /// **MultiRaft** mode (Phase 4b++): the node hosts one Raft group **per region** in
+    /// `placements`, each across that region's replica set, multiplexed over the one
+    /// `RaftService` transport (an inbound RPC's `group_id` selects the group). All groups
+    /// share the node's single engine — regions own disjoint key ranges — with a durable
+    /// [`WalStorage`](wal_storage::WalStorage) log per region under `data_dir/raft/<id>`.
+    /// `clock` is shared so `commit_ts` is globally monotonic across leaders. A request
+    /// routes by key to its region's group; a non-leader replies `NotLeader`.
+    pub fn open_multiraft(
+        opts: Options,
+        node_id: u64,
+        placements: Vec<RegionPlacement>,
+        clock: Arc<dyn TimestampSource>,
+    ) -> Result<Arc<AppState>, Box<dyn std::error::Error + Send + Sync>> {
+        let data_dir = opts.data_dir.clone();
+        let engine = Arc::new(Engine::open(opts)?);
+
+        // Seed the routing registry with the regions this node hosts.
+        let regions = Arc::new(RegionRegistry::open_empty(&data_dir, node_id)?);
+        regions.adopt(
+            placements
+                .iter()
+                .map(|p| Region {
+                    id: p.region_id,
+                    start: p.start.clone(),
+                    end: p.end.clone(),
+                    epoch: p.epoch,
+                })
+                .collect(),
+        )?;
+
+        // One Raft group per region, all applying into the shared engine.
+        let mut groups = HashMap::new();
+        for p in placements {
+            let storage = wal_storage::WalStorage::open(
+                data_dir.join("raft").join(p.region_id.to_string()),
+            )?;
+            let group = raft_group::start(GroupOptions {
+                group_id: p.region_id,
+                id: node_id,
+                voters: p.voters,
+                peers: p.peers,
+                storage,
+                apply: make_apply(engine.clone()),
+                tick: Duration::from_millis(DEFAULT_RAFT_TICK_MS),
+            });
+            groups.insert(p.region_id, group);
+        }
+
         Ok(Arc::new(AppState {
             engine,
             clock,
             regions,
             pd: None,
             hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
-            raft: Some(group),
+            raft: Some(MultiRaft::new(groups)),
         }))
+    }
+
+    /// The Raft group serving `key` — route key → region → group — or `None` if this node
+    /// isn't replicated or hosts no group for the key's region.
+    fn group_for(&self, key: &[u8]) -> Option<&RaftGroup> {
+        let mr = self.raft.as_ref()?;
+        let region = self.regions.route(key)?;
+        mr.group(region.id)
     }
 
     /// Run a single autocommit write (`Put`/`Delete`) through the Raft log on the leader:
@@ -510,7 +564,10 @@ impl KvService for KvApi {
         request: Request<kv::PrewriteRequest>,
     ) -> Result<Response<kv::PrewriteResponse>, Status> {
         let req = request.into_inner();
-        if let Some(g) = &self.state.raft {
+        if self.state.raft.is_some() {
+            let Some(g) = self.state.group_for(&req.primary) else {
+                return Ok(Response::new(kv::PrewriteResponse { errors: vec![region_stale(0)] }));
+            };
             let error = self.state.replicated_prewrite(g, req).await?;
             return Ok(Response::new(kv::PrewriteResponse { errors: error.into_iter().collect() }));
         }
@@ -539,7 +596,10 @@ impl KvService for KvApi {
         request: Request<kv::CommitRequest>,
     ) -> Result<Response<kv::CommitResponse>, Status> {
         let req = request.into_inner();
-        if let Some(g) = &self.state.raft {
+        if self.state.raft.is_some() {
+            let Some(g) = self.state.group_for(&req.primary) else {
+                return Ok(Response::new(kv::CommitResponse { commit_ts: 0, error: Some(region_stale(0)) }));
+            };
             let (commit_ts, error) = self.state.replicated_commit(g, req).await?;
             return Ok(Response::new(kv::CommitResponse { commit_ts, error }));
         }
@@ -586,14 +646,21 @@ impl KvService for KvApi {
                 read_ts: 0,
             }));
         }
-        // Replicated mode: read on the leader (it has applied every committed write), so a
-        // read is linearizable; a follower redirects with `NotLeader`.
-        if let Some(g) = &self.state.raft {
-            if !g.is_leader() {
+        // Replicated mode: read on the key's region leader (it has applied every committed
+        // write, so the read is linearizable); a follower / unhosted region redirects.
+        if self.state.raft.is_some() {
+            // Serve only on a *read-ready* leader (one past its election no-op), so the read
+            // reflects every committed write; otherwise redirect and let the client retry.
+            let err = match self.state.group_for(&req.key) {
+                Some(g) if g.read_ready() => None,
+                Some(g) => Some(not_leader(g.leader_id())),
+                None => Some(region_stale(0)),
+            };
+            if let Some(error) = err {
                 return Ok(Response::new(kv::GetResponse {
                     found: false,
                     value: vec![],
-                    error: Some(not_leader(g.leader_id())),
+                    error: Some(error),
                     read_ts: 0,
                 }));
             }
@@ -645,7 +712,10 @@ impl KvService for KvApi {
         if let Some(ke) = self.state.check_context(&req.context, &req.key) {
             return Ok(Response::new(kv::PutResponse { commit_ts: 0, error: Some(ke) }));
         }
-        if let Some(g) = &self.state.raft {
+        if self.state.raft.is_some() {
+            let Some(g) = self.state.group_for(&req.key) else {
+                return Ok(Response::new(kv::PutResponse { commit_ts: 0, error: Some(region_stale(0)) }));
+            };
             let (commit_ts, error) =
                 self.state.replicated_autocommit(g, req.key, Value::Put(req.value)).await?;
             return Ok(Response::new(kv::PutResponse { commit_ts, error }));
@@ -668,7 +738,10 @@ impl KvService for KvApi {
         if let Some(ke) = self.state.check_context(&req.context, &req.key) {
             return Ok(Response::new(kv::DeleteResponse { commit_ts: 0, error: Some(ke) }));
         }
-        if let Some(g) = &self.state.raft {
+        if self.state.raft.is_some() {
+            let Some(g) = self.state.group_for(&req.key) else {
+                return Ok(Response::new(kv::DeleteResponse { commit_ts: 0, error: Some(region_stale(0)) }));
+            };
             let (commit_ts, error) =
                 self.state.replicated_autocommit(g, req.key, Value::Delete).await?;
             return Ok(Response::new(kv::DeleteResponse { commit_ts, error }));
@@ -773,9 +846,10 @@ impl RaftService for RaftApi {
         &self,
         request: Request<raft::RequestVoteRequest>,
     ) -> Result<Response<raft::RequestVoteResponse>, Status> {
-        match &self.state.raft {
-            Some(g) => Ok(Response::new(g.handle_request_vote(request.into_inner()).await)),
-            None => Err(Status::unimplemented("this node is not running a Raft group")),
+        let req = request.into_inner();
+        match self.state.raft.as_ref().and_then(|mr| mr.group(req.group_id)) {
+            Some(g) => Ok(Response::new(g.handle_request_vote(req).await)),
+            None => Err(Status::not_found(format!("no Raft group {} on this node", req.group_id))),
         }
     }
 
@@ -783,14 +857,14 @@ impl RaftService for RaftApi {
         &self,
         request: Request<raft::AppendEntriesRequest>,
     ) -> Result<Response<Self::AppendEntriesStream>, Status> {
-        match &self.state.raft {
+        let req = request.into_inner();
+        match self.state.raft.as_ref().and_then(|mr| mr.group(req.group_id)) {
             Some(g) => {
                 // The frozen contract is server-streaming; one append yields one response.
-                let resp = g.handle_append_entries(request.into_inner()).await;
-                let stream = tokio_stream::once(Ok(resp));
-                Ok(Response::new(Box::pin(stream)))
+                let resp = g.handle_append_entries(req).await;
+                Ok(Response::new(Box::pin(tokio_stream::once(Ok(resp)))))
             }
-            None => Err(Status::unimplemented("this node is not running a Raft group")),
+            None => Err(Status::not_found(format!("no Raft group {} on this node", req.group_id))),
         }
     }
 
@@ -839,9 +913,9 @@ where
         })
     });
 
-    // When the server stops, also stop the Raft group — otherwise a "killed" node keeps
-    // heartbeating peers and suppresses the re-election that should follow.
-    let group = state.raft.clone();
+    // When the server stops, also stop this node's Raft groups — otherwise a "killed" node
+    // keeps heartbeating peers and suppresses the re-elections that should follow.
+    let shutdown_state = state.clone();
 
     let incoming = TcpListenerStream::new(listener);
     let result = Server::builder()
@@ -853,8 +927,8 @@ where
     if let Some(h) = hb_handle {
         h.abort();
     }
-    if let Some(g) = group {
-        g.shutdown();
+    if let Some(mr) = &shutdown_state.raft {
+        mr.shutdown();
     }
     result
 }
