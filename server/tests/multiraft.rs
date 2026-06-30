@@ -12,7 +12,7 @@ use arcux_engine::Options;
 use arcux_rpc::kv::key_error::Kind;
 use arcux_rpc::kv::kv_service_client::KvServiceClient;
 use arcux_rpc::kv::{self};
-use arcux_server::multiraft::RegionPlacement;
+use arcux_server::multiraft::{Regime, RegionPlacement};
 use arcux_server::{serve_on, AppState, LocalClock, TimestampSource};
 use tokio::net::TcpListener;
 use tonic::transport::Channel;
@@ -55,6 +55,7 @@ impl Cluster {
                     start: vec![],
                     end: b"m".to_vec(),
                     epoch: 1,
+                    regime: Regime::Cp,
                     voters: ids.to_vec(),
                     peers: peers.clone(),
                 },
@@ -63,6 +64,7 @@ impl Cluster {
                     start: b"m".to_vec(),
                     end: vec![],
                     epoch: 1,
+                    regime: Regime::Cp,
                     voters: ids.to_vec(),
                     peers: peers.clone(),
                 },
