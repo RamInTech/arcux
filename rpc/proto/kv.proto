@@ -34,6 +34,9 @@ service KvService {
   // inverse of SplitRegion). Both halves must live on this node; the epoch is bumped and
   // the new topology reported to PD on the next heartbeat.
   rpc MergeRegion(MergeRegionRequest) returns (MergeRegionResponse);
+  // Internal (node→node): replicate an AP write to a peer replica (Phase 5). Leaderless +
+  // HLC-stamped + Last-Writer-Wins; the coordinator that took the client write fans it out.
+  rpc ReplicateAp(ReplicateApRequest) returns (ReplicateApResponse);
 }
 
 // Routing context a region-aware client attaches to every data request: the region
@@ -206,5 +209,19 @@ message MergeRegionRequest {
 }
 message MergeRegionResponse {
   RegionInfo merged = 1;   // left id, range [left.start, right.end), epoch bumped
+  reserved 50 to 99;
+}
+
+// --- AP replication (Phase 5) ---
+
+message ReplicateApRequest {
+  uint64 region_id = 1;
+  bytes key = 2;
+  bytes value = 3;       // ignored when is_delete
+  bool is_delete = 4;    // true ⇒ a tombstone
+  uint64 hlc_ts = 5;     // the coordinator's HLC stamp; the write's MVCC version + LWW rank
+  reserved 50 to 99;
+}
+message ReplicateApResponse {
   reserved 50 to 99;
 }

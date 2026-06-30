@@ -13,16 +13,27 @@ use std::collections::HashMap;
 
 use crate::raft_group::RaftGroup;
 
-/// How a region is placed: its range/epoch and the replica set hosting its group. Passed to
+/// The consistency regime a region is served under (Phase 5). `Cp` ⇒ Percolator + Raft + TSO
+/// (Snapshot Isolation, leader-based, needs a majority). `Ap` ⇒ leaderless + HLC +
+/// Last-Writer-Wins (always available, eventually consistent).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Regime {
+    Cp,
+    Ap,
+}
+
+/// How a region is placed: its range/epoch, regime, and the replica set hosting it. Passed to
 /// [`crate::AppState::open_multiraft`] — one entry per region this node hosts.
 pub struct RegionPlacement {
     pub region_id: u64,
     pub start: Vec<u8>,
     pub end: Vec<u8>,
     pub epoch: u64,
+    /// Consistency regime (`Cp` ⇒ a Raft group; `Ap` ⇒ a leaderless replica set).
+    pub regime: Regime,
     /// All replica node ids (including this node).
     pub voters: Vec<u64>,
-    /// The other replicas' serving addresses (excludes this node), for the Raft transport.
+    /// The other replicas' serving addresses (excludes this node), for the transport.
     pub peers: HashMap<u64, String>,
 }
 

@@ -10,8 +10,10 @@
 /// (`node_id`/`address` on `pd.Region` + `GetRegionResponse`, `address` on
 /// `HeartbeatRequest`) and the assigned-regions list on `HeartbeatResponse`. v4 (Phase 4b++):
 /// added `group_id` to the Raft RPC requests so one `RaftService` multiplexes many region
-/// groups (MultiRaft). All additions are field-additive, so older peers stay wire-compatible.
-pub const VERSION: u32 = 4;
+/// groups (MultiRaft). v5 (Phase 5): added the internal `kv.ReplicateAp` RPC for the
+/// leaderless AP write path. All additions are field-/RPC-additive, so older peers stay
+/// wire-compatible.
+pub const VERSION: u32 = 5;
 
 /// KV API v1 — the transactional + autocommit surface (fully implemented in Phase 2).
 pub mod kv {

@@ -112,5 +112,5 @@ fn pd_messages_roundtrip() {
 
 #[test]
 fn version_is_pinned() {
-    assert_eq!(arcux_rpc::VERSION, 4);
+    assert_eq!(arcux_rpc::VERSION, 5);
 }

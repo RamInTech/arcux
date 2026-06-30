@@ -43,13 +43,17 @@ use arcux_rpc::pd::pd_service_client::PdServiceClient;
 use arcux_rpc::raft::raft_service_server::{RaftService, RaftServiceServer};
 use arcux_rpc::raft;
 
+pub mod ap;
+pub mod hlc;
 pub mod multiraft;
 pub mod raft_cmd;
 pub mod raft_group;
 pub mod raft_transport;
 pub mod wal_storage;
 
-use multiraft::{MultiRaft, RegionPlacement};
+use ap::ApReplication;
+use hlc::Hlc;
+use multiraft::{MultiRaft, Regime, RegionPlacement};
 use raft_cmd::Command;
 use raft_group::{ApplyFn, GroupOptions, ProposeResult, RaftGroup};
 
@@ -163,10 +167,15 @@ pub struct AppState {
     /// PD-connected. Settable so tests can heartbeat faster than PD's failure-detector
     /// timeout. Ignored in direct mode.
     hb_interval_ms: std::sync::atomic::AtomicU64,
-    /// The node's region Raft groups when running **replicated** (Phase 4b/4b+/4b++). `None`
-    /// ⇒ the unreplicated direct/PD path. A request routes by key to its region's group;
-    /// writes go through that group's log, and a non-leader replies `NotLeader`.
+    /// The node's **CP** region Raft groups (Phase 4b/4b+/4b++). `None` ⇒ the unreplicated
+    /// direct/PD path. A CP request routes by key to its region's group; writes go through
+    /// that group's log, and a non-leader replies `NotLeader`.
     raft: Option<MultiRaft>,
+    /// The node's **AP** regions (Phase 5) — leaderless replica sets. A write to an AP region
+    /// is HLC-stamped, applied locally, and fanned out best-effort to peers.
+    ap: Option<ApReplication>,
+    /// This node's hybrid logical clock — the timestamp source for AP writes.
+    hlc: Arc<Hlc>,
 }
 
 impl AppState {
@@ -183,6 +192,8 @@ impl AppState {
             pd: None,
             hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
             raft: None,
+            ap: None,
+            hlc: Arc::new(Hlc::new()),
         }))
     }
 
@@ -207,6 +218,8 @@ impl AppState {
             pd: Some(PdHandle { client, node_id, address }),
             hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
             raft: None,
+            ap: None,
+            hlc: Arc::new(Hlc::new()),
         });
         state.heartbeat().await?; // register, adopt our assignment, become routable
         Ok(state)
@@ -226,6 +239,7 @@ impl AppState {
             start: Vec::new(),
             end: Vec::new(),
             epoch: 1,
+            regime: Regime::Cp,
             voters,
             peers,
         };
@@ -262,22 +276,29 @@ impl AppState {
                 .collect(),
         )?;
 
-        // One Raft group per region, all applying into the shared engine.
+        // Per region: a CP region gets a Raft group (durable log, applies into the shared
+        // engine); an AP region gets a leaderless replica set (just its peers to forward to).
         let mut groups = HashMap::new();
+        let mut ap = ApReplication::new();
         for p in placements {
-            let storage = wal_storage::WalStorage::open(
-                data_dir.join("raft").join(p.region_id.to_string()),
-            )?;
-            let group = raft_group::start(GroupOptions {
-                group_id: p.region_id,
-                id: node_id,
-                voters: p.voters,
-                peers: p.peers,
-                storage,
-                apply: make_apply(engine.clone()),
-                tick: Duration::from_millis(DEFAULT_RAFT_TICK_MS),
-            });
-            groups.insert(p.region_id, group);
+            match p.regime {
+                Regime::Cp => {
+                    let storage = wal_storage::WalStorage::open(
+                        data_dir.join("raft").join(p.region_id.to_string()),
+                    )?;
+                    let group = raft_group::start(GroupOptions {
+                        group_id: p.region_id,
+                        id: node_id,
+                        voters: p.voters,
+                        peers: p.peers,
+                        storage,
+                        apply: make_apply(engine.clone()),
+                        tick: Duration::from_millis(DEFAULT_RAFT_TICK_MS),
+                    });
+                    groups.insert(p.region_id, group);
+                }
+                Regime::Ap => ap.insert(p.region_id, &p.peers),
+            }
         }
 
         Ok(Arc::new(AppState {
@@ -287,6 +308,8 @@ impl AppState {
             pd: None,
             hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
             raft: Some(MultiRaft::new(groups)),
+            ap: Some(ap),
+            hlc: Arc::new(Hlc::new()),
         }))
     }
 
@@ -296,6 +319,48 @@ impl AppState {
         let mr = self.raft.as_ref()?;
         let region = self.regions.route(key)?;
         mr.group(region.id)
+    }
+
+    /// The id of the **AP** region serving `key`, if this node hosts it (route key → region →
+    /// is it AP?). `None` ⇒ not an AP key on this node (fall through to the CP/direct path).
+    fn ap_for(&self, key: &[u8]) -> Option<u64> {
+        let ap = self.ap.as_ref()?;
+        let region = self.regions.route(key)?;
+        ap.hosts(region.id).then_some(region.id)
+    }
+
+    /// Coordinate an **AP** write: stamp it with this node's HLC, apply it locally
+    /// (`committed_batch` at that single timestamp), then fan it out best-effort to the peer
+    /// replicas — acking after the *local* write (W=1), so it succeeds even with peers down.
+    /// Returns the HLC timestamp (used as the write's `commit_ts` and its LWW rank).
+    async fn ap_write(&self, region_id: u64, key: Vec<u8>, value: Value) -> Result<u64, Status> {
+        let ts = self.hlc.now();
+        let is_delete = value.is_delete();
+        let raw_value = match &value {
+            Value::Put(v) => v.clone(),
+            Value::Delete => Vec::new(),
+        };
+        let batch = committed_batch(&key, &value, ts, ts);
+        let engine = self.engine.clone();
+        run_blocking(move || engine.write(batch))
+            .await?
+            .map_err(|e| Status::internal(format!("ap local write: {e}")))?;
+        if let Some(ap) = &self.ap {
+            ap.fanout(region_id, key, raw_value, is_delete, ts);
+        }
+        Ok(ts)
+    }
+
+    /// Apply a forwarded AP write from a peer: pull our HLC forward to its timestamp, then
+    /// apply the same committed version (idempotent — the ts is the MVCC key).
+    async fn ap_apply(&self, key: Vec<u8>, value: Value, hlc_ts: u64) -> Result<(), Status> {
+        self.hlc.observe(hlc_ts);
+        let batch = committed_batch(&key, &value, hlc_ts, hlc_ts);
+        let engine = self.engine.clone();
+        run_blocking(move || engine.write(batch))
+            .await?
+            .map_err(|e| Status::internal(format!("ap apply: {e}")))?;
+        Ok(())
     }
 
     /// Run a single autocommit write (`Put`/`Delete`) through the Raft log on the leader:
@@ -431,6 +496,14 @@ fn region_stale(new_epoch: u64) -> KeyError {
     KeyError { kind: Some(Kind::RegionStale(RegionStale { new_epoch })) }
 }
 
+/// AP regions are leaderless (HLC + Last-Writer-Wins) and have no 2PC, so transactional
+/// `prewrite`/`commit` aren't supported there — use autocommit `Put`/`Delete`.
+fn ap_no_txn() -> Status {
+    Status::failed_precondition(
+        "AP regions are leaderless (LWW); use autocommit Put/Delete, not transactions",
+    )
+}
+
 /// Build a `NotLeader` key-error; `leader_hint` carries the leader's node id (big-endian),
 /// empty when unknown — a redirect signal the region-aware client retries on.
 fn not_leader(leader: Option<u64>) -> KeyError {
@@ -564,6 +637,9 @@ impl KvService for KvApi {
         request: Request<kv::PrewriteRequest>,
     ) -> Result<Response<kv::PrewriteResponse>, Status> {
         let req = request.into_inner();
+        if self.state.ap_for(&req.primary).is_some() {
+            return Err(ap_no_txn());
+        }
         if self.state.raft.is_some() {
             let Some(g) = self.state.group_for(&req.primary) else {
                 return Ok(Response::new(kv::PrewriteResponse { errors: vec![region_stale(0)] }));
@@ -596,6 +672,9 @@ impl KvService for KvApi {
         request: Request<kv::CommitRequest>,
     ) -> Result<Response<kv::CommitResponse>, Status> {
         let req = request.into_inner();
+        if self.state.ap_for(&req.primary).is_some() {
+            return Err(ap_no_txn());
+        }
         if self.state.raft.is_some() {
             let Some(g) = self.state.group_for(&req.primary) else {
                 return Ok(Response::new(kv::CommitResponse { commit_ts: 0, error: Some(region_stale(0)) }));
@@ -644,6 +723,27 @@ impl KvService for KvApi {
                 value: vec![],
                 error: Some(ke),
                 read_ts: 0,
+            }));
+        }
+        // AP read: leaderless Last-Writer-Wins — any replica returns the highest-HLC version
+        // (read at the max timestamp). No leader, always serveable.
+        if self.state.ap_for(&req.key).is_some() {
+            let state = self.state.clone();
+            let key = req.key.clone();
+            let res = run_blocking(move || state.engine.mvcc_get_unresolved(&key, u64::MAX)).await?;
+            return Ok(Response::new(match res {
+                Ok(found) => kv::GetResponse {
+                    found: found.is_some(),
+                    value: found.unwrap_or_default(),
+                    error: None,
+                    read_ts: 0,
+                },
+                Err(e) => match classify(e) {
+                    Classified::Key(ke) => {
+                        kv::GetResponse { found: false, value: vec![], error: Some(ke), read_ts: 0 }
+                    }
+                    Classified::Status(s) => return Err(s),
+                },
             }));
         }
         // Replicated mode: read on the key's region leader (it has applied every committed
@@ -712,6 +812,10 @@ impl KvService for KvApi {
         if let Some(ke) = self.state.check_context(&req.context, &req.key) {
             return Ok(Response::new(kv::PutResponse { commit_ts: 0, error: Some(ke) }));
         }
+        if let Some(region_id) = self.state.ap_for(&req.key) {
+            let commit_ts = self.state.ap_write(region_id, req.key, Value::Put(req.value)).await?;
+            return Ok(Response::new(kv::PutResponse { commit_ts, error: None }));
+        }
         if self.state.raft.is_some() {
             let Some(g) = self.state.group_for(&req.key) else {
                 return Ok(Response::new(kv::PutResponse { commit_ts: 0, error: Some(region_stale(0)) }));
@@ -737,6 +841,10 @@ impl KvService for KvApi {
         let req = request.into_inner();
         if let Some(ke) = self.state.check_context(&req.context, &req.key) {
             return Ok(Response::new(kv::DeleteResponse { commit_ts: 0, error: Some(ke) }));
+        }
+        if let Some(region_id) = self.state.ap_for(&req.key) {
+            let commit_ts = self.state.ap_write(region_id, req.key, Value::Delete).await?;
+            return Ok(Response::new(kv::DeleteResponse { commit_ts, error: None }));
         }
         if self.state.raft.is_some() {
             let Some(g) = self.state.group_for(&req.key) else {
@@ -803,6 +911,16 @@ impl KvService for KvApi {
             return Err(Status::internal(format!("merge applied but PD heartbeat failed: {e}")));
         }
         Ok(Response::new(kv::MergeRegionResponse { merged: Some(region_info(&merged)) }))
+    }
+
+    async fn replicate_ap(
+        &self,
+        request: Request<kv::ReplicateApRequest>,
+    ) -> Result<Response<kv::ReplicateApResponse>, Status> {
+        let req = request.into_inner();
+        let value = if req.is_delete { Value::Delete } else { Value::Put(req.value) };
+        self.state.ap_apply(req.key, value, req.hlc_ts).await?;
+        Ok(Response::new(kv::ReplicateApResponse {}))
     }
 }
 
