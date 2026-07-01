@@ -44,6 +44,7 @@ use arcux_rpc::raft::raft_service_server::{RaftService, RaftServiceServer};
 use arcux_rpc::raft;
 
 pub mod ap;
+pub mod catalog;
 pub mod hlc;
 pub mod multiraft;
 pub mod raft_cmd;
