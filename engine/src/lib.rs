@@ -23,6 +23,7 @@ pub mod memtable;
 pub mod mvcc;
 pub mod options;
 pub mod percolator;
+pub mod scan;
 pub mod sstable;
 pub mod wal;
 

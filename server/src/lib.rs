@@ -869,11 +869,43 @@ impl KvService for KvApi {
 
     async fn scan(
         &self,
-        _request: Request<kv::ScanRequest>,
+        request: Request<kv::ScanRequest>,
     ) -> Result<Response<kv::ScanResponse>, Status> {
-        Err(Status::unimplemented(
-            "scan lands with the Phase 1b merging iterator; the wire shape is frozen",
-        ))
+        let req = request.into_inner();
+        // `ScanResponse` carries no error field, so a stale route surfaces as a gRPC status.
+        if self.state.check_context(&req.context, &req.start_key).is_some() {
+            return Err(Status::failed_precondition("region stale; re-resolve and rescan"));
+        }
+        // Read semantics from the start key's region (mirrors `get`): AP → non-mutating LWW
+        // at max ts; CP → non-mutating on a read-ready leader; direct → resolving at now.
+        let (use_max_ts, resolve) = if self.state.ap_for(&req.start_key).is_some() {
+            (true, false)
+        } else if self.state.raft.is_some() {
+            match self.state.group_for(&req.start_key) {
+                Some(g) if g.read_ready() => (false, false),
+                Some(_) => return Err(Status::unavailable("not the region leader; scan on the leader")),
+                None => return Err(Status::failed_precondition("region not hosted on this node")),
+            }
+        } else {
+            (false, true)
+        };
+
+        let state = self.state.clone();
+        let pairs = run_blocking(move || {
+            let read_ts = if use_max_ts {
+                u64::MAX
+            } else if req.read_ts == 0 {
+                state.clock.now()
+            } else {
+                req.read_ts
+            };
+            state.engine.scan(&req.start_key, &req.end_key, read_ts, req.limit as usize, resolve)
+        })
+        .await?
+        .map_err(|e| Status::internal(format!("scan: {e}")))?;
+
+        let pairs = pairs.into_iter().map(|(key, value)| kv::Kv { key, value }).collect();
+        Ok(Response::new(kv::ScanResponse { pairs }))
     }
 
     async fn split_region(
