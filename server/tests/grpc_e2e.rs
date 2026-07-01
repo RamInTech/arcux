@@ -128,14 +128,24 @@ async fn snapshot_read_honours_commit_ts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn scan_reports_unimplemented() {
+async fn scan_returns_an_ordered_range() {
     let srv = TestServer::start().await;
     let mut c = srv.client();
 
-    match c.scan(b"a".to_vec(), b"z".to_vec(), 10).await {
-        Err(ClientError::Rpc(s)) => assert_eq!(s.code(), tonic::Code::Unimplemented),
-        other => panic!("expected Unimplemented rpc status, got {other:?}"),
+    for (k, v) in [("k/a", "1"), ("k/b", "2"), ("k/c", "3"), ("k/d", "4"), ("other", "x")] {
+        c.put(k.as_bytes().to_vec(), v.as_bytes().to_vec()).await.unwrap();
     }
+
+    // A prefix range comes back in key order, half-open [start, end).
+    let pairs = c.scan(b"k/".to_vec(), b"k0".to_vec(), 0).await.unwrap();
+    let keys: Vec<Vec<u8>> = pairs.iter().map(|(k, _)| k.clone()).collect();
+    assert_eq!(keys, vec![b"k/a".to_vec(), b"k/b".to_vec(), b"k/c".to_vec(), b"k/d".to_vec()]);
+    assert_eq!(pairs[1].1, b"2".to_vec());
+
+    // `limit` caps the batch.
+    let two = c.scan(b"k/".to_vec(), b"k0".to_vec(), 2).await.unwrap();
+    assert_eq!(two.len(), 2);
+    assert_eq!(two[0].0, b"k/a".to_vec());
 
     srv.stop().await;
 }
