@@ -233,9 +233,13 @@ pub fn start(opts: GroupOptions) -> RaftGroup {
     let snapshot = opts.snapshot;
     let restore = opts.restore;
     let obs_actor = obs.clone();
+    let group_id = opts.group_id;
+    let self_id = opts.id;
     std::thread::Builder::new()
         .name(format!("raft-{}", opts.id))
-        .spawn(move || run_actor(node, apply, snapshot, restore, cmd_rx, out_tx, obs_actor))
+        .spawn(move || {
+            run_actor(node, group_id, self_id, apply, snapshot, restore, cmd_rx, out_tx, obs_actor)
+        })
         .expect("spawn raft actor thread");
 
     // Ticker: drive the logical clock. Stops when the actor is gone (send fails).
@@ -253,8 +257,6 @@ pub fn start(opts: GroupOptions) -> RaftGroup {
     });
 
     // Sender: ship outbound messages to peers, feed responses back in.
-    let self_id = opts.id;
-    let group_id = opts.group_id;
     let feedback = cmd_tx.clone();
     tokio::spawn(run_sender(group_id, self_id, clients, out_rx, feedback));
 
@@ -263,8 +265,26 @@ pub fn start(opts: GroupOptions) -> RaftGroup {
 
 /// The actor loop: own the node, process one command at a time, then drain its effects
 /// (outbound messages, committed entries) and publish observable state.
+/// Print a one-line Raft state transition for an operator watching the terminal: e.g. a node
+/// starting an election (CANDIDATE), winning it (LEADER), or stepping down to follow another
+/// node (FOLLOWER) — always with the election `term`, the unit of Raft's logical clock.
+fn log_raft_transition(region: u64, node: u64, role: Role, term: u64, leader: Option<u64>) {
+    let line = match role {
+        Role::Candidate => format!("CANDIDATE — started an election for term {term}"),
+        Role::Leader => format!("LEADER    — won term {term}, now serving writes"),
+        Role::Follower => match leader {
+            Some(l) => format!("FOLLOWER  — following node {l} in term {term}"),
+            None => format!("FOLLOWER  — term {term}, no leader yet"),
+        },
+    };
+    eprintln!("[raft region {region}] node {node}: {line}");
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_actor(
     mut node: RaftNode<WalStorage>,
+    group_id: u64,
+    self_id: u64,
     apply: ApplyFn,
     snapshot: SnapshotFn,
     restore: RestoreFn,
@@ -278,6 +298,9 @@ fn run_actor(
     let mut was_leader = false;
     // Term of the last entry applied — drives the read barrier (`read_ready`).
     let mut applied_term = 0u64;
+    // Last Raft state we logged, so we announce only genuine transitions (election activity).
+    let (mut last_role, mut last_term, mut last_leader) =
+        (node.role(), node.current_term(), node.leader_id());
 
     while let Ok(cmd) = cmd_rx.recv() {
         // A StepReply expects exactly one reply message (addressed back to `from`).
@@ -320,6 +343,16 @@ fn run_actor(
             let _ = node.propose(Vec::new());
         }
         was_leader = node.role() == Role::Leader;
+
+        // Announce Raft state transitions so an operator can watch elections/failover happen:
+        // who's the candidate, who won, the term, and who each node is following.
+        let (role, term, leader) = (node.role(), node.current_term(), node.leader_id());
+        if (role, term, leader) != (last_role, last_term, last_leader) {
+            log_raft_transition(group_id, self_id, role, term, leader);
+            last_role = role;
+            last_term = term;
+            last_leader = leader;
+        }
 
         // Route outbound messages: the one reply (if any) back to the awaiting RPC, the
         // rest to the sender.
