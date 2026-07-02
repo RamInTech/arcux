@@ -50,6 +50,9 @@ pub enum ClientError {
     Rpc(tonic::Status),
     /// A normal protocol outcome the server reported in-band (conflict, live lock, …).
     Key(String),
+    /// In cluster mode: no reachable node is currently the leader (e.g. an election is in
+    /// progress after a failover). Transient — retry shortly.
+    NoLeader,
 }
 
 impl fmt::Display for ClientError {
@@ -58,6 +61,7 @@ impl fmt::Display for ClientError {
             ClientError::Transport(e) => write!(f, "transport error: {e}"),
             ClientError::Rpc(s) => write!(f, "rpc error: {} ({})", s.message(), s.code()),
             ClientError::Key(m) => write!(f, "key error: {m}"),
+            ClientError::NoLeader => write!(f, "no leader available (election in progress?)"),
         }
     }
 }
@@ -211,6 +215,45 @@ impl Routing {
     }
 }
 
+/// Leader-following routing over a **static** set of node endpoints (no PD). Sends to the
+/// presumed leader; on a `NotLeader` redirect or an unreachable node the caller rotates to the
+/// next endpoint, so the client tracks leadership across elections/failover. Shared across
+/// `Client` clones, so a discovered leader is remembered.
+#[derive(Clone)]
+struct ClusterRouting {
+    /// Every node's KV endpoint, in a fixed order.
+    endpoints: Vec<String>,
+    /// Index into `endpoints` of the node we currently believe is the leader.
+    leader: Arc<Mutex<usize>>,
+    /// One lazily-connected KV client per endpoint index.
+    pool: Arc<Mutex<HashMap<usize, KvServiceClient<Channel>>>>,
+}
+
+impl ClusterRouting {
+    /// The KV client for the presumed leader (lazily connected).
+    fn current(&self) -> Result<KvServiceClient<Channel>> {
+        let idx = *self.leader.lock().unwrap();
+        let mut pool = self.pool.lock().unwrap();
+        if let Some(c) = pool.get(&idx) {
+            return Ok(c.clone());
+        }
+        let client = KvServiceClient::new(lazy_channel(&self.endpoints[idx])?);
+        pool.insert(idx, client.clone());
+        Ok(client)
+    }
+
+    /// The presumed leader wasn't (redirect) or was unreachable — try the next endpoint.
+    fn rotate(&self) {
+        let mut l = self.leader.lock().unwrap();
+        *l = (*l + 1) % self.endpoints.len();
+    }
+
+    /// The endpoint we currently believe leads (for status display).
+    fn current_endpoint(&self) -> String {
+        self.endpoints[*self.leader.lock().unwrap()].clone()
+    }
+}
+
 /// An async, region-aware client. Cheap to `clone` (the channel pool and routing cache are
 /// shared), so concurrent callers each take their own handle.
 #[derive(Clone)]
@@ -219,6 +262,8 @@ pub struct Client {
     routing: Option<Routing>,
     /// The single KV client used in direct mode (`None` when region-aware).
     direct: Option<KvServiceClient<Channel>>,
+    /// `Some` ⇒ leader-following over a static endpoint set (no PD).
+    cluster: Option<ClusterRouting>,
 }
 
 impl Client {
@@ -228,7 +273,32 @@ impl Client {
     /// is still binding.
     pub fn connect(uri: impl Into<String>) -> Result<Client> {
         let channel = lazy_channel(&uri.into())?;
-        Ok(Client { routing: None, direct: Some(KvServiceClient::new(channel)) })
+        Ok(Client { routing: None, direct: Some(KvServiceClient::new(channel)), cluster: None })
+    }
+
+    /// Connect to a **static cluster** of KV nodes (no PD), following the leader: requests go
+    /// to the presumed leader and are transparently re-tried against the next node on a
+    /// `NotLeader` redirect or an unreachable node — so writes keep working across an election
+    /// or failover. `endpoints` is every node's URI (e.g. the three `http://127.0.0.1:5006x`).
+    pub fn connect_cluster(endpoints: Vec<String>) -> Result<Client> {
+        if endpoints.is_empty() {
+            return Err(ClientError::Key("connect_cluster needs at least one endpoint".into()));
+        }
+        Ok(Client {
+            routing: None,
+            direct: None,
+            cluster: Some(ClusterRouting {
+                endpoints,
+                leader: Arc::new(Mutex::new(0)),
+                pool: Arc::new(Mutex::new(HashMap::new())),
+            }),
+        })
+    }
+
+    /// In cluster mode, the endpoint currently believed to be the leader (for status display);
+    /// `None` in direct/PD mode.
+    pub fn current_endpoint(&self) -> Option<String> {
+        self.cluster.as_ref().map(|c| c.current_endpoint())
     }
 
     /// Connect lazily to PD in **region-aware** mode: requests are routed per key to the
@@ -243,12 +313,15 @@ impl Client {
             pool: Arc::new(Mutex::new(HashMap::new())),
             fallback_kv: Some(kv_uri.into()),
         };
-        Ok(Client { routing: Some(routing), direct: None })
+        Ok(Client { routing: Some(routing), direct: None, cluster: None })
     }
 
     /// Resolve `key` to `(optional routing context, the KV client to send to)`. In direct
     /// mode the context is `None` and the single node is always used.
     async fn prepare(&self, key: &[u8]) -> Result<(Option<kv::Context>, KvServiceClient<Channel>)> {
+        if let Some(c) = &self.cluster {
+            return Ok((None, c.current()?));
+        }
         match &self.routing {
             Some(r) => {
                 let (ctx, client) = r.resolve(key).await?;
@@ -258,10 +331,24 @@ impl Client {
         }
     }
 
-    /// Drop `key`'s cached route after a `RegionStale`/`NotLeader` (a no-op in direct mode).
+    /// A route was wrong (`RegionStale`/`NotLeader`) or a node was unreachable: in cluster mode
+    /// rotate to the next node (leader-following), in PD mode drop `key`'s cached route, in
+    /// direct mode a no-op.
     fn invalidate(&self, key: &[u8]) {
-        if let Some(r) = &self.routing {
+        if let Some(c) = &self.cluster {
+            c.rotate();
+        } else if let Some(r) = &self.routing {
             r.invalidate(key);
+        }
+    }
+
+    /// The error to return when the retry loop is exhausted: in cluster mode this means no node
+    /// answered as leader (likely a mid-election window), which the caller can retry.
+    fn exhausted(&self) -> ClientError {
+        if self.cluster.is_some() {
+            ClientError::NoLeader
+        } else {
+            routing_exhausted()
         }
     }
 
@@ -304,7 +391,7 @@ impl Client {
                 None => return Ok(()),
             }
         }
-        Err(routing_exhausted())
+        Err(self.exhausted())
     }
 
     /// Commit a prewritten transaction; returns the server-assigned `commit_ts`. Routed
@@ -336,7 +423,7 @@ impl Client {
                 None => return Ok(resp.commit_ts),
             }
         }
-        Err(routing_exhausted())
+        Err(self.exhausted())
     }
 
     /// Snapshot read at "now" (the server picks a fresh `read_ts`).
@@ -349,11 +436,14 @@ impl Client {
         let key = key.into();
         for _ in 0..MAX_ROUTING_ATTEMPTS {
             let (context, mut kv) = self.prepare(&key).await?;
-            let resp = kv
-                .get(kv::GetRequest { key: key.clone(), read_ts, context })
-                .await
-                .map_err(ClientError::Rpc)?
-                .into_inner();
+            let resp = match kv.get(kv::GetRequest { key: key.clone(), read_ts, context }).await {
+                Ok(r) => r.into_inner(),
+                Err(_status) if self.cluster.is_some() => {
+                    self.invalidate(&key); // node unreachable (killed leader?) — try the next
+                    continue;
+                }
+                Err(status) => return Err(ClientError::Rpc(status)),
+            };
             match resp.error {
                 Some(ke) if is_reroute(&ke) => {
                     self.invalidate(&key);
@@ -363,7 +453,7 @@ impl Client {
                 None => return Ok(if resp.found { Some(resp.value) } else { None }),
             }
         }
-        Err(routing_exhausted())
+        Err(self.exhausted())
     }
 
     /// Autocommit single-key put; returns the `commit_ts`. Routed on the key.
@@ -372,11 +462,17 @@ impl Client {
         let value = value.into();
         for _ in 0..MAX_ROUTING_ATTEMPTS {
             let (context, mut kv) = self.prepare(&key).await?;
-            let resp = kv
+            let resp = match kv
                 .put(kv::PutRequest { key: key.clone(), value: value.clone(), context })
                 .await
-                .map_err(ClientError::Rpc)?
-                .into_inner();
+            {
+                Ok(r) => r.into_inner(),
+                Err(_status) if self.cluster.is_some() => {
+                    self.invalidate(&key); // node unreachable (killed leader?) — try the next
+                    continue;
+                }
+                Err(status) => return Err(ClientError::Rpc(status)),
+            };
             match resp.error {
                 Some(ke) if is_reroute(&ke) => {
                     self.invalidate(&key);
@@ -386,7 +482,7 @@ impl Client {
                 None => return Ok(resp.commit_ts),
             }
         }
-        Err(routing_exhausted())
+        Err(self.exhausted())
     }
 
     /// Autocommit single-key delete; returns the `commit_ts`. Routed on the key.
@@ -394,11 +490,14 @@ impl Client {
         let key = key.into();
         for _ in 0..MAX_ROUTING_ATTEMPTS {
             let (context, mut kv) = self.prepare(&key).await?;
-            let resp = kv
-                .delete(kv::DeleteRequest { key: key.clone(), context })
-                .await
-                .map_err(ClientError::Rpc)?
-                .into_inner();
+            let resp = match kv.delete(kv::DeleteRequest { key: key.clone(), context }).await {
+                Ok(r) => r.into_inner(),
+                Err(_status) if self.cluster.is_some() => {
+                    self.invalidate(&key); // node unreachable (killed leader?) — try the next
+                    continue;
+                }
+                Err(status) => return Err(ClientError::Rpc(status)),
+            };
             match resp.error {
                 Some(ke) if is_reroute(&ke) => {
                     self.invalidate(&key);
@@ -408,7 +507,7 @@ impl Client {
                 None => return Ok(resp.commit_ts),
             }
         }
-        Err(routing_exhausted())
+        Err(self.exhausted())
     }
 
     /// Split the region owning `split_key` at that key (operational). Returns the
@@ -451,13 +550,29 @@ impl Client {
         limit: u32,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let start_key = start_key.into();
-        let (context, mut kv) = self.prepare(&start_key).await?;
-        let resp = kv
-            .scan(kv::ScanRequest { start_key, end_key: end_key.into(), limit, read_ts: 0, context })
-            .await
-            .map_err(ClientError::Rpc)?
-            .into_inner();
-        Ok(resp.pairs.into_iter().map(|p| (p.key, p.value)).collect())
+        let end_key = end_key.into();
+        for _ in 0..MAX_ROUTING_ATTEMPTS {
+            let (context, mut kv) = self.prepare(&start_key).await?;
+            let req = kv::ScanRequest {
+                start_key: start_key.clone(),
+                end_key: end_key.clone(),
+                limit,
+                read_ts: 0,
+                context,
+            };
+            match kv.scan(req).await {
+                Ok(r) => {
+                    return Ok(r.into_inner().pairs.into_iter().map(|p| (p.key, p.value)).collect())
+                }
+                // A non-leader replies `unavailable`; in cluster mode rotate to the next node.
+                Err(_status) if self.cluster.is_some() => {
+                    self.invalidate(&start_key);
+                    continue;
+                }
+                Err(status) => return Err(ClientError::Rpc(status)),
+            }
+        }
+        Err(self.exhausted())
     }
 
     /// Convenience: run a full transaction (`begin → prewrite → commit`) over `mutations`
