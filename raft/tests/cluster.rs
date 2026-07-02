@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use arcux_raft::{Config, Entry, MemStorage, RaftNode, Role};
+use arcux_raft::{ConfChange, Config, Entry, MemStorage, RaftNode, Role};
 
 /// Tracks every entry each node has *applied* (taken via `take_committed`) and
 /// asserts they never disagree at any index — State Machine Safety.
@@ -23,6 +23,9 @@ struct Checker {
     applied: BTreeMap<u64, Vec<Entry>>,
     // index -> the (term, data) first observed as applied there
     committed: BTreeMap<u64, (u64, Vec<u8>)>,
+    // highest index each node has caught up to, whether by applying an entry or
+    // installing a snapshot — the anchor for the per-node contiguity check.
+    applied_hi: BTreeMap<u64, u64>,
 }
 
 impl Checker {
@@ -43,15 +46,34 @@ impl Checker {
             } else {
                 self.committed.insert(e.index, (e.term, e.data.clone()));
             }
-            // applied indices must be contiguous and monotonic per node
+            // applied indices must be contiguous and monotonic per node. After a
+            // snapshot the anchor is the snapshot index, not the last Vec entry.
+            let hi = self.applied_hi.entry(id).or_default();
             assert_eq!(
                 e.index,
-                log.last().map(|p| p.index).unwrap_or(0) + 1,
-                "node {id} applied index {} out of order",
-                e.index
+                *hi + 1,
+                "node {id} applied index {} out of order (expected {})",
+                e.index,
+                *hi + 1
             );
+            *hi = e.index;
             log.push(e);
         }
+    }
+
+    /// A snapshot installed on `id` fast-forwards its state to `index` without
+    /// replaying the individual entries below it. The snapshot came from a leader
+    /// that had those entries committed, so per-index safety is already covered by
+    /// `record`; here we only advance the contiguity anchor so the entries the node
+    /// applies *after* the snapshot (starting at `index + 1`) line up.
+    fn record_snapshot(&mut self, id: u64, index: u64) {
+        let hi = self.applied_hi.entry(id).or_default();
+        assert!(
+            index >= *hi,
+            "node {id} installed a snapshot at {index} below its applied point {}",
+            *hi
+        );
+        *hi = index;
     }
 }
 
@@ -83,11 +105,54 @@ impl Cluster {
 
     fn collect_applied(&mut self) {
         for (id, node) in self.nodes.iter_mut() {
+            // Drain an installed snapshot before committed entries — it moves the
+            // applied point forward and the entries that follow build on top of it.
+            if let Some((idx, _data)) = node.take_snapshot() {
+                self.checker.record_snapshot(*id, idx);
+            }
             let committed = node.take_committed();
             if !committed.is_empty() {
                 self.checker.record(*id, committed);
             }
         }
+    }
+
+    /// Drive a node's log compaction: snapshot its applied state through `index`
+    /// and discard the log at or below it (the driver's job in production).
+    fn compact(&mut self, id: u64, index: u64) {
+        self.nodes
+            .get_mut(&id)
+            .unwrap()
+            .compact(index, format!("snap@{index}").into_bytes());
+    }
+
+    /// Bring up a fresh node with an **empty** bootstrap config — a learner that never
+    /// campaigns until a committed `AddNode` makes it a voter (mirrors starting a new replica
+    /// that discovers its membership from the leader).
+    fn add_learner(&mut self, id: u64) {
+        self.nodes.insert(id, RaftNode::new(Config::new(id, vec![]), MemStorage::new()));
+        self.part.insert(id, 0);
+    }
+
+    /// Propose a single-server membership change on `leader` and settle the messages.
+    fn propose_conf_change(&mut self, leader: u64, cc: ConfChange) {
+        self.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose_conf_change(cc)
+            .expect("argument must be the leader with no change in flight");
+        self.pump();
+    }
+
+    /// Simulate decommissioning a removed node: drop it from the harness entirely (a removed
+    /// server is shut down, so it can no longer send or receive).
+    fn decommission(&mut self, id: u64) {
+        self.nodes.remove(&id);
+        self.part.remove(&id);
+    }
+
+    fn voters(&self, id: u64) -> Vec<u64> {
+        self.nodes[&id].voters().to_vec()
     }
 
     /// Deliver all in-flight messages until the cluster goes quiet.
@@ -133,7 +198,7 @@ impl Cluster {
         for (id, n) in &self.nodes {
             if n.role() == Role::Leader {
                 let t = n.current_term();
-                if best.map_or(true, |(bt, _)| t > bt) {
+                if best.is_none_or(|(bt, _)| t > bt) {
                     best = Some((t, *id));
                 }
             }
@@ -241,8 +306,8 @@ fn single_node_elects_and_commits() {
     assert_eq!(
         c.checker.applied[&1],
         vec![
-            Entry { term: 1, index: 1, data: b"x".to_vec() },
-            Entry { term: 1, index: 2, data: b"y".to_vec() },
+            Entry::normal(1, 1, b"x".to_vec()),
+            Entry::normal(1, 2, b"y".to_vec()),
         ]
     );
 }
@@ -279,9 +344,9 @@ fn leader_replicates_and_commits_on_all() {
     c.tick_n(3);
 
     let expected = vec![
-        Entry { term, index: 1, data: b"a".to_vec() },
-        Entry { term, index: 2, data: b"b".to_vec() },
-        Entry { term, index: 3, data: b"c".to_vec() },
+        Entry::normal(term, 1, b"a".to_vec()),
+        Entry::normal(term, 2, b"b".to_vec()),
+        Entry::normal(term, 3, b"c".to_vec()),
     ];
     for id in [1, 2, 3] {
         assert_eq!(c.commit_index(id), 3, "node {id} commit index");
@@ -310,6 +375,60 @@ fn isolated_follower_catches_up_after_heal() {
     assert_eq!(c.last_index(follower), 3);
     assert_eq!(c.commit_index(follower), 3);
     c.assert_logs_converged();
+}
+
+#[test]
+fn far_behind_follower_catches_up_via_snapshot() {
+    // A follower kept offline long enough that the leader *compacts away* the
+    // entries it still needs must be caught up with an `InstallSnapshot`, not a
+    // log replay — the whole point of log compaction.
+    let mut c = Cluster::new(&[1, 2, 3]);
+    let leader = c.run_until_leader(60);
+    let follower = [1, 2, 3].into_iter().find(|x| *x != leader).unwrap();
+    let in_sync = [1, 2, 3].into_iter().find(|x| *x != leader && *x != follower).unwrap();
+
+    // Cut the follower off; the leader + the other node still commit a burst.
+    c.isolate(follower);
+    for i in 0..6 {
+        c.propose(leader, format!("v{i}").as_bytes());
+    }
+    c.tick_n(3);
+    assert_eq!(c.commit_index(leader), 6, "majority commits the burst");
+    assert_eq!(c.last_index(follower), 0, "isolated follower saw nothing");
+
+    // Both in-sync nodes compact their whole log up to the commit point, dropping
+    // exactly the entries the offline follower is missing.
+    c.compact(leader, 6);
+    c.compact(in_sync, 6);
+    assert!(
+        c.nodes[&leader].log_entries().is_empty(),
+        "leader log compacted away"
+    );
+
+    // Reconnect. The leader can no longer build an AppendEntries for the follower
+    // (next_index is below first_index), so it ships a snapshot instead.
+    c.heal();
+    c.tick_n(8);
+
+    assert_eq!(c.commit_index(follower), 6, "follower caught up to the commit point");
+    assert_eq!(c.last_index(follower), 6);
+    assert!(
+        c.nodes[&follower].log_entries().is_empty(),
+        "follower installed a snapshot rather than replaying 6 entries"
+    );
+
+    // Replication resumes cleanly on top of the snapshot boundary.
+    c.propose(leader, b"after-snap");
+    c.tick_n(3);
+    for id in [1, 2, 3] {
+        assert_eq!(c.commit_index(id), 7, "node {id} commits the post-snapshot entry");
+    }
+    c.assert_logs_converged();
+    assert_eq!(
+        c.checker.committed[&7],
+        (c.nodes[&leader].current_term(), b"after-snap".to_vec()),
+        "the post-snapshot entry is agreed everywhere",
+    );
 }
 
 #[test]
@@ -448,4 +567,63 @@ fn randomized_partitions_preserve_safety() {
         c.tick_n(20);
         c.assert_logs_converged();
     }
+}
+
+#[test]
+fn membership_add_then_remove_a_voter() {
+    // A live 3-node group grows to 4 and shrinks back to 3 via single-server changes, staying
+    // safe and available across both — the Phase 4b++ (rest) membership mechanism.
+    let mut c = Cluster::new(&[1, 2, 3]);
+    let leader = c.run_until_leader(60);
+    c.propose(leader, b"a");
+    c.propose(leader, b"b");
+    c.tick_n(3); // let the commit index ride out to the followers
+    for id in [1, 2, 3] {
+        assert_eq!(c.commit_index(id), 2);
+    }
+
+    // --- ADD a 4th voter -------------------------------------------------
+    c.add_learner(4);
+    assert!(c.voters(4).is_empty(), "a learner starts with no membership of its own");
+    c.propose_conf_change(leader, ConfChange::AddNode(4));
+    c.tick_n(10); // node 4 catches up; the AddNode entry commits and propagates
+
+    for id in [1, 2, 3, 4] {
+        assert_eq!(c.voters(id), vec![1, 2, 3, 4], "node {id} adopted the 4-member config");
+    }
+    assert_eq!(c.last_index(4), c.last_index(leader), "the new voter caught up to the log");
+    let add_commit = c.commit_index(leader);
+    for id in [1, 2, 3, 4] {
+        assert_eq!(c.commit_index(id), add_commit, "node {id} committed the AddNode");
+    }
+    c.assert_logs_converged();
+
+    // The group now runs at RF=4: kill one follower and the remaining three still commit
+    // (majority is 3 of 4), proving the newcomer counts toward quorum.
+    let downed = [1, 2, 3, 4].into_iter().find(|x| *x != leader).unwrap();
+    c.isolate(downed);
+    let c_idx = c.propose(leader, b"c");
+    c.tick_n(4);
+    for id in [1, 2, 3, 4].into_iter().filter(|x| *x != downed) {
+        assert_eq!(c.commit_index(id), c_idx, "3 of 4 commit with one replica down");
+    }
+    c.heal();
+    c.tick_n(6);
+
+    // --- REMOVE a voter --------------------------------------------------
+    let victim = [1, 2, 3, 4].into_iter().find(|x| *x != leader).unwrap();
+    c.propose_conf_change(leader, ConfChange::RemoveNode(victim));
+    c.decommission(victim); // a removed server is shut down — it can no longer disrupt
+    c.tick_n(8);
+
+    let survivors: Vec<u64> = [1, 2, 3, 4].into_iter().filter(|x| *x != victim).collect();
+    for &id in &survivors {
+        assert_eq!(c.voters(id), survivors, "node {id} dropped the removed member");
+    }
+    let d_idx = c.propose(leader, b"d");
+    c.tick_n(4);
+    for &id in &survivors {
+        assert_eq!(c.commit_index(id), d_idx, "the shrunk 3-member group still commits");
+    }
+    c.assert_logs_converged();
 }
