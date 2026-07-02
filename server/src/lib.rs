@@ -56,7 +56,7 @@ use ap::ApReplication;
 use hlc::Hlc;
 use multiraft::{MultiRaft, Regime, RegionPlacement};
 use raft_cmd::Command;
-use raft_group::{ApplyFn, GroupOptions, ProposeResult, RaftGroup};
+use raft_group::{ApplyFn, GroupOptions, ProposeResult, RaftGroup, RestoreFn, SnapshotFn};
 
 /// A logical lease (in TSO ticks) added to `start_ts` to form a lock's expiry. The TSO
 /// is a monotonic counter (not wall-clock), so a generous lease keeps autocommit locks
@@ -294,6 +294,8 @@ impl AppState {
                         peers: p.peers,
                         storage,
                         apply: make_apply(engine.clone()),
+                        snapshot: make_snapshot(engine.clone(), p.start.clone(), p.end.clone()),
+                        restore: make_restore(engine.clone()),
                         tick: Duration::from_millis(DEFAULT_RAFT_TICK_MS),
                     });
                     groups.insert(p.region_id, group);
@@ -320,6 +322,12 @@ impl AppState {
         let mr = self.raft.as_ref()?;
         let region = self.regions.route(key)?;
         mr.group(region.id)
+    }
+
+    /// The Raft group for a region by id, if this node hosts it. Exposed so an operator/PD
+    /// path (or a test) can drive membership changes on the region's group.
+    pub fn raft_group(&self, region_id: u64) -> Option<&RaftGroup> {
+        self.raft.as_ref()?.group(region_id)
     }
 
     /// The id of the **AP** region serving `key`, if this node hosts it (route key → region →
@@ -555,6 +563,78 @@ fn make_apply(engine: Arc<Engine>) -> ApplyFn {
             None => Err(Error::corruption("undecodable raft command")),
         }
     })
+}
+
+/// Capture a region's committed state for a Raft snapshot: the latest committed value for
+/// every key in `[start, end)` (via [`Engine::scan`] at the max read timestamp), serialized
+/// as length-prefixed `(key, value)` pairs. `resolve = false` — a snapshot must not resolve
+/// locks (that is a write, and all writes go through the log); a key still locked by an
+/// in-flight txn is simply not yet part of the committed state.
+///
+/// This is **latest-value-per-key**, not the full MVCC version history — a catching-up
+/// replica only needs the current committed state (full-history snapshots are deferred).
+fn make_snapshot(engine: Arc<Engine>, start: Vec<u8>, end: Vec<u8>) -> SnapshotFn {
+    Arc::new(move || -> Vec<u8> {
+        let pairs = engine.scan(&start, &end, u64::MAX, 0, false).unwrap_or_default();
+        encode_kv_pairs(&pairs)
+    })
+}
+
+/// Load a snapshot produced by [`make_snapshot`] into the engine. Each pair is written as a
+/// committed version at the lowest timestamp, so later commits (higher `commit_ts`) shadow
+/// it and reads at any snapshot see the restored value until then. Version history isn't
+/// reconstructed — see [`make_snapshot`].
+fn make_restore(engine: Arc<Engine>) -> RestoreFn {
+    Arc::new(move |bytes: &[u8]| {
+        for (k, v) in decode_kv_pairs(bytes) {
+            let batch = committed_batch(&k, &Value::Put(v), 1, 1);
+            let _ = engine.write(batch);
+        }
+    })
+}
+
+/// Serialize `(key, value)` pairs: `[count:u64][ (klen:u32) key (vlen:u32) value ]*`.
+fn encode_kv_pairs(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&(pairs.len() as u64).to_be_bytes());
+    for (k, v) in pairs {
+        b.extend_from_slice(&(k.len() as u32).to_be_bytes());
+        b.extend_from_slice(k);
+        b.extend_from_slice(&(v.len() as u32).to_be_bytes());
+        b.extend_from_slice(v);
+    }
+    b
+}
+
+/// Inverse of [`encode_kv_pairs`]; tolerant — returns what parses cleanly and stops at the
+/// first truncation (a snapshot payload is produced by us, so this is defensive).
+fn decode_kv_pairs(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut p = 0usize;
+    let take = |p: &mut usize, n: usize| -> Option<&[u8]> {
+        if *p + n > bytes.len() {
+            return None;
+        }
+        let s = &bytes[*p..*p + n];
+        *p += n;
+        Some(s)
+    };
+    let Some(count_b) = take(&mut p, 8) else { return out };
+    let count = u64::from_be_bytes(count_b.try_into().unwrap());
+    for _ in 0..count {
+        let Some(kl) = take(&mut p, 4).map(|b| u32::from_be_bytes(b.try_into().unwrap()) as usize)
+        else {
+            break;
+        };
+        let Some(k) = take(&mut p, kl).map(<[u8]>::to_vec) else { break };
+        let Some(vl) = take(&mut p, 4).map(|b| u32::from_be_bytes(b.try_into().unwrap()) as usize)
+        else {
+            break;
+        };
+        let Some(v) = take(&mut p, vl).map(<[u8]>::to_vec) else { break };
+        out.push((k, v));
+    }
+    out
 }
 
 fn region_info(r: &Region) -> RegionInfo {
@@ -1021,11 +1101,13 @@ impl RaftService for RaftApi {
 
     async fn install_snapshot(
         &self,
-        _request: Request<raft::InstallSnapshotRequest>,
+        request: Request<raft::InstallSnapshotRequest>,
     ) -> Result<Response<raft::InstallSnapshotResponse>, Status> {
-        // Snapshots / log compaction are a later Phase-4b milestone (the log is unbounded
-        // for now); the wire contract already reserves room.
-        Err(Status::unimplemented("InstallSnapshot lands with Phase-4b log compaction"))
+        let req = request.into_inner();
+        match self.state.raft.as_ref().and_then(|mr| mr.group(req.group_id)) {
+            Some(g) => Ok(Response::new(g.handle_install_snapshot(req).await)),
+            None => Err(Status::not_found(format!("no Raft group {} on this node", req.group_id))),
+        }
     }
 }
 

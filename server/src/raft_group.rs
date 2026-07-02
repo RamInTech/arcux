@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arcux_engine::Error;
-use arcux_raft::{Config, Message, MessageBody, RaftNode, Role};
+use arcux_raft::{ConfChange, Config, EntryType, Message, MessageBody, RaftNode, Role};
 use arcux_rpc::raft;
 use arcux_rpc::raft::raft_service_client::RaftServiceClient;
 use tonic::transport::Channel;
@@ -34,6 +34,18 @@ use crate::wal_storage::WalStorage;
 /// The leader's proposer sees this result (a Percolator conflict surfaces here as `Err`);
 /// followers apply and ignore it.
 pub type ApplyFn = Arc<dyn Fn(&[u8]) -> Result<(), Error> + Send + Sync>;
+
+/// Captures this region's committed state as opaque snapshot bytes (the driver's log
+/// compaction handoff — serialized latest-value-per-key from `Engine::scan`).
+pub type SnapshotFn = Arc<dyn Fn() -> Vec<u8> + Send + Sync>;
+
+/// Loads snapshot bytes produced by a [`SnapshotFn`] back into the region's engine state
+/// (used when this replica installs a leader's `InstallSnapshot`).
+pub type RestoreFn = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+/// How many applied entries may accumulate above the last snapshot before the driver
+/// compacts. A blunt log-length trigger (size-/time-based policy is deferred).
+const COMPACT_THRESHOLD: u64 = 64;
 
 /// Outcome of a leader `propose`.
 #[derive(Debug)]
@@ -53,13 +65,15 @@ enum Cmd {
     StepReply(Message, tokio::sync::oneshot::Sender<Option<Message>>),
     /// Leader-only: append a command, parking `tx` until it commits or we step down.
     Propose(Vec<u8>, tokio::sync::oneshot::Sender<ProposeResult>),
+    /// Leader-only: append a single-server membership change, parking `tx` until it commits.
+    ProposeConf(ConfChange, tokio::sync::oneshot::Sender<ProposeResult>),
     /// Stop the actor (and, by cascade, the ticker + sender) — used to take a node down.
     Stop,
 }
 
 /// Observable, lock-protected snapshot of the node's role/leader (read without messaging
 /// the actor — the hot path for routing decisions).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Observable {
     role: Role,
     leader_id: Option<u64>,
@@ -67,6 +81,9 @@ struct Observable {
     /// no-op). Until then it hasn't re-applied prior-term committed entries, so a read would
     /// not be linearizable — the read barrier (`readIndex`).
     read_ready: bool,
+    /// The group's current voter set (derived from the log; changes on a committed membership
+    /// change). Lets the routing/PD layer observe the replica set.
+    voters: Vec<u64>,
 }
 
 /// A handle to a running Raft group. Cheap to clone (shares the command channel + the
@@ -95,6 +112,10 @@ pub struct GroupOptions {
     /// Applies each committed entry to the state machine (decode + execute), returning the
     /// engine outcome for the proposer.
     pub apply: ApplyFn,
+    /// Captures the region's committed state for log compaction (drives `InstallSnapshot`).
+    pub snapshot: SnapshotFn,
+    /// Loads an installed snapshot's bytes back into the engine.
+    pub restore: RestoreFn,
     /// Logical tick period (one heartbeat per tick; election timeout is ~10–20 ticks).
     pub tick: Duration,
 }
@@ -114,11 +135,26 @@ impl RaftGroup {
         self.obs.lock().unwrap().leader_id
     }
 
+    /// The group's current voter set (its replica ids), as last observed by the actor.
+    pub fn voters(&self) -> Vec<u64> {
+        self.obs.lock().unwrap().voters.clone()
+    }
+
     /// Propose a command (an encoded [`WriteBatch`]) and await its commit. Returns
     /// `NotLeader` immediately if this node isn't the leader.
     pub async fn propose(&self, data: Vec<u8>) -> ProposeResult {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self.cmd_tx.send(Cmd::Propose(data, tx)).is_err() {
+            return ProposeResult::NotLeader { leader_hint: None };
+        }
+        rx.await.unwrap_or(ProposeResult::NotLeader { leader_hint: None })
+    }
+
+    /// Propose a single-server membership change (leader only) and await its commit. Adds or
+    /// removes one voter; the newly-added replica catches up via append/snapshot afterwards.
+    pub async fn propose_conf_change(&self, cc: ConfChange) -> ProposeResult {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.cmd_tx.send(Cmd::ProposeConf(cc, tx)).is_err() {
             return ProposeResult::NotLeader { leader_hint: None };
         }
         rx.await.unwrap_or(ProposeResult::NotLeader { leader_hint: None })
@@ -140,6 +176,15 @@ impl RaftGroup {
     ) -> raft::AppendEntriesResponse {
         let msg = xport::append_request_to_msg(&req, self.id);
         xport::append_response(self.step_reply(msg).await.as_ref())
+    }
+
+    /// Serve an inbound `InstallSnapshot` RPC.
+    pub async fn handle_install_snapshot(
+        &self,
+        req: raft::InstallSnapshotRequest,
+    ) -> raft::InstallSnapshotResponse {
+        let msg = xport::install_snapshot_request_to_msg(&req, self.id);
+        xport::install_snapshot_response(self.step_reply(msg).await.as_ref())
     }
 
     async fn step_reply(&self, msg: Message) -> Option<Message> {
@@ -164,8 +209,12 @@ impl RaftGroup {
 pub fn start(opts: GroupOptions) -> RaftGroup {
     let (cmd_tx, cmd_rx) = smpsc::channel::<Cmd>();
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-    let obs =
-        Arc::new(Mutex::new(Observable { role: Role::Follower, leader_id: None, read_ready: false }));
+    let obs = Arc::new(Mutex::new(Observable {
+        role: Role::Follower,
+        leader_id: None,
+        read_ready: false,
+        voters: Vec::new(),
+    }));
 
     // Pre-build lazy clients for each peer (connect_lazy does no I/O until first call).
     let mut clients: HashMap<u64, RaftServiceClient<Channel>> = HashMap::new();
@@ -181,10 +230,12 @@ pub fn start(opts: GroupOptions) -> RaftGroup {
     // The actor thread owns the node (blocking fsync lives here, off the reactor).
     let node = RaftNode::new(Config::new(opts.id, opts.voters), opts.storage);
     let apply = opts.apply;
+    let snapshot = opts.snapshot;
+    let restore = opts.restore;
     let obs_actor = obs.clone();
     std::thread::Builder::new()
         .name(format!("raft-{}", opts.id))
-        .spawn(move || run_actor(node, apply, cmd_rx, out_tx, obs_actor))
+        .spawn(move || run_actor(node, apply, snapshot, restore, cmd_rx, out_tx, obs_actor))
         .expect("spawn raft actor thread");
 
     // Ticker: drive the logical clock. Stops when the actor is gone (send fails).
@@ -215,6 +266,8 @@ pub fn start(opts: GroupOptions) -> RaftGroup {
 fn run_actor(
     mut node: RaftNode<WalStorage>,
     apply: ApplyFn,
+    snapshot: SnapshotFn,
+    restore: RestoreFn,
     cmd_rx: smpsc::Receiver<Cmd>,
     out_tx: tokio::sync::mpsc::UnboundedSender<Message>,
     obs: Arc<Mutex<Observable>>,
@@ -239,6 +292,14 @@ fn run_actor(
                 reply = Some((from, tx));
             }
             Cmd::Propose(data, tx) => match node.propose(data) {
+                Ok(index) => {
+                    pending.insert(index, tx);
+                }
+                Err(_) => {
+                    let _ = tx.send(ProposeResult::NotLeader { leader_hint: node.leader_id() });
+                }
+            },
+            Cmd::ProposeConf(cc, tx) => match node.propose_conf_change(cc) {
                 Ok(index) => {
                     pending.insert(index, tx);
                 }
@@ -276,14 +337,39 @@ fn run_actor(
             let _ = tx.send(None); // no reply was produced (shouldn't happen)
         }
 
+        // A snapshot the leader installed on us supersedes the log below its index — load its
+        // state into the engine before applying anything above it. `take_snapshot` also
+        // advances `applied_term` implicitly (the entries it covers are already applied).
+        if let Some((_idx, data)) = node.take_snapshot() {
+            restore(&data);
+            applied_term = node.current_term();
+        }
+
         // Apply newly-committed entries in order; answer each one's parked proposer (if we
         // are the leader that proposed it) with the apply outcome.
         for e in node.take_committed() {
             applied_term = e.term;
-            let outcome = apply(&e.data);
+            // A config-change entry's membership effect was already applied by the core; the
+            // state machine has nothing to run for it (its `data` is a ConfChange, not a
+            // command), so skip the apply closure and report success to the proposer.
+            let outcome = if e.entry_type == EntryType::ConfChange {
+                Ok(())
+            } else {
+                apply(&e.data)
+            };
             if let Some(tx) = pending.remove(&e.index) {
                 let _ = tx.send(ProposeResult::Applied(outcome));
             }
+        }
+
+        // Bound the log: once enough entries have accumulated above the last snapshot,
+        // capture the region's committed state and compact everything at/below the applied
+        // point. Every replica does this independently to cap its own log; only a leader ever
+        // *ships* the resulting snapshot (to a follower it can no longer back-fill by append).
+        if node.last_applied() + 1 >= node.first_index() + COMPACT_THRESHOLD {
+            let index = node.last_applied();
+            let bytes = snapshot();
+            node.compact(index, bytes);
         }
 
         // If we've lost leadership, fail any still-parked proposals — their entries can no
@@ -299,7 +385,12 @@ fn run_actor(
         // A leader is read-ready once it has applied an entry of its current term (its
         // no-op) — only then has it re-applied every prior committed entry.
         let read_ready = role == Role::Leader && applied_term == node.current_term();
-        *obs.lock().unwrap() = Observable { role, leader_id: node.leader_id(), read_ready };
+        *obs.lock().unwrap() = Observable {
+            role,
+            leader_id: node.leader_id(),
+            read_ready,
+            voters: node.voters().to_vec(),
+        };
     }
 }
 
@@ -335,13 +426,36 @@ async fn run_sender(
                         }
                     }
                 }
+                MessageBody::InstallSnapshot { last_included_index, .. } => {
+                    // The ack carries only `term`; the follower is caught up to exactly the
+                    // index we shipped, so we re-attach it as its match_index.
+                    let sent = *last_included_index;
+                    if let Ok(resp) =
+                        client.install_snapshot(xport::install_snapshot_request(&m, group_id)).await
+                    {
+                        let reply = xport::install_snapshot_response_to_msg(
+                            &resp.into_inner(),
+                            peer,
+                            self_id,
+                            sent,
+                        );
+                        let _ = feedback.send(Cmd::Step(reply));
+                    }
+                }
                 // Responses are returned by the RPC above, never shipped outbound.
-                MessageBody::RequestVoteResp { .. } | MessageBody::AppendEntriesResp { .. } => {}
+                MessageBody::RequestVoteResp { .. }
+                | MessageBody::AppendEntriesResp { .. }
+                | MessageBody::InstallSnapshotResp { .. } => {}
             }
         });
     }
 }
 
 fn is_response(b: &MessageBody) -> bool {
-    matches!(b, MessageBody::RequestVoteResp { .. } | MessageBody::AppendEntriesResp { .. })
+    matches!(
+        b,
+        MessageBody::RequestVoteResp { .. }
+            | MessageBody::AppendEntriesResp { .. }
+            | MessageBody::InstallSnapshotResp { .. }
+    )
 }

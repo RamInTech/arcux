@@ -19,6 +19,7 @@ message LogEntry {
   uint64 term = 1;
   uint64 index = 2;
   bytes data = 3;
+  uint32 entry_type = 4;  // Phase 4b++ rest: 0 = normal, 1 = config change (membership)
   reserved 50 to 99;
 }
 
@@ -60,6 +61,7 @@ message InstallSnapshotRequest {
   uint64 last_included_term = 4;
   bytes data = 5;
   uint64 group_id = 6;  // Phase 4b++: which region's Raft group (MultiRaft multiplexing)
+  repeated uint64 conf_state = 7;  // Phase 4b++ rest: group membership as of the snapshot
   reserved 50 to 99;
 }
 message InstallSnapshotResponse {

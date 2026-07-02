@@ -32,14 +32,18 @@
 //! assert_eq!(n.take_committed().len(), 1);
 //! ```
 //!
-//! Not yet in this milestone (the next Phase-4 step): `InstallSnapshot` / log
-//! compaction and single-server membership changes. The wire contract already
-//! reserves room for both.
+//! `InstallSnapshot` / log compaction land in Phase 4b++ (see [`Snapshot`] and the
+//! [`Storage`] compaction methods): a node snapshots its committed state, discards the log
+//! below it, and fast-forwards a far-behind replica with a snapshot instead of the whole
+//! log. **Single-server membership changes** also land in 4b++ (see [`ConfChange`] and
+//! [`RaftNode::propose_conf_change`]): one add/remove at a time, effective on append, with the
+//! resulting voter set recorded in the log + snapshot so a newcomer adopts it directly.
+//! PD-on-Raft and PD-driven automatic re-replication are the remaining Phase-4 work.
 
 pub mod message;
 pub mod node;
 pub mod storage;
 
-pub use message::{Entry, HardState, Message, MessageBody};
+pub use message::{ConfChange, Entry, EntryType, HardState, Message, MessageBody};
 pub use node::{Config, ProposeError, RaftNode, Role};
-pub use storage::{MemStorage, Storage};
+pub use storage::{MemStorage, Snapshot, Storage};
