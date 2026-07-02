@@ -1201,6 +1201,32 @@ pub async fn serve_with_pd(
     Ok(())
 }
 
+/// Open the engine as a **replicated CP node** — a single whole-keyspace Raft group across
+/// `voters` — bind `addr`, and serve until Ctrl-C. This node is `node_id` (which must be one
+/// of `voters`); `peers` maps the *other* voter ids to their gRPC addresses so the group can
+/// replicate. Timestamps come from a local clock, so run one cluster per machine-time source;
+/// front the nodes with PD for a globally monotonic oracle in a real deployment.
+///
+/// Writes go to whichever node the group elected leader (others reply `NotLeader`); killing
+/// the leader triggers a re-election among the survivors.
+pub async fn serve_replicated(
+    opts: Options,
+    addr: SocketAddr,
+    node_id: u64,
+    voters: Vec<u64>,
+    peers: HashMap<u64, String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let clock: Arc<dyn TimestampSource> = Arc::new(LocalClock::new());
+    let state = AppState::open_replicated(opts, node_id, voters.clone(), peers, clock)?;
+    let listener = TcpListener::bind(addr).await?;
+    eprintln!(
+        "arcux-server listening on {} (replicated CP, node {node_id}, voters {voters:?})",
+        listener.local_addr()?
+    );
+    serve_on(state, listener, shutdown_signal()).await?;
+    Ok(())
+}
+
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     eprintln!("arcux-server shutting down");
