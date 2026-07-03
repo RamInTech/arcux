@@ -301,6 +301,7 @@ fn run_actor(
     // Last Raft state we logged, so we announce only genuine transitions (election activity).
     let (mut last_role, mut last_term, mut last_leader) =
         (node.role(), node.current_term(), node.leader_id());
+    let mut last_vote = node.voted_for();
 
     while let Ok(cmd) = cmd_rx.recv() {
         // A StepReply expects exactly one reply message (addressed back to `from`).
@@ -352,6 +353,19 @@ fn run_actor(
             last_role = role;
             last_term = term;
             last_leader = leader;
+        }
+
+        // Log when this node grants its vote to *another* node (a follower backing a candidate);
+        // a candidate voting for itself is already implied by the CANDIDATE transition above.
+        let vote = node.voted_for();
+        if vote != last_vote {
+            if let Some(cand) = vote.filter(|c| *c != self_id) {
+                eprintln!(
+                    "[raft region {group_id}] node {self_id}: voted for node {cand} in term {}",
+                    node.current_term()
+                );
+            }
+            last_vote = vote;
         }
 
         // Route outbound messages: the one reply (if any) back to the awaiting RPC, the
