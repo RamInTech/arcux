@@ -172,6 +172,11 @@ impl<S: Storage> RaftNode<S> {
     pub fn voted_for(&self) -> Option<u64> {
         self.voted_for
     }
+    /// The nodes (including self) that have granted this candidate a vote this term — the tally
+    /// that drives election victory. Only meaningful while [`Role::Candidate`].
+    pub fn votes(&self) -> Vec<u64> {
+        self.votes.iter().copied().collect()
+    }
     pub fn commit_index(&self) -> u64 {
         self.commit_index
     }

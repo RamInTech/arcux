@@ -27,7 +27,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arcux_engine::keys::{encode_data_key, encode_write_value};
+use arcux_engine::keys::{decode_data_key, encode_data_key, encode_write_value};
 use arcux_engine::{Cf, Engine, Error, Mutation, Options, Transaction, Value, WriteBatch};
 use arcux_pd::{Region, RegionRegistry, Tso};
 use tokio::net::TcpListener;
@@ -161,6 +161,8 @@ const DEFAULT_RAFT_TICK_MS: u64 = 30;
 /// authoritative region table, and (when PD-connected) a heartbeat handle.
 pub struct AppState {
     pub engine: Arc<Engine>,
+    /// This node's id — used only to label server-side operation logs.
+    node_id: u64,
     clock: Arc<dyn TimestampSource>,
     regions: Arc<RegionRegistry>,
     pd: Option<PdHandle>,
@@ -188,6 +190,7 @@ impl AppState {
         let engine = Arc::new(Engine::open(opts)?);
         Ok(Arc::new(AppState {
             engine,
+            node_id: 1,
             clock: Arc::new(LocalClock::new()),
             regions,
             pd: None,
@@ -214,6 +217,7 @@ impl AppState {
         let clock: Arc<dyn TimestampSource> = Arc::new(PdClock::new(client.clone()));
         let state = Arc::new(AppState {
             engine,
+            node_id,
             clock,
             regions,
             pd: Some(PdHandle { client, node_id, address }),
@@ -293,7 +297,7 @@ impl AppState {
                         voters: p.voters,
                         peers: p.peers,
                         storage,
-                        apply: make_apply(engine.clone()),
+                        apply: make_apply(engine.clone(), node_id, p.region_id),
                         snapshot: make_snapshot(engine.clone(), p.start.clone(), p.end.clone()),
                         restore: make_restore(engine.clone()),
                         tick: Duration::from_millis(DEFAULT_RAFT_TICK_MS),
@@ -306,6 +310,7 @@ impl AppState {
 
         Ok(Arc::new(AppState {
             engine,
+            node_id,
             clock,
             regions,
             pd: None,
@@ -344,6 +349,7 @@ impl AppState {
     /// Returns the HLC timestamp (used as the write's `commit_ts` and its LWW rank).
     async fn ap_write(&self, region_id: u64, key: Vec<u8>, value: Value) -> Result<u64, Status> {
         let ts = self.hlc.now();
+        log_kv(region_id, self.node_id, "AP write (local, fanning out)", &key, ts);
         let is_delete = value.is_delete();
         let raw_value = match &value {
             Value::Put(v) => v.clone(),
@@ -364,6 +370,8 @@ impl AppState {
     /// apply the same committed version (idempotent — the ts is the MVCC key).
     async fn ap_apply(&self, key: Vec<u8>, value: Value, hlc_ts: u64) -> Result<(), Status> {
         self.hlc.observe(hlc_ts);
+        let region_id = self.regions.route(&key).map(|r| r.id).unwrap_or(0);
+        log_kv(region_id, self.node_id, "AP replicated (from peer)", &key, hlc_ts);
         let batch = committed_batch(&key, &value, hlc_ts, hlc_ts);
         let engine = self.engine.clone();
         run_blocking(move || engine.write(batch))
@@ -536,13 +544,37 @@ fn committed_batch(key: &[u8], value: &Value, start_ts: u64, commit_ts: u64) -> 
 /// the same log prefix against identical state) by reusing the single-node Percolator. The
 /// returned engine `Result` answers the leader's proposer; a Percolator conflict is an
 /// `Err` here, surfaced to the client as a `KeyError`. An empty entry is the election no-op.
-fn make_apply(engine: Arc<Engine>) -> ApplyFn {
+/// Print a KV data operation on this node's terminal (server-side observability). Keys are
+/// shown as text. CP writes are logged from the apply path (so on **every** replica); AP writes
+/// from the receiving node and again on each peer; reads only on the node that serves them.
+fn log_kv(region: u64, node: u64, what: &str, key: &[u8], ts: u64) {
+    eprintln!(
+        "[kv region {region}] node {node}: {what} {} @ {ts}",
+        String::from_utf8_lossy(key)
+    );
+}
+
+/// Log each user key in a committed autocommit batch (recovered from its Write-CF entry).
+fn log_committed_write(region: u64, node: u64, batch: &WriteBatch) {
+    for op in &batch.ops {
+        if op.cf() == Cf::Write {
+            if let Some((user_key, commit_ts)) = decode_data_key(op.key()) {
+                log_kv(region, node, "committed (raft)", user_key, commit_ts);
+            }
+        }
+    }
+}
+
+fn make_apply(engine: Arc<Engine>, node_id: u64, region_id: u64) -> ApplyFn {
     Arc::new(move |data: &[u8]| -> Result<(), Error> {
         if data.is_empty() {
             return Ok(());
         }
         match Command::decode(data) {
             Some(Command::Autocommit(batch)) => {
+                // Log on *every* replica that applies this committed entry — a CP write shows
+                // up in all nodes' terminals, the visible face of Raft replication.
+                log_committed_write(region_id, node_id, &batch);
                 engine.write(batch)?;
                 Ok(())
             }
@@ -550,6 +582,10 @@ fn make_apply(engine: Arc<Engine>) -> ApplyFn {
                 Transaction::new(&engine, start_ts, mutations)?.prewrite(ttl)
             }
             Some(Command::Commit { primary, keys, start_ts, commit_ts }) => {
+                eprintln!(
+                    "[kv region {region_id}] node {node_id}: committed txn ({} key(s)) @ {commit_ts} (raft)",
+                    keys.len()
+                );
                 // Commit reads each mutation's *key* only; values are placeholders, with the
                 // primary first (mirrors the direct commit path).
                 let mut muts = vec![Mutation::delete(primary.clone())];
@@ -808,7 +844,8 @@ impl KvService for KvApi {
         }
         // AP read: leaderless Last-Writer-Wins — any replica returns the highest-HLC version
         // (read at the max timestamp). No leader, always serveable.
-        if self.state.ap_for(&req.key).is_some() {
+        if let Some(region_id) = self.state.ap_for(&req.key) {
+            log_kv(region_id, self.state.node_id, "GET (AP, this node)", &req.key, 0);
             let state = self.state.clone();
             let key = req.key.clone();
             let res = run_blocking(move || state.engine.mvcc_get_unresolved(&key, u64::MAX)).await?;
@@ -846,6 +883,13 @@ impl KvService for KvApi {
                 }));
             }
         }
+        log_kv(
+            self.state.regions.route(&req.key).map(|r| r.id).unwrap_or(0),
+            self.state.node_id,
+            "GET (leader/direct)",
+            &req.key,
+            0,
+        );
         let state = self.state.clone();
         // In a replicated region, reads must not mutate (lock resolution is a write that
         // would bypass Raft), so use the non-resolving read; the direct path resolves.
@@ -1223,6 +1267,44 @@ pub async fn serve_replicated(
         "arcux-server listening on {} (replicated CP, node {node_id}, voters {voters:?})",
         listener.local_addr()?
     );
+    serve_on(state, listener, shutdown_signal()).await?;
+    Ok(())
+}
+
+/// Open a **catalog-driven multi-region** node: the keyspace is tiled at the declared tables'
+/// prefix boundaries and each region is hosted per its regime — a **CP** table as a Raft group
+/// (replicated across `voters`), an **AP** table as a leaderless HLC/LWW replica set (fanning
+/// out to `peers`). `node_id` is this node (must be one of `voters`); undeclared key ranges
+/// default to CP (strong-by-default). Bind `addr` and serve until Ctrl-C.
+pub async fn serve_catalog(
+    opts: Options,
+    addr: SocketAddr,
+    node_id: u64,
+    voters: Vec<u64>,
+    peers: HashMap<u64, String>,
+    tables: Vec<(String, Regime)>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut cat = catalog::Catalog::new();
+    for (name, regime) in &tables {
+        cat.create_table(name, *regime);
+    }
+    let placements = cat.placements(voters.clone(), peers);
+
+    let clock: Arc<dyn TimestampSource> = Arc::new(LocalClock::new());
+    let state = AppState::open_multiraft(opts, node_id, placements, clock)?;
+    let listener = TcpListener::bind(addr).await?;
+
+    let map = tables
+        .iter()
+        .map(|(n, r)| format!("{n}={}", if *r == Regime::Ap { "AP" } else { "CP" }))
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!(
+        "arcux-server listening on {} (catalog, node {node_id}, voters {voters:?})",
+        listener.local_addr()?
+    );
+    eprintln!("  tables: {map}  (undeclared keys: CP)");
+
     serve_on(state, listener, shutdown_signal()).await?;
     Ok(())
 }
