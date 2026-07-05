@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use arcux_engine::Options;
+use arcux_server::multiraft::Regime;
 
 const HELP: &str = "\
 arcux-server [--data <dir>] [--listen <addr:port>] [--node-id <n>]
@@ -42,12 +43,17 @@ arcux-server [--data <dir>] [--listen <addr:port>] [--node-id <n>]
       --base-port <p>          base port for --cluster (default 50060; node i => base+i)
       --voters    <id,...>     replicated CP (explicit): the full voter set
       --peer      <id>=<addr>  address of another voter (repeatable)
+      --table     <name>=cp|ap declare a table's regime (repeatable); undeclared keys are CP
 
 easy local 3-node cluster (one per terminal):
   arcux-server -n 1 -c 3
   arcux-server -n 2 -c 3
   arcux-server -n 3 -c 3
-=> nodes listen on 127.0.0.1:50061/50062/50063, data in ./arcux-n1/2/3";
+=> nodes listen on 127.0.0.1:50061/50062/50063, data in ./arcux-n1/2/3
+
+single node with a CP table and an AP table:
+  arcux-server --table ledger=cp --table likes=ap
+=> keys under ledger/ are strongly consistent (Raft); likes/ is leaderless AP";
 
 /// Normalize a bare `addr:port` to a full `http://` URI (leaving an explicit scheme as-is).
 fn as_uri(s: &str) -> String {
@@ -69,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut peers: HashMap<u64, String> = HashMap::new();
     let mut cluster: Option<u64> = None;
     let mut base_port: u16 = 50060;
+    let mut tables: Vec<(String, Regime)> = Vec::new();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -116,6 +123,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let id: u64 = id.parse().map_err(|_| format!("--peer id {id:?} is not a u64"))?;
                 peers.insert(id, as_uri(addr));
             }
+            "--table" => {
+                let spec = args.next().ok_or("--table requires <name>=<cp|ap>")?;
+                let (name, regime) = spec
+                    .split_once('=')
+                    .ok_or_else(|| format!("--table must be <name>=<cp|ap>, got {spec:?}"))?;
+                let regime = match regime.to_ascii_lowercase().as_str() {
+                    "cp" => Regime::Cp,
+                    "ap" => Regime::Ap,
+                    other => return Err(format!("--table regime must be cp or ap, got {other:?}").into()),
+                };
+                tables.push((name.to_string(), regime));
+            }
             "--help" | "-h" => {
                 println!("{HELP}");
                 return Ok(());
@@ -148,6 +167,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listen = listen.unwrap_or_else(|| "127.0.0.1:50051".to_string());
     let addr: SocketAddr = listen.parse()?;
     let opts = Options::new(data_dir.unwrap_or_else(|| "./arcux-data".to_string()));
+
+    // Catalog mode: --table declarations tile the keyspace into per-regime regions (CP tables
+    // as Raft groups, AP tables leaderless). Runs single-node unless a replica set was given.
+    if !tables.is_empty() {
+        if pd.is_some() {
+            return Err("--table (catalog mode) and --pd are mutually exclusive".into());
+        }
+        let voters = if voters.is_empty() { vec![node_id] } else { voters };
+        if !voters.contains(&node_id) {
+            return Err(format!("--node-id {node_id} must be one of the voters {voters:?}").into());
+        }
+        for v in voters.iter().filter(|v| **v != node_id) {
+            if !peers.contains_key(v) {
+                return Err(format!("missing --peer {v}=<addr> for voter {v}").into());
+            }
+        }
+        return arcux_server::serve_catalog(opts, addr, node_id, voters, peers, tables).await;
+    }
 
     // Mode selection: replicated CP (voters set) ⇒ Raft, else --pd ⇒ PD, else direct.
     if !voters.is_empty() {

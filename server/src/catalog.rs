@@ -66,6 +66,52 @@ impl Catalog {
             peers,
         }
     }
+
+    /// Tile the whole keyspace into contiguous regions cut at the declared tables' prefix
+    /// boundaries — each region carries the regime of the range it covers (declared tables get
+    /// theirs; the gaps between/around them default to CP). Every region shares the same
+    /// replica set (`voters`/`peers`); [`crate::AppState::open_multiraft`] then hosts each CP
+    /// region as a Raft group and each AP region as a leaderless replica set.
+    pub fn placements(
+        &self,
+        voters: Vec<u64>,
+        peers: HashMap<u64, String>,
+    ) -> Vec<RegionPlacement> {
+        // Boundaries: the keyspace start, plus each table prefix's start and its successor.
+        let mut bounds: Vec<Vec<u8>> = vec![Vec::new()];
+        for (prefix, _) in &self.tables {
+            bounds.push(prefix.clone());
+            if let Some(succ) = prefix_successor(prefix) {
+                bounds.push(succ);
+            }
+        }
+        bounds.sort();
+        bounds.dedup();
+
+        // Consecutive boundaries form the regions; the last runs to +∞ (empty end).
+        bounds
+            .iter()
+            .enumerate()
+            .map(|(i, start)| {
+                let end = bounds.get(i + 1).cloned().unwrap_or_default();
+                self.place(i as u64 + 1, start.clone(), end, voters.clone(), peers.clone())
+            })
+            .collect()
+    }
+}
+
+/// The smallest key strictly greater than every key having `prefix` — i.e. the exclusive end
+/// of the prefix range (`b"a/"` → `b"a0"`). `None` when `prefix` is all `0xff` (no upper bound).
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.last_mut() {
+        if *last < 0xff {
+            *last += 1;
+            return Some(end);
+        }
+        end.pop();
+    }
+    None
 }
 
 impl Default for Catalog {
@@ -121,6 +167,32 @@ mod tests {
         cat.create_table("t", Regime::Cp);
         cat.create_table("t", Regime::Ap);
         assert_eq!(cat.regime_for(b"t/k"), Regime::Ap);
+    }
+
+    #[test]
+    fn placements_tile_the_keyspace_by_regime() {
+        let mut cat = Catalog::new();
+        cat.create_table("ledger", Regime::Cp);
+        cat.create_table("likes", Regime::Ap);
+        let ps = cat.placements(vec![1, 2, 3], HashMap::new());
+
+        // Contiguous, gap-free tiling from "" (start) to +∞ (empty end).
+        assert_eq!(ps.first().unwrap().start, b"");
+        assert!(ps.last().unwrap().end.is_empty(), "last region runs to +inf");
+        for w in ps.windows(2) {
+            assert_eq!(w[0].end, w[1].start, "regions must be contiguous");
+        }
+
+        // Each key lands in a region carrying its catalog regime.
+        let regime_of = |key: &[u8]| {
+            ps.iter()
+                .find(|p| key >= p.start.as_slice() && (p.end.is_empty() || key < p.end.as_slice()))
+                .unwrap()
+                .regime
+        };
+        assert_eq!(regime_of(b"likes/post7"), Regime::Ap);
+        assert_eq!(regime_of(b"ledger/acct1"), Regime::Cp);
+        assert_eq!(regime_of(b"zzz"), Regime::Cp, "undeclared keys default to CP");
     }
 
     #[test]
