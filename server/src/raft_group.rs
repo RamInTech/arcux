@@ -302,6 +302,8 @@ fn run_actor(
     let (mut last_role, mut last_term, mut last_leader) =
         (node.role(), node.current_term(), node.leader_id());
     let mut last_vote = node.voted_for();
+    // Votes this node has already tallied as a candidate, so we log each newly-arrived one.
+    let mut last_votes: std::collections::BTreeSet<u64> = node.votes().into_iter().collect();
 
     while let Ok(cmd) = cmd_rx.recv() {
         // A StepReply expects exactly one reply message (addressed back to `from`).
@@ -345,18 +347,11 @@ fn run_actor(
         }
         was_leader = node.role() == Role::Leader;
 
-        // Announce Raft state transitions so an operator can watch elections/failover happen:
-        // who's the candidate, who won, the term, and who each node is following.
-        let (role, term, leader) = (node.role(), node.current_term(), node.leader_id());
-        if (role, term, leader) != (last_role, last_term, last_leader) {
-            log_raft_transition(group_id, self_id, role, term, leader);
-            last_role = role;
-            last_term = term;
-            last_leader = leader;
-        }
+        // Log election activity *before* the role transition, so within the step that a
+        // candidate receives its winning vote you read "received vote (2/2)" then "LEADER won".
 
-        // Log when this node grants its vote to *another* node (a follower backing a candidate);
-        // a candidate voting for itself is already implied by the CANDIDATE transition above.
+        // This node granting its vote to *another* node (a follower backing a candidate); a
+        // candidate voting for itself is already implied by the CANDIDATE transition below.
         let vote = node.voted_for();
         if vote != last_vote {
             if let Some(cand) = vote.filter(|c| *c != self_id) {
@@ -366,6 +361,31 @@ fn run_actor(
                 );
             }
             last_vote = vote;
+        }
+
+        // Candidate side: each newly-received vote + the running tally toward a majority. No
+        // role guard — the winning vote flips the node to Leader in the same step, and votes
+        // only ever grow during an active campaign (a new election clears the set first).
+        let votes: std::collections::BTreeSet<u64> = node.votes().into_iter().collect();
+        let majority = node.voters().len() / 2 + 1;
+        for granter in votes.difference(&last_votes).filter(|g| **g != self_id) {
+            eprintln!(
+                "[raft region {group_id}] node {self_id}: received vote from node {granter} ({}/{} for term {})",
+                votes.len(),
+                majority,
+                node.current_term()
+            );
+        }
+        last_votes = votes;
+
+        // Announce the resulting Raft state transition: who's the candidate, who won, the term,
+        // and who each node is following.
+        let (role, term, leader) = (node.role(), node.current_term(), node.leader_id());
+        if (role, term, leader) != (last_role, last_term, last_leader) {
+            log_raft_transition(group_id, self_id, role, term, leader);
+            last_role = role;
+            last_term = term;
+            last_leader = leader;
         }
 
         // Route outbound messages: the one reply (if any) back to the awaiting RPC, the
