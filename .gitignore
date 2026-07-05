@@ -2,6 +2,10 @@
 **/*.rs.bk
 *.pdb
 .claude
+.DS_Store
+/arcux-data
+/arcux-pd-data
+/arcux-n*
 arcux.md
 phase1_details.md
 phase1b_details.md
@@ -15,3 +19,5 @@ phase4b++_details.md
 pending.md
 phase5_details.md
 phase5b_details.md
+
+command.md
