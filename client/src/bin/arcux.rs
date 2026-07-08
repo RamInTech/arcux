@@ -90,8 +90,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => eprintln!("usage: connect <uri>"),
             },
             _ => {
-                run_command(&mut client, &args).await;
-                announce_leader_change(&client, &mut last_leader);
+                // Only announce a leader change on success — a failed op may have rotated the
+                // presumed-leader index (e.g. cycling through unreachable nodes), and "leader is
+                // now X" would be misleading after "can't reach any server".
+                if run_command(&mut client, &args).await {
+                    announce_leader_change(&client, &mut last_leader);
+                } else {
+                    last_leader = client.current_endpoint();
+                }
             }
         }
     }
@@ -102,12 +108,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Run one command, waiting out a mid-election window: in cluster mode a `NoLeader` result is
 /// transient (the cluster is picking a new leader), so retry with a short backoff before giving
-/// up. Any other error is reported immediately.
-async fn run_command(client: &mut Client, args: &[String]) {
+/// up. Any other error is reported immediately. Returns `true` iff the command succeeded.
+async fn run_command(client: &mut Client, args: &[String]) -> bool {
     let mut announced = false;
     for _ in 0..40 {
         match dispatch(client, args).await {
-            Ok(()) => return,
+            Ok(()) => return true,
+            // Nodes are up but leaderless (a CP mid-election): wait it out and retry.
             Err(e) if is_no_leader(e.as_ref()) => {
                 if !announced {
                     eprintln!("{DIM}· no leader right now — waiting for the cluster to elect one…{RESET}");
@@ -115,18 +122,30 @@ async fn run_command(client: &mut Client, args: &[String]) {
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
+            // Not a single node answered — the servers themselves are down. There's no election
+            // to wait out, so say so plainly and stop rather than spinning on "no leader".
+            Err(e) if is_unreachable(e.as_ref()) => {
+                eprintln!("{DIM}error:{RESET} can't reach any arcux server — is the cluster running?");
+                return false;
+            }
             Err(e) => {
                 eprintln!("{DIM}error:{RESET} {e}");
-                return;
+                return false;
             }
         }
     }
     eprintln!("{DIM}error:{RESET} still no leader after retrying — is a majority of the cluster up?");
+    false
 }
 
 /// True if the boxed error is a transient `NoLeader` (cluster mid-election).
 fn is_no_leader(e: &(dyn std::error::Error + 'static)) -> bool {
     matches!(e.downcast_ref::<ClientError>(), Some(ClientError::NoLeader))
+}
+
+/// True if the boxed error is `Unreachable` (no configured node could be contacted).
+fn is_unreachable(e: &(dyn std::error::Error + 'static)) -> bool {
+    matches!(e.downcast_ref::<ClientError>(), Some(ClientError::Unreachable))
 }
 
 /// After an op, if the presumed leader endpoint changed (a failover), say so.

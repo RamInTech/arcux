@@ -50,9 +50,13 @@ pub enum ClientError {
     Rpc(tonic::Status),
     /// A normal protocol outcome the server reported in-band (conflict, live lock, …).
     Key(String),
-    /// In cluster mode: no reachable node is currently the leader (e.g. an election is in
-    /// progress after a failover). Transient — retry shortly.
+    /// In cluster mode: a node answered but none is currently the leader (e.g. an election is
+    /// in progress after a failover). Transient — retry shortly.
     NoLeader,
+    /// In cluster mode: not one configured node could be reached (every attempt was a transport
+    /// failure) — the cluster is likely down. Distinct from `NoLeader`, where nodes *are* up but
+    /// leaderless: there is no election to wait out here, the servers themselves are unreachable.
+    Unreachable,
 }
 
 impl fmt::Display for ClientError {
@@ -62,6 +66,7 @@ impl fmt::Display for ClientError {
             ClientError::Rpc(s) => write!(f, "rpc error: {} ({})", s.message(), s.code()),
             ClientError::Key(m) => write!(f, "key error: {m}"),
             ClientError::NoLeader => write!(f, "no leader available (election in progress?)"),
+            ClientError::Unreachable => write!(f, "no arcux server reachable (is the cluster running?)"),
         }
     }
 }
@@ -342,11 +347,17 @@ impl Client {
         }
     }
 
-    /// The error to return when the retry loop is exhausted: in cluster mode this means no node
-    /// answered as leader (likely a mid-election window), which the caller can retry.
-    fn exhausted(&self) -> ClientError {
+    /// The error to return when the retry loop is exhausted. In cluster mode this splits on
+    /// whether any node actually answered: if one did but none was leader it's `NoLeader` (a
+    /// mid-election window, worth retrying); if *no* node could be reached at all it's
+    /// `Unreachable` (the cluster is down — no election to wait out).
+    fn exhausted(&self, reached_a_node: bool) -> ClientError {
         if self.cluster.is_some() {
-            ClientError::NoLeader
+            if reached_a_node {
+                ClientError::NoLeader
+            } else {
+                ClientError::Unreachable
+            }
         } else {
             routing_exhausted()
         }
@@ -391,7 +402,9 @@ impl Client {
                 None => return Ok(()),
             }
         }
-        Err(self.exhausted())
+        // A transport error returns `Rpc` above, so exhaustion here means a live node kept
+        // redirecting us (`NotLeader`/`RegionStale`) — a reachable-but-leaderless window.
+        Err(self.exhausted(true))
     }
 
     /// Commit a prewritten transaction; returns the server-assigned `commit_ts`. Routed
@@ -423,7 +436,9 @@ impl Client {
                 None => return Ok(resp.commit_ts),
             }
         }
-        Err(self.exhausted())
+        // A transport error returns `Rpc` above, so exhaustion here means a live node kept
+        // redirecting us (`NotLeader`/`RegionStale`) — a reachable-but-leaderless window.
+        Err(self.exhausted(true))
     }
 
     /// Snapshot read at "now" (the server picks a fresh `read_ts`).
@@ -434,10 +449,14 @@ impl Client {
     /// Snapshot read at an explicit `read_ts` (0 ⇒ server picks "now").
     pub async fn get_at(&mut self, key: impl Into<Vec<u8>>, read_ts: u64) -> Result<Option<Vec<u8>>> {
         let key = key.into();
+        let mut reached_a_node = false;
         for _ in 0..MAX_ROUTING_ATTEMPTS {
             let (context, mut kv) = self.prepare(&key).await?;
             let resp = match kv.get(kv::GetRequest { key: key.clone(), read_ts, context }).await {
-                Ok(r) => r.into_inner(),
+                Ok(r) => {
+                    reached_a_node = true; // a live server answered (leader or a redirect)
+                    r.into_inner()
+                }
                 Err(_status) if self.cluster.is_some() => {
                     self.invalidate(&key); // node unreachable (killed leader?) — try the next
                     continue;
@@ -453,20 +472,24 @@ impl Client {
                 None => return Ok(if resp.found { Some(resp.value) } else { None }),
             }
         }
-        Err(self.exhausted())
+        Err(self.exhausted(reached_a_node))
     }
 
     /// Autocommit single-key put; returns the `commit_ts`. Routed on the key.
     pub async fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<u64> {
         let key = key.into();
         let value = value.into();
+        let mut reached_a_node = false;
         for _ in 0..MAX_ROUTING_ATTEMPTS {
             let (context, mut kv) = self.prepare(&key).await?;
             let resp = match kv
                 .put(kv::PutRequest { key: key.clone(), value: value.clone(), context })
                 .await
             {
-                Ok(r) => r.into_inner(),
+                Ok(r) => {
+                    reached_a_node = true; // a live server answered (leader or a redirect)
+                    r.into_inner()
+                }
                 Err(_status) if self.cluster.is_some() => {
                     self.invalidate(&key); // node unreachable (killed leader?) — try the next
                     continue;
@@ -482,16 +505,20 @@ impl Client {
                 None => return Ok(resp.commit_ts),
             }
         }
-        Err(self.exhausted())
+        Err(self.exhausted(reached_a_node))
     }
 
     /// Autocommit single-key delete; returns the `commit_ts`. Routed on the key.
     pub async fn delete(&mut self, key: impl Into<Vec<u8>>) -> Result<u64> {
         let key = key.into();
+        let mut reached_a_node = false;
         for _ in 0..MAX_ROUTING_ATTEMPTS {
             let (context, mut kv) = self.prepare(&key).await?;
             let resp = match kv.delete(kv::DeleteRequest { key: key.clone(), context }).await {
-                Ok(r) => r.into_inner(),
+                Ok(r) => {
+                    reached_a_node = true; // a live server answered (leader or a redirect)
+                    r.into_inner()
+                }
                 Err(_status) if self.cluster.is_some() => {
                     self.invalidate(&key); // node unreachable (killed leader?) — try the next
                     continue;
@@ -507,7 +534,7 @@ impl Client {
                 None => return Ok(resp.commit_ts),
             }
         }
-        Err(self.exhausted())
+        Err(self.exhausted(reached_a_node))
     }
 
     /// Split the region owning `split_key` at that key (operational). Returns the
@@ -572,7 +599,9 @@ impl Client {
                 Err(status) => return Err(ClientError::Rpc(status)),
             }
         }
-        Err(self.exhausted())
+        // Only transport-failure rotations reach here (an `Ok` returns above), so no node was
+        // reachable ⇒ `Unreachable`, never `NoLeader`.
+        Err(self.exhausted(false))
     }
 
     /// Convenience: run a full transaction (`begin → prewrite → commit`) over `mutations`
