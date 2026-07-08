@@ -64,7 +64,7 @@ Client SDK  ──▶  routes each key to its owning region (and, for CP, to tha
 
 - [`engine/`](engine/) — the storage engine (`arcux-engine`): write-ahead log, MVCC over an LSM tree, crash recovery, and single-node Percolator transactions.
 - [`rpc/`](rpc/) — the gRPC wire contract (`kv`/`raft`/`pd` protobufs) and generated code.
-- [`pd/`](pd/) — the Placement Driver (`arcux-pd`): cluster timestamp oracle, region registry, per-node membership and failure detection.
+- [`pd/`](pd/) — the Placement Driver (`arcux-pd`): cluster timestamp oracle, region registry, per-node membership and failure detection. Runs either single-process or as a **replicated 3-node Raft group** (`arcux-pd --cluster 3`) built on the same `arcux-raft` core, so a PD leader failure keeps the router and never regresses the timestamp oracle.
 - [`raft/`](raft/) — the hand-rolled Raft consensus core (`arcux-raft`): election, replication, commit safety, persistence, snapshotting, membership changes — built transport-free and proven deterministically.
 - [`server/`](server/) — the `tonic` server (`arcux-server`): binds Raft groups to regions, runs the AP leaderless path, hosts the consistency catalog, and serves the KV/PD RPCs.
   - `raft_group.rs` — per-region Raft group driver.
