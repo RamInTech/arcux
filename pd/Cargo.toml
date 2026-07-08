@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 arcux-rpc = { path = "../rpc" }
+arcux-raft = { path = "../raft" }
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true

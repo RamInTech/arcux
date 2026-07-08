@@ -45,6 +45,7 @@ dependencies = [
 name = "arcux-pd"
 version = "0.1.0"
 dependencies = [
+ "arcux-raft",
  "arcux-rpc",
  "prost",
  "tempfile",
