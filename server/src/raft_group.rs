@@ -47,6 +47,12 @@ pub type RestoreFn = Arc<dyn Fn(&[u8]) + Send + Sync>;
 /// compacts. A blunt log-length trigger (size-/time-based policy is deferred).
 const COMPACT_THRESHOLD: u64 = 64;
 
+/// How many ticks a leader may sit with parked-but-uncommittable writes before we log that
+/// it's stalled for lack of a follower majority. Comfortably longer than a heartbeat (so a
+/// healthy commit never trips it) but short enough to explain a hang quickly (~0.5s at the
+/// default 30ms tick).
+const STALL_LOG_TICKS: u32 = 15;
+
 /// Outcome of a leader `propose`.
 #[derive(Debug)]
 pub enum ProposeResult {
@@ -304,10 +310,16 @@ fn run_actor(
     let mut last_vote = node.voted_for();
     // Votes this node has already tallied as a candidate, so we log each newly-arrived one.
     let mut last_votes: std::collections::BTreeSet<u64> = node.votes().into_iter().collect();
+    // Leader-stall detection: consecutive ticks a leader has held uncommittable parked writes,
+    // and whether we've already logged the current stall (so we announce it just once).
+    let mut stall_ticks = 0u32;
+    let mut stall_logged = false;
 
     while let Ok(cmd) = cmd_rx.recv() {
         // A StepReply expects exactly one reply message (addressed back to `from`).
         let mut reply: Option<(u64, tokio::sync::oneshot::Sender<Option<Message>>)> = None;
+        // Only advance the stall clock on real time passing (a tick), not on every message.
+        let ticked = matches!(cmd, Cmd::Tick);
 
         match cmd {
             Cmd::Tick => node.tick(),
@@ -446,6 +458,36 @@ fn run_actor(
             let hint = node.leader_id();
             for (_, tx) in std::mem::take(&mut pending) {
                 let _ = tx.send(ProposeResult::NotLeader { leader_hint: hint });
+            }
+        }
+
+        // Leader-without-majority: a leader appends a write to its own log, but `commit_index`
+        // can only advance once a *majority* of voters persist it. If the other replicas are
+        // down, parked proposals sit uncommitted forever and the write hangs (correct CP
+        // behaviour — no split-brain). Detect that state and log it once, so an operator
+        // watching sees *why* writes stopped landing, and log again when a majority returns.
+        if ticked {
+            let uncommitted = node.last_log_index().saturating_sub(node.commit_index());
+            let stalled = role == Role::Leader && !pending.is_empty() && uncommitted > 0;
+            if stalled {
+                stall_ticks += 1;
+                if stall_ticks >= STALL_LOG_TICKS && !stall_logged {
+                    let voters = node.voters().len();
+                    eprintln!(
+                        "[raft region {group_id}] node {self_id}: LEADER cannot commit — waiting for majority ({} of {voters} voters needed; {uncommitted} write(s) parked in term {})",
+                        voters / 2 + 1,
+                        node.current_term(),
+                    );
+                    stall_logged = true;
+                }
+            } else {
+                if stall_logged {
+                    eprintln!(
+                        "[raft region {group_id}] node {self_id}: majority restored — committing parked writes"
+                    );
+                }
+                stall_ticks = 0;
+                stall_logged = false;
             }
         }
 
