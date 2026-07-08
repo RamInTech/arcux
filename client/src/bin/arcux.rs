@@ -47,10 +47,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     print_banner(&endpoints, &mode);
 
-    // In cluster mode, remember which node we last saw lead so we can announce a failover.
-    let mut last_leader = client.current_endpoint();
-    if let Some(l) = &last_leader {
-        println!("  {DIM}leader (assumed): {l}{RESET}\n");
+    // In cluster mode, remember which node the client is routing to, so we can note when it
+    // switches (a CP failover, or just a new AP coordinator). Deliberately node-neutral: the
+    // client is leader-following but can't tell whether any given key is CP or AP, so it must
+    // not claim the node it lands on is a "leader".
+    let mut last_node = client.current_endpoint();
+    if let Some(l) = &last_node {
+        println!("  {DIM}routing via {l}{RESET}\n");
     }
 
     let stdin = io::stdin();
@@ -82,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(uri) => match Client::connect(uri.clone()) {
                     Ok(c) => {
                         client = c;
-                        last_leader = None;
+                        last_node = None;
                         println!("{DIM}connected to {uri}{RESET}");
                     }
                     Err(e) => eprintln!("error: {e}"),
@@ -90,13 +93,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => eprintln!("usage: connect <uri>"),
             },
             _ => {
-                // Only announce a leader change on success — a failed op may have rotated the
-                // presumed-leader index (e.g. cycling through unreachable nodes), and "leader is
-                // now X" would be misleading after "can't reach any server".
+                // Only note a node switch on success — a failed op may have rotated the routing
+                // index (e.g. cycling through unreachable nodes), and announcing it would be
+                // misleading right after "can't reach any server".
                 if run_command(&mut client, &args).await {
-                    announce_leader_change(&client, &mut last_leader);
+                    announce_node_change(&client, &mut last_node);
                 } else {
-                    last_leader = client.current_endpoint();
+                    last_node = client.current_endpoint();
                 }
             }
         }
@@ -148,12 +151,13 @@ fn is_unreachable(e: &(dyn std::error::Error + 'static)) -> bool {
     matches!(e.downcast_ref::<ClientError>(), Some(ClientError::Unreachable))
 }
 
-/// After an op, if the presumed leader endpoint changed (a failover), say so.
-fn announce_leader_change(client: &Client, last: &mut Option<String>) {
+/// After a successful op, if the node the client routes to changed, say so — node-neutral, since
+/// it could be a CP failover *or* just a different AP coordinator (the client can't tell which).
+fn announce_node_change(client: &Client, last: &mut Option<String>) {
     let now = client.current_endpoint();
     if now.is_some() && now != *last {
         if let Some(l) = &now {
-            println!("{DIM}· leader is now {l}{RESET}");
+            println!("{DIM}· now routing via {l}{RESET}");
         }
         *last = now;
     }
