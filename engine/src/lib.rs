@@ -33,6 +33,6 @@ pub use db::Engine;
 pub use error::{Error, Result};
 pub use keys::{Cf, Lock, LockKind, Value};
 pub use memtable::MemValue;
-pub use mvcc::Snapshot;
+pub use mvcc::{Snapshot, TxnStatus};
 pub use options::{FsyncMode, Options};
 pub use percolator::{Mutation, Transaction};

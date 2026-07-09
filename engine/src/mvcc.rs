@@ -20,6 +20,22 @@ use crate::error::{Error, Result};
 use crate::keys::{decode_data_key, decode_write_value, encode_data_key, Cf, Lock, Value};
 use crate::memtable::MemValue;
 
+/// The fate of a transaction, as told by its **primary** key.
+///
+/// This is exactly what a reader needs to resolve a leftover lock: follow the lock to its
+/// primary and ask "did the transaction commit?". Cross-region, the primary may live in a
+/// *different* region than the locked key, so this is also the payload a `CheckTxnStatus`
+/// RPC carries back from the primary's region leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnStatus {
+    /// The primary committed at this `commit_ts` → roll the encountered key **forward**.
+    Committed(u64),
+    /// The primary holds no live lock and never committed → the txn is dead; roll **back**.
+    RolledBack,
+    /// The primary's lock is still alive (`ttl` not yet expired) → the txn is pending; **wait**.
+    Locked { ttl: u64 },
+}
+
 /// A read view at a fixed timestamp.
 pub struct Snapshot<'a> {
     engine: &'a Engine,
@@ -106,38 +122,51 @@ impl Engine {
         }
     }
 
-    /// Resolve a leftover lock on `key` by consulting its `primary`.
-    fn resolve_lock(&self, key: &[u8], lock: &Lock, now_ts: u64) -> Result<()> {
-        let primary = &lock.primary;
+    /// Determine a transaction's fate from its `primary` key — and, when the primary's lock
+    /// has expired, roll the primary back so the verdict is durable before it is reported.
+    ///
+    /// This is the authoritative answer a region gives when a reader (here or in *another*
+    /// region) meets a lock pointing at `primary`. It reads only the primary's own CFs, so
+    /// it is exactly what a `CheckTxnStatus` RPC to the primary's region leader evaluates.
+    pub fn check_txn_status(&self, primary: &[u8], start_ts: u64, now_ts: u64) -> Result<TxnStatus> {
         let primary_lock = match self.get_cf_raw(Cf::Lock, primary)? {
             Some(b) => Some(Lock::decode(&b).ok_or_else(|| Error::corruption("primary lock decode"))?),
             None => None,
         };
 
-        // Primary still locked by *this* txn → the transaction is still pending.
+        // Primary still locked by *this* txn → pending, unless its TTL has expired (dead).
         if let Some(plock) = &primary_lock {
-            if plock.start_ts == lock.start_ts {
+            if plock.start_ts == start_ts {
                 if now_ts > plock.ttl {
-                    // TTL expired → the txn is dead → roll back.
-                    self.roll_back(primary, lock.start_ts)?;
-                    if key != primary {
-                        self.roll_back(key, lock.start_ts)?;
-                    }
-                    return Ok(());
+                    self.roll_back(primary, start_ts)?; // TTL expired → kill the txn
+                    return Ok(TxnStatus::RolledBack);
                 }
-                return Err(Error::KeyIsLocked(format!(
-                    "primary {primary:?} lock alive (ttl {})",
-                    plock.ttl
-                )));
+                return Ok(TxnStatus::Locked { ttl: plock.ttl });
             }
         }
 
         // Primary is not locked by this txn → it committed or aborted; ask the Write CF.
-        // (Roll-forward is idempotent and conditional, so it is also correct when
-        // `key == primary` — it just re-writes the existing commit and drops the lock.)
-        match self.find_commit_ts(primary, lock.start_ts)? {
-            Some(commit_ts) => self.roll_forward(key, lock.start_ts, commit_ts)?,
-            None => self.roll_back(key, lock.start_ts)?,
+        match self.find_commit_ts(primary, start_ts)? {
+            Some(commit_ts) => Ok(TxnStatus::Committed(commit_ts)),
+            None => Ok(TxnStatus::RolledBack),
+        }
+    }
+
+    /// Resolve a leftover lock on `key` by consulting its `primary` (assumed **local** —
+    /// same engine). The cross-region generalization is in `server::cross_txn`, which asks
+    /// the primary's region for the [`TxnStatus`] and then rolls `key` the same way here.
+    fn resolve_lock(&self, key: &[u8], lock: &Lock, now_ts: u64) -> Result<()> {
+        // Roll-forward/back are idempotent and conditional, so this is also correct when
+        // `key == lock.primary` — it just re-applies the primary's own verdict.
+        match self.check_txn_status(&lock.primary, lock.start_ts, now_ts)? {
+            TxnStatus::Committed(commit_ts) => self.roll_forward(key, lock.start_ts, commit_ts)?,
+            TxnStatus::RolledBack => self.roll_back(key, lock.start_ts)?,
+            TxnStatus::Locked { ttl } => {
+                return Err(Error::KeyIsLocked(format!(
+                    "primary {:?} lock alive (ttl {ttl})",
+                    lock.primary
+                )));
+            }
         }
         Ok(())
     }
