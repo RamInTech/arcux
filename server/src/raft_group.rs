@@ -307,7 +307,10 @@ fn run_actor(
     // Last Raft state we logged, so we announce only genuine transitions (election activity).
     let (mut last_role, mut last_term, mut last_leader) =
         (node.role(), node.current_term(), node.leader_id());
-    let mut last_vote = node.voted_for();
+    // The last (term, vote) we logged. Keyed on the *term* too, not just the target: a node can
+    // grant its vote to the same candidate across consecutive terms (a re-campaign after a split
+    // vote), and each of those is a distinct vote worth logging even though the target is unchanged.
+    let mut last_vote = (node.current_term(), node.voted_for());
     // Votes this node has already tallied as a candidate, so we log each newly-arrived one.
     let mut last_votes: std::collections::BTreeSet<u64> = node.votes().into_iter().collect();
     // Leader-stall detection: consecutive ticks a leader has held uncommittable parked writes,
@@ -364,13 +367,14 @@ fn run_actor(
 
         // This node granting its vote to *another* node (a follower backing a candidate); a
         // candidate voting for itself is already implied by the CANDIDATE transition below.
-        let vote = node.voted_for();
+        let vote = (node.current_term(), node.voted_for());
         if vote != last_vote {
-            if let Some(cand) = vote.filter(|c| *c != self_id) {
-                eprintln!(
-                    "[raft region {group_id}] node {self_id}: voted for node {cand} in term {}",
-                    node.current_term()
-                );
+            if let (term, Some(cand)) = vote {
+                if cand != self_id {
+                    eprintln!(
+                        "[raft region {group_id}] node {self_id}: voted for node {cand} in term {term}"
+                    );
+                }
             }
             last_vote = vote;
         }
