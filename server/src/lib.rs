@@ -45,6 +45,7 @@ use arcux_rpc::raft;
 
 pub mod ap;
 pub mod catalog;
+pub mod cross_txn;
 pub mod hlc;
 pub mod multiraft;
 pub mod raft_cmd;
