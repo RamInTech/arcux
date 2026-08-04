@@ -119,7 +119,6 @@ fn leader_group(states: &[Arc<AppState>]) -> Option<RaftGroup> {
         .iter()
         .filter_map(|s| s.raft_group(REGION_ID))
         .find(|g| g.is_leader())
-        .cloned()
 }
 
 /// Drive a membership change on the current leader, retrying across a re-election until it

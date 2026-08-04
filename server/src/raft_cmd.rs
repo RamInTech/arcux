@@ -25,11 +25,18 @@ pub enum Command {
     /// Percolator phase 2: commit the transaction at `commit_ts` (allocated by the leader,
     /// so every replica commits at the same timestamp).
     Commit { primary: Vec<u8>, keys: Vec<Vec<u8>>, start_ts: u64, commit_ts: u64 },
+    /// Percolator lock resolution (Phase 5, cross-region): roll each key **forward** to
+    /// `commit_ts` (when `commit_ts > 0`) or **back** (when `commit_ts == 0`). Conditional per
+    /// key — only a lock still owned by `start_ts` is touched — so it is idempotent on replay.
+    /// One command drives cross-region secondary finalization, reader-driven roll-forward/back,
+    /// and expired-primary lock GC, each applied in the key's **own** region's log.
+    Resolve { keys: Vec<Vec<u8>>, start_ts: u64, commit_ts: u64 },
 }
 
 const TAG_AUTOCOMMIT: u8 = 0;
 const TAG_PREWRITE: u8 = 1;
 const TAG_COMMIT: u8 = 2;
+const TAG_RESOLVE: u8 = 3;
 
 impl Command {
     pub fn encode(&self) -> Vec<u8> {
@@ -55,6 +62,15 @@ impl Command {
                 buf.extend_from_slice(&start_ts.to_be_bytes());
                 buf.extend_from_slice(&commit_ts.to_be_bytes());
                 put_length_prefixed(&mut buf, primary);
+                buf.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+                for k in keys {
+                    put_length_prefixed(&mut buf, k);
+                }
+            }
+            Command::Resolve { keys, start_ts, commit_ts } => {
+                buf.push(TAG_RESOLVE);
+                buf.extend_from_slice(&start_ts.to_be_bytes());
+                buf.extend_from_slice(&commit_ts.to_be_bytes());
                 buf.extend_from_slice(&(keys.len() as u32).to_be_bytes());
                 for k in keys {
                     put_length_prefixed(&mut buf, k);
@@ -93,6 +109,16 @@ impl Command {
                     keys.push(get_length_prefixed(rest, &mut pos)?.to_vec());
                 }
                 Some(Command::Commit { primary, keys, start_ts, commit_ts })
+            }
+            TAG_RESOLVE => {
+                let start_ts = get_u64(rest, &mut pos)?;
+                let commit_ts = get_u64(rest, &mut pos)?;
+                let count = get_u32(rest, &mut pos)? as usize;
+                let mut keys = Vec::with_capacity(count);
+                for _ in 0..count {
+                    keys.push(get_length_prefixed(rest, &mut pos)?.to_vec());
+                }
+                Some(Command::Resolve { keys, start_ts, commit_ts })
             }
             _ => None,
         }
@@ -152,6 +178,17 @@ mod tests {
             start_ts: 42,
             commit_ts: 50,
         });
+    }
+
+    #[test]
+    fn resolve_round_trips() {
+        assert_round_trips(Command::Resolve {
+            keys: vec![b"a".to_vec(), b"item".to_vec()],
+            start_ts: 42,
+            commit_ts: 50,
+        });
+        // Rollback form (commit_ts == 0).
+        assert_round_trips(Command::Resolve { keys: vec![b"x".to_vec()], start_ts: 7, commit_ts: 0 });
     }
 
     #[test]

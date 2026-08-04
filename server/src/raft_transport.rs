@@ -78,18 +78,34 @@ pub fn append_request(m: &Message, group_id: u64) -> raft::AppendEntriesRequest 
 /// `group_id`. Panics if the body is not an `InstallSnapshot`.
 pub fn install_snapshot_request(m: &Message, group_id: u64) -> raft::InstallSnapshotRequest {
     match &m.body {
-        MessageBody::InstallSnapshot { last_included_index, last_included_term, conf_state, data } => {
-            raft::InstallSnapshotRequest {
-                term: m.term,
-                leader_id: m.from,
-                last_included_index: *last_included_index,
-                last_included_term: *last_included_term,
-                data: data.clone(),
-                group_id,
-                conf_state: conf_state.clone(),
-            }
-        }
+        MessageBody::InstallSnapshot {
+            last_included_index,
+            last_included_term,
+            conf_state,
+            learners,
+            data,
+        } => raft::InstallSnapshotRequest {
+            term: m.term,
+            leader_id: m.from,
+            last_included_index: *last_included_index,
+            last_included_term: *last_included_term,
+            data: data.clone(),
+            group_id,
+            conf_state: conf_state.clone(),
+            learners: learners.clone(),
+        },
         _ => unreachable!("install_snapshot_request on a non-InstallSnapshot message"),
+    }
+}
+
+/// Build a `TimeoutNow` request (leadership transfer) from an outbound Message, tagged with
+/// `group_id`. Panics if the body is not a `TimeoutNow`.
+pub fn timeout_now_request(m: &Message, group_id: u64) -> raft::TimeoutNowRequest {
+    match &m.body {
+        MessageBody::TimeoutNow => {
+            raft::TimeoutNowRequest { term: m.term, leader_id: m.from, group_id }
+        }
+        _ => unreachable!("timeout_now_request on a non-TimeoutNow message"),
     }
 }
 
@@ -130,9 +146,14 @@ pub fn install_snapshot_request_to_msg(req: &raft::InstallSnapshotRequest, self_
             last_included_index: req.last_included_index,
             last_included_term: req.last_included_term,
             conf_state: req.conf_state.clone(),
+            learners: req.learners.clone(),
             data: req.data.clone(),
         },
     }
+}
+
+pub fn timeout_now_request_to_msg(req: &raft::TimeoutNowRequest, self_id: u64) -> Message {
+    Message { from: req.leader_id, to: self_id, term: req.term, body: MessageBody::TimeoutNow }
 }
 
 // ---- reply Message → response (server side) ------------------------------------------
@@ -253,6 +274,7 @@ mod tests {
                 last_included_index: 42,
                 last_included_term: 8,
                 conf_state: vec![1, 2, 3],
+                learners: vec![4],
                 data: b"state".to_vec(),
             },
         };

@@ -73,6 +73,9 @@ enum Cmd {
     Propose(Vec<u8>, tokio::sync::oneshot::Sender<ProposeResult>),
     /// Leader-only: append a single-server membership change, parking `tx` until it commits.
     ProposeConf(ConfChange, tokio::sync::oneshot::Sender<ProposeResult>),
+    /// Leader-only: hand leadership to a caught-up voter (fire-and-forget; the target's
+    /// election deposes this leader). `tx` reports whether the transfer was accepted.
+    TransferLeader(u64, tokio::sync::oneshot::Sender<bool>),
     /// Stop the actor (and, by cascade, the ticker + sender) — used to take a node down.
     Stop,
 }
@@ -90,6 +93,13 @@ struct Observable {
     /// The group's current voter set (derived from the log; changes on a committed membership
     /// change). Lets the routing/PD layer observe the replica set.
     voters: Vec<u64>,
+    /// The group's current non-voting learners (Phase 4b++ rest) — replicas catching up
+    /// toward promotion.
+    learners: Vec<u64>,
+    /// Leader-only replication progress: `peer id → (match_index, leader last_log_index)`.
+    /// `match == last` ⇒ the peer holds the whole log — the promotion gate the repair driver
+    /// polls before turning a learner into a voter. Empty on non-leaders.
+    progress: BTreeMap<u64, (u64, u64)>,
 }
 
 /// A handle to a running Raft group. Cheap to clone (shares the command channel + the
@@ -99,6 +109,10 @@ pub struct RaftGroup {
     id: u64,
     cmd_tx: smpsc::Sender<Cmd>,
     obs: Arc<Mutex<Observable>>,
+    /// Peer id → transport client, shared with the sender. Interior-mutable so a replica
+    /// added at runtime (re-replication onto a fresh node) becomes reachable without
+    /// restarting the group — see [`RaftGroup::add_peer`].
+    clients: Arc<Mutex<HashMap<u64, RaftServiceClient<Channel>>>>,
 }
 
 /// Configuration to [`start`] a group.
@@ -144,6 +158,50 @@ impl RaftGroup {
     /// The group's current voter set (its replica ids), as last observed by the actor.
     pub fn voters(&self) -> Vec<u64> {
         self.obs.lock().unwrap().voters.clone()
+    }
+
+    /// The group's current non-voting learners, as last observed by the actor.
+    pub fn learners(&self) -> Vec<u64> {
+        self.obs.lock().unwrap().learners.clone()
+    }
+
+    /// Whether `peer` currently holds this leader's entire log (`match == last`) — the gate
+    /// the repair driver polls before promoting a learner. `false` on a non-leader (only the
+    /// leader tracks progress) or for an unknown peer.
+    pub fn peer_caught_up(&self, peer: u64) -> bool {
+        self.obs
+            .lock()
+            .unwrap()
+            .progress
+            .get(&peer)
+            .is_some_and(|(matched, last)| matched >= last)
+    }
+
+    /// Make `peer` (at `address`) reachable from this group's transport — the runtime
+    /// counterpart of the static `peers` map in [`GroupOptions`], used when re-replication
+    /// adds a replica on a node the group was never configured with. Idempotent.
+    pub fn add_peer(&self, peer: u64, address: &str) {
+        match Channel::from_shared(address.to_string()) {
+            Ok(ep) => {
+                self.clients
+                    .lock()
+                    .unwrap()
+                    .entry(peer)
+                    .or_insert_with(|| RaftServiceClient::new(ep.connect_lazy()));
+            }
+            Err(e) => eprintln!("raft: bad peer address {address}: {e}"),
+        }
+    }
+
+    /// Hand leadership to `target` (a caught-up voter). Returns `true` if the transfer was
+    /// accepted (the actual handoff completes asynchronously via the target's election);
+    /// `false` if this node isn't the leader or the target isn't an eligible voter.
+    pub async fn transfer_leadership(&self, target: u64) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.cmd_tx.send(Cmd::TransferLeader(target, tx)).is_err() {
+            return false;
+        }
+        rx.await.unwrap_or(false)
     }
 
     /// Propose a command (an encoded [`WriteBatch`]) and await its commit. Returns
@@ -193,6 +251,13 @@ impl RaftGroup {
         xport::install_snapshot_response(self.step_reply(msg).await.as_ref())
     }
 
+    /// Serve an inbound `TimeoutNow` RPC (leadership transfer): step it in — this node
+    /// campaigns immediately. Fire-and-forget; the RequestVotes flow through the sender.
+    pub async fn handle_timeout_now(&self, req: raft::TimeoutNowRequest) {
+        let msg = xport::timeout_now_request_to_msg(&req, self.id);
+        let _ = self.step_reply(msg).await;
+    }
+
     async fn step_reply(&self, msg: Message) -> Option<Message> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self.cmd_tx.send(Cmd::StepReply(msg, tx)).is_err() {
@@ -220,18 +285,22 @@ pub fn start(opts: GroupOptions) -> RaftGroup {
         leader_id: None,
         read_ready: false,
         voters: Vec::new(),
+        learners: Vec::new(),
+        progress: BTreeMap::new(),
     }));
 
     // Pre-build lazy clients for each peer (connect_lazy does no I/O until first call).
-    let mut clients: HashMap<u64, RaftServiceClient<Channel>> = HashMap::new();
+    // Shared with the group handle so re-replication can add peers at runtime.
+    let mut initial: HashMap<u64, RaftServiceClient<Channel>> = HashMap::new();
     for (peer, addr) in &opts.peers {
         match Channel::from_shared(addr.clone()) {
             Ok(ep) => {
-                clients.insert(*peer, RaftServiceClient::new(ep.connect_lazy()));
+                initial.insert(*peer, RaftServiceClient::new(ep.connect_lazy()));
             }
             Err(e) => eprintln!("raft: bad peer address {addr}: {e}"),
         }
     }
+    let clients = Arc::new(Mutex::new(initial));
 
     // The actor thread owns the node (blocking fsync lives here, off the reactor).
     let node = RaftNode::new(Config::new(opts.id, opts.voters), opts.storage);
@@ -264,9 +333,9 @@ pub fn start(opts: GroupOptions) -> RaftGroup {
 
     // Sender: ship outbound messages to peers, feed responses back in.
     let feedback = cmd_tx.clone();
-    tokio::spawn(run_sender(group_id, self_id, clients, out_rx, feedback));
+    tokio::spawn(run_sender(group_id, self_id, clients.clone(), out_rx, feedback));
 
-    RaftGroup { id: opts.id, cmd_tx, obs }
+    RaftGroup { id: opts.id, cmd_tx, obs, clients }
 }
 
 /// The actor loop: own the node, process one command at a time, then drain its effects
@@ -348,6 +417,15 @@ fn run_actor(
                     let _ = tx.send(ProposeResult::NotLeader { leader_hint: node.leader_id() });
                 }
             },
+            Cmd::TransferLeader(target, tx) => {
+                let accepted = node.transfer_leadership(target).is_ok();
+                if accepted {
+                    eprintln!(
+                        "[raft region {group_id}] node {self_id}: transferring leadership to node {target}"
+                    );
+                }
+                let _ = tx.send(accepted);
+            }
             Cmd::Stop => break,
         }
 
@@ -498,11 +576,23 @@ fn run_actor(
         // A leader is read-ready once it has applied an entry of its current term (its
         // no-op) — only then has it re-applied every prior committed entry.
         let read_ready = role == Role::Leader && applied_term == node.current_term();
+        // Publish per-peer replication progress (leader only) — the repair driver reads it
+        // to decide when a catching-up learner is safe to promote.
+        let mut progress = BTreeMap::new();
+        if role == Role::Leader {
+            for p in node.voters().iter().chain(node.learners().iter()) {
+                if let Some(pr) = node.progress(*p) {
+                    progress.insert(*p, pr);
+                }
+            }
+        }
         *obs.lock().unwrap() = Observable {
             role,
             leader_id: node.leader_id(),
             read_ready,
             voters: node.voters().to_vec(),
+            learners: node.learners().to_vec(),
+            progress,
         };
     }
 }
@@ -513,12 +603,12 @@ fn run_actor(
 async fn run_sender(
     group_id: u64,
     self_id: u64,
-    clients: HashMap<u64, RaftServiceClient<Channel>>,
+    clients: Arc<Mutex<HashMap<u64, RaftServiceClient<Channel>>>>,
     mut out_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
     feedback: smpsc::Sender<Cmd>,
 ) {
     while let Some(m) = out_rx.recv().await {
-        let Some(client) = clients.get(&m.to).cloned() else { continue };
+        let Some(client) = clients.lock().unwrap().get(&m.to).cloned() else { continue };
         let peer = m.to;
         let feedback = feedback.clone();
         tokio::spawn(async move {
@@ -554,6 +644,11 @@ async fn run_sender(
                         );
                         let _ = feedback.send(Cmd::Step(reply));
                     }
+                }
+                MessageBody::TimeoutNow => {
+                    // Leadership transfer is fire-and-forget: no reply to feed back — the
+                    // target's election (a higher-term RequestVote) is the visible effect.
+                    let _ = client.timeout_now(xport::timeout_now_request(&m, group_id)).await;
                 }
                 // Responses are returned by the RPC above, never shipped outbound.
                 MessageBody::RequestVoteResp { .. }
