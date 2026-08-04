@@ -67,9 +67,16 @@ pub enum ProposeError {
     /// A membership change is already in flight (uncommitted). Raft allows only **one**
     /// config change at a time; retry after the pending one commits.
     ConfChangeInProgress,
-    /// A leader may not remove itself (that needs a leadership transfer first, deferred).
-    /// Transfer leadership, then remove the old leader from the new one.
+    /// A leader may not remove itself. Transfer leadership
+    /// ([`RaftNode::transfer_leadership`]), then remove the old leader from the new one.
     CannotRemoveLeader,
+    /// A leadership transfer is in flight: the leader stops taking new proposals so the
+    /// target can fully catch up. Transient — retry shortly (the transfer either completes
+    /// or times out after one election timeout).
+    TransferInProgress,
+    /// The transfer target is not a voting member of the group (a learner or a stranger
+    /// cannot be handed leadership).
+    NotAVoter,
 }
 
 pub struct RaftNode<S: Storage> {
@@ -79,6 +86,10 @@ pub struct RaftNode<S: Storage> {
     /// change takes effect the instant its entry is in the log (Raft dissertation §4.1), and
     /// truncating that entry reverts it. Recomputed on any log mutation via `recompute_conf`.
     voters: Vec<u64>,
+    /// Non-voting **learners** (Phase 4b++ rest), derived alongside `voters`: replicated to
+    /// like followers, but never counted toward the commit majority, never solicited for
+    /// votes, and never campaigning. The catch-up stage of auto re-replication.
+    learners: Vec<u64>,
     /// The initial membership (from [`Config`]) — the base for `voters` when the log holds no
     /// snapshot. Never changes.
     bootstrap_conf: Vec<u64>,
@@ -110,6 +121,12 @@ pub struct RaftNode<S: Storage> {
     heartbeat_timeout: u32,
     rng: u64,
 
+    // Leadership transfer in flight (leader only): the target we will hand off to once its
+    // log is fully caught up, and how many ticks the transfer has been pending (it expires
+    // after one election timeout so a dead target can't wedge the leader).
+    transfer_target: Option<u64>,
+    transfer_elapsed: u32,
+
     // Outbox, drained by `take_messages`.
     messages: Vec<Message>,
 
@@ -128,6 +145,7 @@ impl<S: Storage> RaftNode<S> {
         let mut node = Self {
             id: cfg.id,
             voters: cfg.voters,
+            learners: Vec::new(),
             bootstrap_conf,
             storage,
             role: Role::Follower,
@@ -145,6 +163,8 @@ impl<S: Storage> RaftNode<S> {
             election_timeout: cfg.election_timeout.max(1),
             heartbeat_timeout: cfg.heartbeat_timeout.max(1),
             rng: cfg.seed | 1,
+            transfer_target: None,
+            transfer_elapsed: 0,
             messages: Vec::new(),
             pending_snapshot: None,
         };
@@ -199,6 +219,19 @@ impl<S: Storage> RaftNode<S> {
     pub fn voters(&self) -> &[u64] {
         &self.voters
     }
+    /// The current non-voting learners, derived from the log alongside [`voters`](Self::voters).
+    pub fn learners(&self) -> &[u64] {
+        &self.learners
+    }
+    /// A peer's replication progress as this leader sees it: `(match_index, last_log_index)`.
+    /// `match == last` ⇒ the peer holds the leader's entire log — the promotion gate for a
+    /// catching-up learner. `None` when not the leader or the peer is untracked.
+    pub fn progress(&self, peer: u64) -> Option<(u64, u64)> {
+        if self.role != Role::Leader {
+            return None;
+        }
+        Some((*self.match_index.get(&peer)?, self.storage.last_index()))
+    }
     pub fn storage(&self) -> &S {
         &self.storage
     }
@@ -213,6 +246,15 @@ impl<S: Storage> RaftNode<S> {
     pub fn tick(&mut self) {
         match self.role {
             Role::Leader => {
+                // A pending leadership transfer expires after one election timeout — a dead
+                // or unreachable target must not wedge the leader's proposal path forever.
+                if self.transfer_target.is_some() {
+                    self.transfer_elapsed += 1;
+                    if self.transfer_elapsed >= self.election_timeout {
+                        self.transfer_target = None;
+                        self.transfer_elapsed = 0;
+                    }
+                }
                 self.heartbeat_elapsed += 1;
                 if self.heartbeat_elapsed >= self.heartbeat_timeout {
                     self.heartbeat_elapsed = 0;
@@ -235,6 +277,11 @@ impl<S: Storage> RaftNode<S> {
         if self.role != Role::Leader {
             return Err(ProposeError::NotLeader);
         }
+        // While handing off leadership, stop taking new writes: the target's "caught up"
+        // check must be against a log that stops moving (dissertation §3.10).
+        if self.transfer_target.is_some() {
+            return Err(ProposeError::TransferInProgress);
+        }
         let index = self.storage.last_index() + 1;
         let entry = Entry::normal(self.current_term, index, data);
         self.storage.append(&[entry]);
@@ -247,15 +294,18 @@ impl<S: Storage> RaftNode<S> {
         Ok(index)
     }
 
-    /// Append a single-server membership change (leader only). Adding a voter starts
-    /// replicating to it immediately; removing one shrinks the quorum. The change takes
-    /// effect on **append** (so `voters` updates now), and commits under the new majority —
-    /// which for an added node means committing waits until that node catches up (a brief
-    /// availability dip; a non-voting learner catch-up phase is deferred). Returns the entry's
-    /// log index.
+    /// Append a single-server membership change (leader only). `AddLearner` starts
+    /// replicating to a **non-voting** replica (no quorum impact — the safe first step of
+    /// re-replication); `AddNode` adds a voter, or **promotes** a caught-up learner;
+    /// `RemoveNode` drops a member (voter or learner) and shrinks the quorum. The change
+    /// takes effect on **append** (so the membership updates now) and commits under the new
+    /// majority. Returns the entry's log index.
     pub fn propose_conf_change(&mut self, cc: ConfChange) -> Result<u64, ProposeError> {
         if self.role != Role::Leader {
             return Err(ProposeError::NotLeader);
+        }
+        if self.transfer_target.is_some() {
+            return Err(ProposeError::TransferInProgress);
         }
         // Raft permits only one in-flight change; the previous must commit first.
         if self.has_pending_conf_change() {
@@ -267,32 +317,66 @@ impl<S: Storage> RaftNode<S> {
 
         // Record the *resulting* membership in the entry (not just the delta) so any replica
         // can adopt it directly.
-        let mut new_conf = self.voters.clone();
-        apply_conf_change(&mut new_conf, cc);
-        new_conf.sort_unstable();
-        new_conf.dedup();
+        let (mut new_voters, mut new_learners) = (self.voters.clone(), self.learners.clone());
+        apply_conf_change(&mut new_voters, &mut new_learners, cc);
+        new_voters.sort_unstable();
+        new_voters.dedup();
+        new_learners.sort_unstable();
+        new_learners.dedup();
 
         let index = self.storage.last_index() + 1;
         let entry = Entry {
             term: self.current_term,
             index,
             entry_type: EntryType::ConfChange,
-            data: cc.encode(&new_conf),
+            data: cc.encode(&new_voters, &new_learners),
         };
         self.storage.append(&[entry]);
         self.match_index.insert(self.id, index);
         self.next_index.insert(self.id, index + 1);
-        // Membership is effective on append — refresh the voter set before we count acks.
+        // Membership is effective on append — refresh the member sets before we count acks.
         self.recompute_conf();
-        // A freshly-added voter starts with an empty log: replicate from the beginning
-        // (`send_append` sends a snapshot instead if the leader has already compacted).
-        if let ConfChange::AddNode(id) = cc {
-            self.next_index.insert(id, 1);
-            self.match_index.insert(id, 0);
+        // A freshly-added replica starts with an empty log: replicate from the beginning
+        // (`send_append` sends a snapshot instead if the leader has already compacted). A
+        // *promoted* learner keeps the progress it already earned — don't reset it.
+        if let ConfChange::AddNode(id) | ConfChange::AddLearner(id) = cc {
+            self.next_index.entry(id).or_insert(1);
+            self.match_index.entry(id).or_insert(0);
         }
         self.maybe_advance_commit();
         self.broadcast_append();
         Ok(index)
+    }
+
+    /// Begin transferring leadership to `target` (leader only, dissertation §3.10). The
+    /// leader stops accepting proposals, brings the target fully up to date, then tells it
+    /// to campaign immediately (`TimeoutNow`) — it wins because its log is complete. If the
+    /// target is already caught up the handoff fires at once; otherwise it fires from the
+    /// append path, and expires after one election timeout if the target never catches up.
+    pub fn transfer_leadership(&mut self, target: u64) -> Result<(), ProposeError> {
+        if self.role != Role::Leader {
+            return Err(ProposeError::NotLeader);
+        }
+        if !self.voters.contains(&target) || target == self.id {
+            return Err(ProposeError::NotAVoter);
+        }
+        self.transfer_target = Some(target);
+        self.transfer_elapsed = 0;
+        if self.progress(target).is_some_and(|(m, last)| m >= last) {
+            self.fire_timeout_now(target);
+        } else {
+            self.send_append(target); // hurry the target along
+        }
+        Ok(())
+    }
+
+    /// Send `TimeoutNow` to a fully-caught-up transfer target and consider the handoff done
+    /// (the target's election will depose us via the higher term).
+    fn fire_timeout_now(&mut self, target: u64) {
+        let term = self.current_term;
+        self.send(target, term, MessageBody::TimeoutNow);
+        self.transfer_target = None;
+        self.transfer_elapsed = 0;
     }
 
     /// Process one inbound message.
@@ -338,6 +422,7 @@ impl<S: Storage> RaftNode<S> {
                 last_included_index,
                 last_included_term,
                 conf_state,
+                learners,
                 data,
             } => self.handle_install_snapshot(
                 msg.from,
@@ -345,11 +430,13 @@ impl<S: Storage> RaftNode<S> {
                 last_included_index,
                 last_included_term,
                 conf_state,
+                learners,
                 data,
             ),
             MessageBody::InstallSnapshotResp { match_index } => {
                 self.handle_install_snapshot_resp(msg.from, msg.term, match_index)
             }
+            MessageBody::TimeoutNow => self.handle_timeout_now(msg.term),
         }
     }
 
@@ -388,8 +475,8 @@ impl<S: Storage> RaftNode<S> {
             return;
         }
         let term = self.storage.term(index).expect("compact index must be in the log");
-        let conf_state = self.conf_at(index);
-        self.storage.compact(index, term, conf_state, data);
+        let (conf_state, learners) = self.conf_at(index);
+        self.storage.compact(index, term, conf_state, learners, data);
     }
 
     /// Whether there is outbound work or newly-committed / snapshot state to drain.
@@ -438,12 +525,14 @@ impl<S: Storage> RaftNode<S> {
         let last = self.storage.last_index();
         self.next_index.clear();
         self.match_index.clear();
-        for v in self.voters.clone() {
-            self.next_index.insert(v, last + 1);
-            self.match_index.insert(v, 0);
+        for p in self.voters.iter().chain(self.learners.iter()).copied().collect::<Vec<_>>() {
+            self.next_index.insert(p, last + 1);
+            self.match_index.insert(p, 0);
         }
         self.match_index.insert(self.id, last);
         self.heartbeat_elapsed = 0;
+        self.transfer_target = None;
+        self.transfer_elapsed = 0;
         // Assert leadership immediately so followers reset their election timers.
         self.broadcast_append();
     }
@@ -456,6 +545,8 @@ impl<S: Storage> RaftNode<S> {
         }
         self.role = Role::Follower;
         self.leader_id = leader;
+        self.transfer_target = None;
+        self.transfer_elapsed = 0;
         self.reset_election_timer();
     }
 
@@ -492,12 +583,24 @@ impl<S: Storage> RaftNode<S> {
         if self.role != Role::Candidate || term != self.current_term {
             return; // stale or no longer campaigning
         }
-        if granted {
+        // Only a *voter's* grant counts toward the majority — a learner (or a just-removed
+        // member) answering a stale solicitation must not swing an election.
+        if granted && self.voters.contains(&from) {
             self.votes.insert(from);
             if self.votes.len() >= self.majority() {
                 self.become_leader();
             }
         }
+    }
+
+    /// Leadership-transfer target: the (still live) leader told us to campaign immediately.
+    /// Skip the randomized wait — our log is complete, so we win the election it triggers.
+    fn handle_timeout_now(&mut self, term: u64) {
+        // Stale sender, or we're not a voter (a learner must never campaign) → ignore.
+        if term < self.current_term || !self.is_voter() {
+            return;
+        }
+        self.start_election();
     }
 
     fn handle_append_entries(
@@ -615,6 +718,10 @@ impl<S: Storage> RaftNode<S> {
             self.match_index.insert(from, m);
             self.next_index.insert(from, m + 1);
             self.maybe_advance_commit();
+            // A pending leadership transfer fires the moment its target holds our whole log.
+            if self.transfer_target == Some(from) && m >= self.storage.last_index() {
+                self.fire_timeout_now(from);
+            }
         } else {
             // Log mismatch: back off `next_index` and retry immediately so the
             // follower converges in O(divergence) round trips.
@@ -627,6 +734,7 @@ impl<S: Storage> RaftNode<S> {
     /// Follower: install a snapshot the leader sent because it had compacted the entries we
     /// still needed. Adopt it as our state (through `last_included_index`) and surface the
     /// data for the caller to load into the engine via [`take_snapshot`](Self::take_snapshot).
+    #[allow(clippy::too_many_arguments)]
     fn handle_install_snapshot(
         &mut self,
         from: u64,
@@ -634,6 +742,7 @@ impl<S: Storage> RaftNode<S> {
         last_included_index: u64,
         last_included_term: u64,
         conf_state: Vec<u64>,
+        learners: Vec<u64>,
         data: Vec<u8>,
     ) {
         // Reject a leader from an older term.
@@ -660,6 +769,7 @@ impl<S: Storage> RaftNode<S> {
             last_included_index,
             last_included_term,
             conf_state,
+            learners,
             data: data.clone(),
         });
         self.commit_index = last_included_index;
@@ -714,7 +824,7 @@ impl<S: Storage> RaftNode<S> {
     }
 
     fn broadcast_append(&mut self) {
-        for p in self.peers() {
+        for p in self.replication_peers() {
             self.send_append(p);
         }
     }
@@ -757,6 +867,7 @@ impl<S: Storage> RaftNode<S> {
                 last_included_index: snap.last_included_index,
                 last_included_term: snap.last_included_term,
                 conf_state: snap.conf_state,
+                learners: snap.learners,
                 data: snap.data,
             },
         );
@@ -785,9 +896,20 @@ impl<S: Storage> RaftNode<S> {
     }
 
     /// All voters except this node (materialized to release the `self` borrow
-    /// before the caller sends).
+    /// before the caller sends). Vote solicitation goes here — never to learners.
     fn peers(&self) -> Vec<u64> {
         self.voters.iter().copied().filter(|p| *p != self.id).collect()
+    }
+
+    /// Everyone the leader replicates to: voters **and** learners, except this node. The
+    /// only membership difference a learner sees is that it isn't counted or solicited.
+    fn replication_peers(&self) -> Vec<u64> {
+        self.voters
+            .iter()
+            .chain(self.learners.iter())
+            .copied()
+            .filter(|p| *p != self.id)
+            .collect()
     }
 
     /// Whether this node is a current voting member of the group.
@@ -807,32 +929,42 @@ impl<S: Storage> RaftNode<S> {
             .any(|e| e.entry_type == EntryType::ConfChange)
     }
 
-    /// The voter set as of `index`: the base config (snapshot `conf_state`, else bootstrap)
-    /// folded with every config change in the log up to and including `index`.
-    fn conf_at(&self, index: u64) -> Vec<u64> {
-        let mut conf = self
-            .storage
-            .snapshot()
-            .map(|s| s.conf_state)
-            .unwrap_or_else(|| self.bootstrap_conf.clone());
+    /// The membership as of `index` — `(voters, learners)`: the base config (snapshot
+    /// `conf_state` + `learners`, else bootstrap) folded with every config change in the log
+    /// up to and including `index`.
+    fn conf_at(&self, index: u64) -> (Vec<u64>, Vec<u64>) {
+        let (mut voters, mut learners) = match self.storage.snapshot() {
+            Some(s) => (s.conf_state, s.learners),
+            None => (self.bootstrap_conf.clone(), Vec::new()),
+        };
         // Each ConfChange entry records the absolute resulting membership, so the config as of
         // `index` is simply the one from the highest-indexed change at or below it.
         for e in self.storage.entries(self.storage.first_index(), index) {
             if e.entry_type == EntryType::ConfChange {
-                if let Some((_, new_conf)) = ConfChange::decode(&e.data) {
-                    conf = new_conf;
+                if let Some((_, v, l)) = ConfChange::decode(&e.data) {
+                    voters = v;
+                    learners = l;
                 }
             }
         }
-        conf.sort_unstable();
-        conf.dedup();
-        conf
+        voters.sort_unstable();
+        voters.dedup();
+        learners.sort_unstable();
+        learners.dedup();
+        (voters, learners)
     }
 
-    /// Re-derive [`voters`](Self::voters) from durable state after any log mutation. A leader
-    /// that finds itself removed from the group steps down.
+    /// Re-derive [`voters`](Self::voters) + [`learners`](Self::learners) from durable state
+    /// after any log mutation. A leader that finds itself no longer a voter steps down; a
+    /// transfer whose target lost voterhood is abandoned.
     fn recompute_conf(&mut self) {
-        self.voters = self.conf_at(self.storage.last_index());
+        (self.voters, self.learners) = self.conf_at(self.storage.last_index());
+        if let Some(t) = self.transfer_target {
+            if !self.voters.contains(&t) {
+                self.transfer_target = None;
+                self.transfer_elapsed = 0;
+            }
+        }
         if self.role == Role::Leader && !self.is_voter() {
             self.become_follower(self.current_term, None);
         }
@@ -859,15 +991,26 @@ impl<S: Storage> RaftNode<S> {
     }
 }
 
-/// Fold one membership change into a voter set (add if absent, remove if present).
-fn apply_conf_change(conf: &mut Vec<u64>, cc: ConfChange) {
+/// Fold one membership change into the `(voters, learners)` sets. `AddNode` on a learner is
+/// a **promotion** (moves it across); `RemoveNode` drops the id from both; `AddLearner` on an
+/// existing voter is a no-op (never silently demote a voter).
+fn apply_conf_change(voters: &mut Vec<u64>, learners: &mut Vec<u64>, cc: ConfChange) {
     match cc {
         ConfChange::AddNode(id) => {
-            if !conf.contains(&id) {
-                conf.push(id);
+            learners.retain(|l| *l != id);
+            if !voters.contains(&id) {
+                voters.push(id);
             }
         }
-        ConfChange::RemoveNode(id) => conf.retain(|v| *v != id),
+        ConfChange::RemoveNode(id) => {
+            voters.retain(|v| *v != id);
+            learners.retain(|l| *l != id);
+        }
+        ConfChange::AddLearner(id) => {
+            if !voters.contains(&id) && !learners.contains(&id) {
+                learners.push(id);
+            }
+        }
     }
 }
 
@@ -975,6 +1118,7 @@ mod tests {
                 last_included_index: 64,
                 last_included_term: 1,
                 conf_state: vec![1, 2, 3],
+                learners: vec![],
                 data: b"snap".to_vec(),
             },
         });
