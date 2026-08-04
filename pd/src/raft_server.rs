@@ -25,7 +25,7 @@ use arcux_rpc::pd::{
 use arcux_rpc::raft::raft_service_server::{RaftService, RaftServiceServer};
 use arcux_rpc::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    RequestVoteRequest, RequestVoteResponse,
+    RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest, TimeoutNowResponse,
 };
 
 use crate::cluster::now_ms;
@@ -157,6 +157,14 @@ impl RaftService for PdRaftApi {
         request: Request<InstallSnapshotRequest>,
     ) -> Result<Response<InstallSnapshotResponse>, Status> {
         Ok(Response::new(self.group.handle_install_snapshot(request.into_inner()).await))
+    }
+
+    async fn timeout_now(
+        &self,
+        request: Request<TimeoutNowRequest>,
+    ) -> Result<Response<TimeoutNowResponse>, Status> {
+        self.group.handle_timeout_now(request.into_inner()).await;
+        Ok(Response::new(TimeoutNowResponse {}))
     }
 }
 

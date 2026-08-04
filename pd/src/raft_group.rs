@@ -157,6 +157,13 @@ impl PdGroup {
         xport::install_snapshot_response(self.step_reply(msg).await.as_ref())
     }
 
+    /// Serve an inbound `TimeoutNow` (leadership transfer): step it in — the node campaigns
+    /// immediately. Fire-and-forget; the resulting `RequestVote`s flow through the sender.
+    pub async fn handle_timeout_now(&self, req: raft::TimeoutNowRequest) {
+        let msg = xport::timeout_now_request_to_msg(&req, self.self_id);
+        let _ = self.step_reply(msg).await;
+    }
+
     async fn step_reply(&self, msg: Message) -> Option<Message> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self.cmd_tx.send(Cmd::StepReply(msg, tx)).is_err() {
@@ -394,6 +401,10 @@ async fn run_sender(
                         );
                         let _ = feedback.send(Cmd::Step(reply));
                     }
+                }
+                MessageBody::TimeoutNow => {
+                    // Leadership transfer is fire-and-forget: no reply to feed back.
+                    let _ = client.timeout_now(xport::timeout_now_request(&m)).await;
                 }
                 MessageBody::RequestVoteResp { .. }
                 | MessageBody::AppendEntriesResp { .. }
