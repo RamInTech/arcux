@@ -37,3 +37,8 @@ tokio-stream = { version = "0.1", features = ["net"] }
 
 [profile.release]
 debug = 1
+
+# Keep debug builds small: line-tables give usable panic backtraces without the full
+# (very large) debug-info that otherwise dominates target/debug.
+[profile.dev]
+debug = "line-tables-only"
