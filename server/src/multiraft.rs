@@ -10,6 +10,7 @@
 //! engine + apply closure + `WalStorage`); this module is the registry around them.
 
 use std::collections::HashMap;
+use std::sync::RwLock;
 
 use crate::raft_group::RaftGroup;
 
@@ -38,23 +39,32 @@ pub struct RegionPlacement {
 }
 
 /// The node's live region groups, keyed by region id (= the wire `group_id`).
+/// Interior-mutable so a group can be **added at runtime** — re-replication starts a fresh
+/// replica of an existing region on a node that wasn't hosting it at startup.
 pub struct MultiRaft {
-    groups: HashMap<u64, RaftGroup>,
+    groups: RwLock<HashMap<u64, RaftGroup>>,
 }
 
 impl MultiRaft {
     pub fn new(groups: HashMap<u64, RaftGroup>) -> MultiRaft {
-        MultiRaft { groups }
+        MultiRaft { groups: RwLock::new(groups) }
     }
 
-    /// The group for `region_id`, if this node hosts it.
-    pub fn group(&self, region_id: u64) -> Option<&RaftGroup> {
-        self.groups.get(&region_id)
+    /// The group for `region_id`, if this node hosts it. Returns an owned handle
+    /// ([`RaftGroup`] is a cheap clone sharing the actor's channels).
+    pub fn group(&self, region_id: u64) -> Option<RaftGroup> {
+        self.groups.read().unwrap().get(&region_id).cloned()
+    }
+
+    /// Host a new region group on this node at runtime (the re-replication path). A no-op if
+    /// the region is already hosted (returns the existing handle).
+    pub fn insert(&self, region_id: u64, group: RaftGroup) -> RaftGroup {
+        self.groups.write().unwrap().entry(region_id).or_insert(group).clone()
     }
 
     /// Stop every group (cascades each actor/ticker/sender down). Called when the node stops.
     pub fn shutdown(&self) {
-        for g in self.groups.values() {
+        for g in self.groups.read().unwrap().values() {
             g.shutdown();
         }
     }

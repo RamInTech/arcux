@@ -48,6 +48,17 @@ impl ApReplication {
         self.regions.contains_key(&region_id)
     }
 
+    /// The ids of every AP region this node hosts (the anti-entropy driver iterates these).
+    pub fn region_ids(&self) -> Vec<u64> {
+        self.regions.keys().copied().collect()
+    }
+
+    /// Clones of the peer replica clients for `region_id` — used by anti-entropy (digest /
+    /// fetch) and read-repair to talk to the other replicas. Empty if the region isn't hosted.
+    pub fn peers_of(&self, region_id: u64) -> Vec<KvServiceClient<Channel>> {
+        self.regions.get(&region_id).map(|r| r.peers.clone()).unwrap_or_default()
+    }
+
     /// Fan a write out to the region's peer replicas — best-effort, each in its own task.
     /// Returns immediately; the coordinator has already applied locally and acked (W=1).
     pub fn fanout(&self, region_id: u64, key: Vec<u8>, value: Vec<u8>, is_delete: bool, hlc_ts: u64) {

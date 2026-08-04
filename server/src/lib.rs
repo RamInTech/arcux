@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arcux_engine::keys::{decode_data_key, encode_data_key, encode_write_value};
-use arcux_engine::{Cf, Engine, Error, Mutation, Options, Transaction, Value, WriteBatch};
+use arcux_engine::{Cf, Engine, Error, Lock, Mutation, Options, Transaction, TxnStatus, Value, WriteBatch};
 use arcux_pd::{Region, RegionRegistry, Tso};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -43,6 +43,7 @@ use arcux_rpc::pd::pd_service_client::PdServiceClient;
 use arcux_rpc::raft::raft_service_server::{RaftService, RaftServiceServer};
 use arcux_rpc::raft;
 
+pub mod anti_entropy;
 pub mod ap;
 pub mod catalog;
 pub mod cross_txn;
@@ -51,6 +52,7 @@ pub mod multiraft;
 pub mod raft_cmd;
 pub mod raft_group;
 pub mod raft_transport;
+pub mod repair;
 pub mod wal_storage;
 
 use ap::ApReplication;
@@ -158,6 +160,11 @@ const DEFAULT_HEARTBEAT_MS: u64 = 1_000;
 /// Default Raft logical-tick period (one heartbeat per tick; election timeout ~10–20).
 const DEFAULT_RAFT_TICK_MS: u64 = 30;
 
+/// Default period between AP anti-entropy passes (a node hosting AP regions reconciles with a
+/// peer this often). Frequent enough to converge quickly after a heal; cheap because a matching
+/// Merkle root means the whole pass is one digest exchange.
+const DEFAULT_ANTI_ENTROPY_MS: u64 = 250;
+
 /// Shared node state behind an `Arc`: the storage engine, the timestamp source, the
 /// authoritative region table, and (when PD-connected) a heartbeat handle.
 pub struct AppState {
@@ -171,6 +178,10 @@ pub struct AppState {
     /// PD-connected. Settable so tests can heartbeat faster than PD's failure-detector
     /// timeout. Ignored in direct mode.
     hb_interval_ms: std::sync::atomic::AtomicU64,
+    /// Period (ms) of the background AP anti-entropy pass [`serve_on`] runs when this node
+    /// hosts AP regions. Settable so a test can turn it up (effectively off) to isolate the
+    /// read-repair path, or down to converge fast.
+    ae_interval_ms: std::sync::atomic::AtomicU64,
     /// The node's **CP** region Raft groups (Phase 4b/4b+/4b++). `None` ⇒ the unreplicated
     /// direct/PD path. A CP request routes by key to its region's group; writes go through
     /// that group's log, and a non-leader replies `NotLeader`.
@@ -196,6 +207,7 @@ impl AppState {
             regions,
             pd: None,
             hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
+            ae_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_ANTI_ENTROPY_MS),
             raft: None,
             ap: None,
             hlc: Arc::new(Hlc::new()),
@@ -223,6 +235,7 @@ impl AppState {
             regions,
             pd: Some(PdHandle { client, node_id, address }),
             hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
+            ae_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_ANTI_ENTROPY_MS),
             raft: None,
             ap: None,
             hlc: Arc::new(Hlc::new()),
@@ -316,6 +329,7 @@ impl AppState {
             regions,
             pd: None,
             hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
+            ae_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_ANTI_ENTROPY_MS),
             raft: Some(MultiRaft::new(groups)),
             ap: Some(ap),
             hlc: Arc::new(Hlc::new()),
@@ -323,8 +337,9 @@ impl AppState {
     }
 
     /// The Raft group serving `key` — route key → region → group — or `None` if this node
-    /// isn't replicated or hosts no group for the key's region.
-    fn group_for(&self, key: &[u8]) -> Option<&RaftGroup> {
+    /// isn't replicated or hosts no group for the key's region. (An owned handle: `RaftGroup`
+    /// is a cheap clone sharing the actor's channels.)
+    fn group_for(&self, key: &[u8]) -> Option<RaftGroup> {
         let mr = self.raft.as_ref()?;
         let region = self.regions.route(key)?;
         mr.group(region.id)
@@ -332,8 +347,51 @@ impl AppState {
 
     /// The Raft group for a region by id, if this node hosts it. Exposed so an operator/PD
     /// path (or a test) can drive membership changes on the region's group.
-    pub fn raft_group(&self, region_id: u64) -> Option<&RaftGroup> {
+    pub fn raft_group(&self, region_id: u64) -> Option<RaftGroup> {
         self.raft.as_ref()?.group(region_id)
+    }
+
+    /// Host a **new replica of an existing region** on this node at runtime — the receiving
+    /// end of re-replication. Starts the region's Raft group with an **empty bootstrap
+    /// config** (it never campaigns and adopts the real membership from the log/snapshot the
+    /// leader sends once this node is added as a learner), registers the region for routing,
+    /// and returns the group handle. Idempotent: an already-hosted region returns its
+    /// existing group.
+    pub fn host_region(
+        &self,
+        placement: RegionPlacement,
+    ) -> Result<RaftGroup, Box<dyn std::error::Error + Send + Sync>> {
+        let mr = self.raft.as_ref().ok_or("node is not in replicated (multiraft) mode")?;
+        if let Some(g) = mr.group(placement.region_id) {
+            return Ok(g);
+        }
+        // Make the region routable here (group_for goes key → region → group).
+        let mut regions = self.regions.list();
+        regions.push(Region {
+            id: placement.region_id,
+            start: placement.start.clone(),
+            end: placement.end.clone(),
+            epoch: placement.epoch,
+        });
+        self.regions.adopt(regions)?;
+
+        let storage = wal_storage::WalStorage::open(
+            self.engine.options().data_dir.join("raft").join(placement.region_id.to_string()),
+        )?;
+        let group = raft_group::start(GroupOptions {
+            group_id: placement.region_id,
+            id: self.node_id,
+            // Empty bootstrap: membership comes from the leader's log, exactly like a
+            // deterministic-harness `spawn_blank` node.
+            voters: Vec::new(),
+            peers: placement.peers,
+            storage,
+            apply: make_apply(self.engine.clone(), self.node_id, placement.region_id),
+            snapshot: make_snapshot(self.engine.clone(), placement.start, placement.end),
+            restore: make_restore(self.engine.clone()),
+            tick: Duration::from_millis(DEFAULT_RAFT_TICK_MS),
+        });
+        Ok(mr.insert(placement.region_id, group))
     }
 
     /// The id of the **AP** region serving `key`, if this node hosts it (route key → region →
@@ -379,6 +437,129 @@ impl AppState {
             .await?
             .map_err(|e| Status::internal(format!("ap apply: {e}")))?;
         Ok(())
+    }
+
+    /// Set the background AP anti-entropy period (ms). A large value effectively disables the
+    /// background pass (used to isolate read-repair in tests).
+    pub fn set_anti_entropy_interval_ms(&self, ms: u64) {
+        self.ae_interval_ms.store(ms.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// One AP anti-entropy pass over every AP region this node hosts. For each region it
+    /// computes the local Merkle digest, then for each peer exchanges digests
+    /// ([`ApDigest`](KvService::ap_digest)), fetches only the **divergent** buckets
+    /// ([`ApFetch`](KvService::ap_fetch)), and Last-Writer-Wins-merges the peer's newer
+    /// versions into the local engine. Pull-only (heals *this* node); full convergence follows
+    /// because every node runs this against every peer, so drift flows both ways over time.
+    pub async fn reconcile_ap_once(&self) {
+        let Some(ap) = &self.ap else { return };
+        for region_id in ap.region_ids() {
+            let Some(region) = self.regions.by_id(region_id) else { continue };
+            let engine = self.engine.clone();
+            let (start, end) = (region.start.clone(), region.end.clone());
+            let local = match run_blocking(move || engine.scan_versions(&start, &end, 0)).await {
+                Ok(Ok(v)) => v,
+                _ => continue,
+            };
+            let local_vers: Vec<anti_entropy::Version> = local.iter().map(to_ae_version).collect();
+            let local_digest = anti_entropy::digest(&local_vers);
+            let local_map: HashMap<Vec<u8>, u64> =
+                local_vers.iter().map(|v| (v.key.clone(), v.version)).collect();
+
+            for mut peer in ap.peers_of(region_id) {
+                // 1) the peer's compact digest → the buckets that differ from ours.
+                let Ok(resp) = peer.ap_digest(kv::ApDigestRequest { region_id }).await else {
+                    continue; // unreachable peer — try it next pass
+                };
+                let leaves = resp.into_inner().leaves;
+                if leaves.len() != anti_entropy::LEAVES {
+                    continue;
+                }
+                let buckets = anti_entropy::diff(&local_digest, &anti_entropy::Digest { leaves });
+                if buckets.is_empty() {
+                    continue; // identical range — nothing to do (the common case)
+                }
+                // 2) fetch just the divergent buckets' entries, 3) LWW-merge the newer ones.
+                let req = kv::ApFetchRequest {
+                    region_id,
+                    buckets: buckets.iter().map(|b| *b as u32).collect(),
+                    keys: vec![],
+                };
+                let Ok(fetched) = peer.ap_fetch(req).await else { continue };
+                let remote: Vec<anti_entropy::Version> =
+                    fetched.into_inner().entries.iter().map(from_ap_entry).collect();
+                for v in anti_entropy::to_adopt(&local_map, &remote) {
+                    let value = if v.is_delete { Value::Delete } else { Value::Put(v.value) };
+                    let _ = self.ap_apply(v.key, value, v.version).await;
+                }
+            }
+        }
+    }
+
+    /// Serve an AP read of `key` with **read-repair**: read the local version, ask every peer
+    /// replica for theirs, take the Last-Writer-Wins winner (highest HLC), **adopt it locally**
+    /// if a peer was ahead, **push it** to any peer that was behind, and return the winner.
+    /// Best-effort against peers (an unreachable one is skipped), so it never blocks the read.
+    /// Returns the resolved value (`None` for absent-or-tombstoned), or an engine `Error`.
+    async fn ap_read_repair(&self, region_id: u64, key: &[u8]) -> Result<Result<Option<Vec<u8>>, Error>, Status> {
+        // Our own latest version of the key.
+        let engine = self.engine.clone();
+        let k = key.to_vec();
+        let local = match run_blocking(move || {
+            let mut succ = k.clone();
+            succ.push(0);
+            engine.scan_versions(&k, &succ, 1)
+        })
+        .await?
+        {
+            Ok(v) => v.into_iter().next().map(|(_, ts, val, del)| (ts, val, del)),
+            Err(e) => return Ok(Err(e)),
+        };
+        let local_ts = local.as_ref().map(|(ts, _, _)| *ts);
+
+        // Ask each peer for its version; track which peers are behind so we can push to them.
+        let mut best = local;
+        let mut peer_states = Vec::new(); // (peer client, that peer's version ts)
+        for mut peer in self.ap.as_ref().map(|ap| ap.peers_of(region_id)).unwrap_or_default() {
+            let req =
+                kv::ApFetchRequest { region_id, buckets: vec![], keys: vec![key.to_vec()] };
+            let ver = match peer.ap_fetch(req).await {
+                Ok(r) => r.into_inner().entries.into_iter().next().map(|e| (e.hlc, e.value, e.is_delete)),
+                Err(_) => None, // unreachable — ignore
+            };
+            if let Some((ts, val, del)) = &ver {
+                if best.as_ref().is_none_or(|(b, _, _)| *ts > *b) {
+                    best = Some((*ts, val.clone(), *del));
+                }
+            }
+            peer_states.push((peer, ver.map(|(ts, _, _)| ts)));
+        }
+
+        let Some((best_ts, best_val, best_del)) = best else {
+            return Ok(Ok(None)); // the key exists nowhere reachable
+        };
+
+        // Adopt locally if a peer's version beat ours (or we had none).
+        if local_ts.is_none_or(|lt| best_ts > lt) {
+            let value = if best_del { Value::Delete } else { Value::Put(best_val.clone()) };
+            self.ap_apply(key.to_vec(), value, best_ts).await?;
+        }
+        // Push the winner to every reachable peer that was behind — best-effort, off the read.
+        for (mut peer, pts) in peer_states {
+            if pts.is_none_or(|t| best_ts > t) {
+                let req = kv::ReplicateApRequest {
+                    region_id,
+                    key: key.to_vec(),
+                    value: best_val.clone(),
+                    is_delete: best_del,
+                    hlc_ts: best_ts,
+                };
+                tokio::spawn(async move {
+                    let _ = peer.replicate_ap(req).await;
+                });
+            }
+        }
+        Ok(Ok(if best_del { None } else { Some(best_val) }))
     }
 
     /// Run a single autocommit write (`Put`/`Delete`) through the Raft log on the leader:
@@ -461,6 +642,91 @@ impl AppState {
         }
     }
 
+    /// Replicate a **lock resolution** through the key region's log: roll `keys` forward to
+    /// `commit_ts` (> 0) or back (== 0). Used for cross-region secondary finalization and for
+    /// reader-driven resolution. Conditional per key at apply, so it is safe to retry.
+    async fn replicated_resolve(
+        &self,
+        group: &RaftGroup,
+        keys: Vec<Vec<u8>>,
+        start_ts: u64,
+        commit_ts: u64,
+    ) -> Result<Option<KeyError>, Status> {
+        if !group.is_leader() {
+            return Ok(Some(not_leader(group.leader_id())));
+        }
+        let cmd = Command::Resolve { keys, start_ts, commit_ts };
+        match group.propose(cmd.encode()).await {
+            ProposeResult::Applied(Ok(())) => Ok(None),
+            ProposeResult::Applied(Err(e)) => Ok(Some(classify_to_key(e)?)),
+            ProposeResult::NotLeader { leader_hint } => Ok(Some(not_leader(leader_hint))),
+        }
+    }
+
+    /// Answer a `CheckTxnStatus` for the transaction whose primary key is `primary` (hosted by
+    /// `group`, the primary's region leader). The determination is a linearizable read on the
+    /// read-ready leader; if the primary's lock has **expired**, the leader first rolls it back
+    /// *through Raft* (the atomic decision point that prevents a late commit) and then reports
+    /// the now-settled fate. A non-ready leader redirects so the reader retries the real leader.
+    async fn check_txn_status(
+        &self,
+        group: &RaftGroup,
+        primary: Vec<u8>,
+        start_ts: u64,
+        now_ts: u64,
+    ) -> Result<kv::CheckTxnStatusResponse, Status> {
+        if !group.read_ready() {
+            return Ok(check_status_err(not_leader(group.leader_id())));
+        }
+        let engine = self.engine.clone();
+        let p = primary.clone();
+        let peek = run_blocking(move || engine.check_txn_status_peek(&p, start_ts))
+            .await?
+            .map_err(|e| Status::internal(format!("check_txn_status: {e}")))?;
+        match peek {
+            TxnStatus::Committed(commit_ts) => Ok(committed_status(commit_ts)),
+            TxnStatus::Locked { ttl } if now_ts <= ttl => Ok(locked_status(ttl)),
+            // Expired lock, or already dead: settle the primary as rolled-back through the log
+            // (conditional — a no-op if it actually committed or was already resolved), then
+            // re-peek the settled state so a lost race still reports the true fate.
+            TxnStatus::Locked { .. } | TxnStatus::RolledBack => {
+                match self.replicated_resolve(group, vec![primary.clone()], start_ts, 0).await? {
+                    None => {}
+                    Some(ke) => return Ok(check_status_err(ke)),
+                }
+                let engine = self.engine.clone();
+                let settled = run_blocking(move || engine.check_txn_status_peek(&primary, start_ts))
+                    .await?
+                    .map_err(|e| Status::internal(format!("check_txn_status: {e}")))?;
+                match settled {
+                    TxnStatus::Committed(commit_ts) => Ok(committed_status(commit_ts)),
+                    _ => Ok(rolled_back_status()),
+                }
+            }
+        }
+    }
+
+    /// Read `key`'s current lock (if any) as a **structured** `Locked` key-error carrying the
+    /// primary + start_ts. A replicated leader can't resolve a lock inline (resolution is a
+    /// write that must go through Raft), so it hands the reader exactly what it needs to
+    /// consult the primary's region and drive [`ResolveLock`]. `None` ⇒ the lock is already
+    /// gone (a concurrent resolver won the race) → the caller just retries the read.
+    async fn locked_key_error(&self, key: &[u8]) -> Result<Option<KeyError>, Status> {
+        let engine = self.engine.clone();
+        let key = key.to_vec();
+        let lock = run_blocking(move || engine.get_cf_raw(Cf::Lock, &key))
+            .await?
+            .map_err(|e| Status::internal(format!("lock read: {e}")))?;
+        Ok(lock.and_then(|b| Lock::decode(&b)).map(|l| KeyError {
+            kind: Some(Kind::Locked(kv::Locked {
+                primary: l.primary,
+                lock_ts: l.start_ts,
+                ttl: l.ttl,
+                detail: String::new(),
+            })),
+        }))
+    }
+
     /// Set the background heartbeat period (ms). Must be shorter than PD's failure-detector
     /// timeout or a live node will be marked down between beats; tests use a small value.
     pub fn set_heartbeat_interval_ms(&self, ms: u64) {
@@ -529,6 +795,47 @@ fn not_leader(leader: Option<u64>) -> KeyError {
     KeyError { kind: Some(Kind::NotLeader(NotLeader { leader_hint })) }
 }
 
+/// Build a `CheckTxnStatusResponse` for each fate.
+fn committed_status(commit_ts: u64) -> kv::CheckTxnStatusResponse {
+    kv::CheckTxnStatusResponse { fate: kv::TxnFate::Committed as i32, commit_ts, ttl: 0, error: None }
+}
+fn rolled_back_status() -> kv::CheckTxnStatusResponse {
+    kv::CheckTxnStatusResponse { fate: kv::TxnFate::RolledBack as i32, commit_ts: 0, ttl: 0, error: None }
+}
+fn locked_status(ttl: u64) -> kv::CheckTxnStatusResponse {
+    kv::CheckTxnStatusResponse { fate: kv::TxnFate::Locked as i32, commit_ts: 0, ttl, error: None }
+}
+/// A redirect/failure surfaced through `CheckTxnStatusResponse.error` (fate is ignored then).
+fn check_status_err(ke: KeyError) -> kv::CheckTxnStatusResponse {
+    kv::CheckTxnStatusResponse {
+        fate: kv::TxnFate::RolledBack as i32,
+        commit_ts: 0,
+        ttl: 0,
+        error: Some(ke),
+    }
+}
+
+/// Engine versioned-scan tuple → the anti-entropy core's [`Version`](anti_entropy::Version).
+fn to_ae_version(t: &(Vec<u8>, u64, Vec<u8>, bool)) -> anti_entropy::Version {
+    let (key, ts, value, is_delete) = t;
+    anti_entropy::Version {
+        key: key.clone(),
+        version: *ts,
+        value: value.clone(),
+        is_delete: *is_delete,
+    }
+}
+
+/// Wire [`ApEntry`](kv::ApEntry) → the anti-entropy core's [`Version`](anti_entropy::Version).
+fn from_ap_entry(e: &kv::ApEntry) -> anti_entropy::Version {
+    anti_entropy::Version {
+        key: e.key.clone(),
+        version: e.hlc,
+        value: e.value.clone(),
+        is_delete: e.is_delete,
+    }
+}
+
 /// The durable, already-committed state of a single-key write: the value in the Default CF
 /// at `start_ts` and the commit pointer in the Write CF at `commit_ts`. Atomic and
 /// lock-free (it represents a *finished* transaction), so applying it on every replica via
@@ -566,6 +873,39 @@ fn log_committed_write(region: u64, node: u64, batch: &WriteBatch) {
     }
 }
 
+/// Prewrite one region's slice of a transaction: prewrite every `mutation` (all in this
+/// region) against `engine`, recording the transaction's **global** `primary` in each lock.
+/// On the first conflict, roll back the locks this call acquired (in this region) and return
+/// the error; the coordinator rolls the transaction's *other* regions back. Deterministic
+/// across replicas — the same log prefix yields the same conflict and the same partial
+/// rollback. This is the per-region generalization of [`Transaction::prewrite`], which instead
+/// derives the primary from `mutations[0]` (correct only when the whole txn is one region).
+fn prewrite_region(
+    engine: &Engine,
+    mutations: &[Mutation],
+    primary: &[u8],
+    start_ts: u64,
+    ttl: u64,
+) -> Result<(), Error> {
+    let mut acquired: Vec<Vec<u8>> = Vec::new();
+    let mut result = Ok(());
+    for m in mutations {
+        match engine.prewrite_one(&m.key, &m.value, primary, start_ts, ttl) {
+            Ok(_) => acquired.push(m.key.clone()),
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        }
+    }
+    if result.is_err() {
+        for k in &acquired {
+            let _ = engine.resolve_rollback(k, start_ts);
+        }
+    }
+    result
+}
+
 fn make_apply(engine: Arc<Engine>, node_id: u64, region_id: u64) -> ApplyFn {
     Arc::new(move |data: &[u8]| -> Result<(), Error> {
         if data.is_empty() {
@@ -579,8 +919,21 @@ fn make_apply(engine: Arc<Engine>, node_id: u64, region_id: u64) -> ApplyFn {
                 engine.write(batch)?;
                 Ok(())
             }
-            Some(Command::Prewrite { mutations, start_ts, ttl, .. }) => {
-                Transaction::new(&engine, start_ts, mutations)?.prewrite(ttl)
+            Some(Command::Prewrite { mutations, primary, start_ts, ttl }) => {
+                // Every mutation here belongs to *this* region, but each lock records the
+                // transaction's **global** primary (which may live in another region) — so a
+                // reader that meets any of these locks can follow it to that primary.
+                prewrite_region(&engine, &mutations, &primary, start_ts, ttl)
+            }
+            Some(Command::Resolve { keys, start_ts, commit_ts }) => {
+                for k in &keys {
+                    if commit_ts == 0 {
+                        engine.resolve_rollback(k, start_ts)?;
+                    } else {
+                        engine.resolve_commit(k, start_ts, commit_ts)?;
+                    }
+                }
+                Ok(())
             }
             Some(Command::Commit { primary, keys, start_ts, commit_ts }) => {
                 eprintln!(
@@ -759,10 +1112,13 @@ impl KvService for KvApi {
             return Err(ap_no_txn());
         }
         if self.state.raft.is_some() {
-            let Some(g) = self.state.group_for(&req.primary) else {
+            // Cross-region: a prewrite call carries one region's slice of the transaction, so
+            // route by the mutations' region — not the primary, which may live elsewhere.
+            let route_key = req.mutations.first().map(|m| m.key.clone()).unwrap_or_else(|| req.primary.clone());
+            let Some(g) = self.state.group_for(&route_key) else {
                 return Ok(Response::new(kv::PrewriteResponse { errors: vec![region_stale(0)] }));
             };
-            let error = self.state.replicated_prewrite(g, req).await?;
+            let error = self.state.replicated_prewrite(&g, req).await?;
             return Ok(Response::new(kv::PrewriteResponse { errors: error.into_iter().collect() }));
         }
         if let Some(ke) = self.state.check_context(&req.context, &req.primary) {
@@ -797,7 +1153,7 @@ impl KvService for KvApi {
             let Some(g) = self.state.group_for(&req.primary) else {
                 return Ok(Response::new(kv::CommitResponse { commit_ts: 0, error: Some(region_stale(0)) }));
             };
-            let (commit_ts, error) = self.state.replicated_commit(g, req).await?;
+            let (commit_ts, error) = self.state.replicated_commit(&g, req).await?;
             return Ok(Response::new(kv::CommitResponse { commit_ts, error }));
         }
         if let Some(ke) = self.state.check_context(&req.context, &req.primary) {
@@ -846,10 +1202,9 @@ impl KvService for KvApi {
         // AP read: leaderless Last-Writer-Wins — any replica returns the highest-HLC version
         // (read at the max timestamp). No leader, always serveable.
         if let Some(region_id) = self.state.ap_for(&req.key) {
-            log_kv(region_id, self.state.node_id, "GET (AP, this node)", &req.key, 0);
-            let state = self.state.clone();
-            let key = req.key.clone();
-            let res = run_blocking(move || state.engine.mvcc_get_unresolved(&key, u64::MAX)).await?;
+            log_kv(region_id, self.state.node_id, "GET (AP, read-repair)", &req.key, 0);
+            // Read-repair: consult the peers, return the LWW winner, and heal stale replicas.
+            let res = self.state.ap_read_repair(region_id, &req.key).await?;
             return Ok(Response::new(match res {
                 Ok(found) => kv::GetResponse {
                     found: found.is_some(),
@@ -895,6 +1250,7 @@ impl KvService for KvApi {
         // In a replicated region, reads must not mutate (lock resolution is a write that
         // would bypass Raft), so use the non-resolving read; the direct path resolves.
         let replicated = self.state.raft.is_some();
+        let key = req.key.clone(); // retained for structured-lock reporting below
         // Allocate read_ts and read in one blocking hop so the (possibly PD-backed)
         // clock is never touched from the reactor, and read_ts is known on every path.
         let (res, read_ts) = run_blocking(move || {
@@ -918,15 +1274,30 @@ impl KvService for KvApi {
                 error: None,
                 read_ts,
             })),
-            Err(e) => match classify(e) {
-                Classified::Key(ke) => Ok(Response::new(kv::GetResponse {
-                    found: false,
-                    value: vec![],
-                    error: Some(ke),
-                    read_ts,
-                })),
-                Classified::Status(s) => Err(s),
-            },
+            Err(e) => {
+                // In a replicated region a leader can't resolve a lock inline (resolution is a
+                // write → must go through Raft), so hand back *structured* lock info: the
+                // cross-region reader consults the primary's region and drives ResolveLock.
+                if replicated && matches!(e, Error::KeyIsLocked(_)) {
+                    if let Some(locked) = self.state.locked_key_error(&key).await? {
+                        return Ok(Response::new(kv::GetResponse {
+                            found: false,
+                            value: vec![],
+                            error: Some(locked),
+                            read_ts,
+                        }));
+                    }
+                }
+                match classify(e) {
+                    Classified::Key(ke) => Ok(Response::new(kv::GetResponse {
+                        found: false,
+                        value: vec![],
+                        error: Some(ke),
+                        read_ts,
+                    })),
+                    Classified::Status(s) => Err(s),
+                }
+            }
         }
     }
 
@@ -947,7 +1318,7 @@ impl KvService for KvApi {
                 return Ok(Response::new(kv::PutResponse { commit_ts: 0, error: Some(region_stale(0)) }));
             };
             let (commit_ts, error) =
-                self.state.replicated_autocommit(g, req.key, Value::Put(req.value)).await?;
+                self.state.replicated_autocommit(&g, req.key, Value::Put(req.value)).await?;
             return Ok(Response::new(kv::PutResponse { commit_ts, error }));
         }
         let res = self.autocommit(Mutation::put(req.key, req.value)).await?;
@@ -977,7 +1348,7 @@ impl KvService for KvApi {
                 return Ok(Response::new(kv::DeleteResponse { commit_ts: 0, error: Some(region_stale(0)) }));
             };
             let (commit_ts, error) =
-                self.state.replicated_autocommit(g, req.key, Value::Delete).await?;
+                self.state.replicated_autocommit(&g, req.key, Value::Delete).await?;
             return Ok(Response::new(kv::DeleteResponse { commit_ts, error }));
         }
         let res = self.autocommit(Mutation::delete(req.key)).await?;
@@ -1080,6 +1451,92 @@ impl KvService for KvApi {
         self.state.ap_apply(req.key, value, req.hlc_ts).await?;
         Ok(Response::new(kv::ReplicateApResponse {}))
     }
+
+    async fn ap_digest(
+        &self,
+        request: Request<kv::ApDigestRequest>,
+    ) -> Result<Response<kv::ApDigestResponse>, Status> {
+        let region_id = request.into_inner().region_id;
+        let Some(region) = self.state.regions.by_id(region_id) else {
+            return Ok(Response::new(kv::ApDigestResponse { leaves: vec![] }));
+        };
+        let engine = self.state.engine.clone();
+        let (start, end) = (region.start, region.end);
+        let versions = run_blocking(move || engine.scan_versions(&start, &end, 0))
+            .await?
+            .map_err(|e| Status::internal(format!("ap digest scan: {e}")))?;
+        let ae: Vec<anti_entropy::Version> = versions.iter().map(to_ae_version).collect();
+        Ok(Response::new(kv::ApDigestResponse { leaves: anti_entropy::digest(&ae).leaves }))
+    }
+
+    async fn ap_fetch(
+        &self,
+        request: Request<kv::ApFetchRequest>,
+    ) -> Result<Response<kv::ApFetchResponse>, Status> {
+        let req = request.into_inner();
+        let Some(region) = self.state.regions.by_id(req.region_id) else {
+            return Ok(Response::new(kv::ApFetchResponse { entries: vec![] }));
+        };
+        let engine = self.state.engine.clone();
+        let (start, end) = (region.start, region.end);
+        let want_buckets: std::collections::HashSet<usize> =
+            req.buckets.iter().map(|b| *b as usize).collect();
+        let want_keys = req.keys;
+        let entries = run_blocking(move || -> Result<Vec<kv::ApEntry>, Error> {
+            let mut out = Vec::new();
+            // Specific keys (read-repair): read just those keys' latest versions.
+            for k in &want_keys {
+                let mut succ = k.clone();
+                succ.push(0);
+                if let Some((key, ts, value, is_delete)) =
+                    engine.scan_versions(k, &succ, 1)?.into_iter().next()
+                {
+                    out.push(kv::ApEntry { key, hlc: ts, value, is_delete });
+                }
+            }
+            // Divergent buckets (anti-entropy): scan the region, keep the matching buckets.
+            if !want_buckets.is_empty() {
+                for (key, ts, value, is_delete) in engine.scan_versions(&start, &end, 0)? {
+                    if want_buckets.contains(&anti_entropy::bucket_of(&key)) {
+                        out.push(kv::ApEntry { key, hlc: ts, value, is_delete });
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await?
+        .map_err(|e| Status::internal(format!("ap fetch scan: {e}")))?;
+        Ok(Response::new(kv::ApFetchResponse { entries }))
+    }
+
+    async fn check_txn_status(
+        &self,
+        request: Request<kv::CheckTxnStatusRequest>,
+    ) -> Result<Response<kv::CheckTxnStatusResponse>, Status> {
+        let req = request.into_inner();
+        // Only meaningful for a replicated (CP) primary; route to the primary's region group.
+        let Some(g) = self.state.group_for(&req.primary) else {
+            return Ok(Response::new(check_status_err(region_stale(0))));
+        };
+        let resp = self.state.check_txn_status(&g, req.primary, req.start_ts, req.now_ts).await?;
+        Ok(Response::new(resp))
+    }
+
+    async fn resolve_lock(
+        &self,
+        request: Request<kv::ResolveLockRequest>,
+    ) -> Result<Response<kv::ResolveLockResponse>, Status> {
+        let req = request.into_inner();
+        // All keys share one region (the coordinator splits per region); route by the first.
+        let Some(route_key) = req.keys.first() else {
+            return Ok(Response::new(kv::ResolveLockResponse { error: None }));
+        };
+        let Some(g) = self.state.group_for(route_key) else {
+            return Ok(Response::new(kv::ResolveLockResponse { error: Some(region_stale(0)) }));
+        };
+        let error = self.state.replicated_resolve(&g, req.keys, req.start_ts, req.commit_ts).await?;
+        Ok(Response::new(kv::ResolveLockResponse { error }))
+    }
 }
 
 impl KvApi {
@@ -1154,6 +1611,20 @@ impl RaftService for RaftApi {
             None => Err(Status::not_found(format!("no Raft group {} on this node", req.group_id))),
         }
     }
+
+    async fn timeout_now(
+        &self,
+        request: Request<raft::TimeoutNowRequest>,
+    ) -> Result<Response<raft::TimeoutNowResponse>, Status> {
+        let req = request.into_inner();
+        match self.state.raft.as_ref().and_then(|mr| mr.group(req.group_id)) {
+            Some(g) => {
+                g.handle_timeout_now(req).await;
+                Ok(Response::new(raft::TimeoutNowResponse {}))
+            }
+            None => Err(Status::not_found(format!("no Raft group {} on this node", req.group_id))),
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------------
@@ -1191,6 +1662,24 @@ where
         })
     });
 
+    // If this node hosts AP regions, run background anti-entropy: periodically reconcile with
+    // peers so writes that missed the best-effort fan-out (a partitioned/crashed replica)
+    // converge once everyone is reachable again. Tied to serve_on's lifetime.
+    let ae_handle = state
+        .ap
+        .as_ref()
+        .filter(|ap| !ap.region_ids().is_empty())
+        .map(|_| {
+            let ae = state.clone();
+            tokio::spawn(async move {
+                loop {
+                    let ms = ae.ae_interval_ms.load(std::sync::atomic::Ordering::Relaxed).max(1);
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    ae.reconcile_ap_once().await;
+                }
+            })
+        });
+
     // When the server stops, also stop this node's Raft groups — otherwise a "killed" node
     // keeps heartbeating peers and suppresses the re-elections that should follow.
     let shutdown_state = state.clone();
@@ -1203,6 +1692,9 @@ where
         .await;
 
     if let Some(h) = hb_handle {
+        h.abort();
+    }
+    if let Some(h) = ae_handle {
         h.abort();
     }
     if let Some(mr) = &shutdown_state.raft {
