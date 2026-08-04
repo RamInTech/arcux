@@ -100,7 +100,10 @@ impl Cluster {
     }
 
     fn reachable(&self, a: u64, b: u64) -> bool {
-        self.part[&a] == self.part[&b]
+        match (self.part.get(&a), self.part.get(&b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => false, // a decommissioned (dead, removed-from-harness) node is unreachable
+        }
     }
 
     fn collect_applied(&mut self) {
@@ -126,10 +129,10 @@ impl Cluster {
             .compact(index, format!("snap@{index}").into_bytes());
     }
 
-    /// Bring up a fresh node with an **empty** bootstrap config — a learner that never
-    /// campaigns until a committed `AddNode` makes it a voter (mirrors starting a new replica
-    /// that discovers its membership from the leader).
-    fn add_learner(&mut self, id: u64) {
+    /// Bring up a fresh node with an **empty** bootstrap config — it never campaigns and has
+    /// no membership of its own until a replicated config change tells it otherwise (mirrors
+    /// starting a new replica that discovers its membership from the leader).
+    fn spawn_blank(&mut self, id: u64) {
         self.nodes.insert(id, RaftNode::new(Config::new(id, vec![]), MemStorage::new()));
         self.part.insert(id, 0);
     }
@@ -153,6 +156,9 @@ impl Cluster {
 
     fn voters(&self, id: u64) -> Vec<u64> {
         self.nodes[&id].voters().to_vec()
+    }
+    fn learners(&self, id: u64) -> Vec<u64> {
+        self.nodes[&id].learners().to_vec()
     }
 
     /// Deliver all in-flight messages until the cluster goes quiet.
@@ -583,8 +589,8 @@ fn membership_add_then_remove_a_voter() {
     }
 
     // --- ADD a 4th voter -------------------------------------------------
-    c.add_learner(4);
-    assert!(c.voters(4).is_empty(), "a learner starts with no membership of its own");
+    c.spawn_blank(4);
+    assert!(c.voters(4).is_empty(), "a blank node starts with no membership of its own");
     c.propose_conf_change(leader, ConfChange::AddNode(4));
     c.tick_n(10); // node 4 catches up; the AddNode entry commits and propagates
 
@@ -624,6 +630,211 @@ fn membership_add_then_remove_a_voter() {
     c.tick_n(4);
     for &id in &survivors {
         assert_eq!(c.commit_index(id), d_idx, "the shrunk 3-member group still commits");
+    }
+    c.assert_logs_converged();
+}
+
+#[test]
+fn learner_replicates_but_never_votes_or_counts() {
+    // A learner receives the log like any follower, but has **zero quorum weight**: it can't
+    // swing an election, can't campaign, and its silence never stalls a commit.
+    let mut c = Cluster::new(&[1, 2, 3]);
+    let leader = c.run_until_leader(60);
+    c.propose(leader, b"a");
+    c.tick_n(3);
+
+    // Add node 4 as a learner while it is UNREACHABLE — the change and later writes must
+    // commit with the 2-of-3 voter majority alone (a cold *voter* would have moved the
+    // majority to 3-of-4 immediately; the learner doesn't).
+    c.spawn_blank(4);
+    c.isolate(4);
+    c.propose_conf_change(leader, ConfChange::AddLearner(4));
+    for id in [1, 2, 3] {
+        assert_eq!(c.voters(id), vec![1, 2, 3], "node {id}: the voter set is unchanged");
+        assert_eq!(c.learners(id), vec![4], "node {id}: 4 is a learner");
+    }
+    let idx = c.propose(leader, b"b");
+    c.tick_n(3);
+    assert_eq!(c.commit_index(leader), idx, "commits don't wait for the unreachable learner");
+
+    // Reconnect: the learner catches up by plain replication...
+    c.heal();
+    c.tick_n(8);
+    assert_eq!(c.last_index(4), c.last_index(leader), "the learner caught up");
+    assert_eq!(c.commit_index(4), c.commit_index(leader));
+    assert_eq!(c.learners(4), vec![4], "the learner learned it is a learner");
+
+    // ...but never campaigns, even isolated with an expired election timer.
+    c.isolate(4);
+    c.tick_n(40);
+    assert_eq!(c.nodes[&4].role(), Role::Follower, "a learner must never start an election");
+    assert_eq!(c.nodes[&4].current_term(), c.nodes[&leader].current_term());
+    c.heal();
+    c.tick_n(4);
+    c.assert_logs_converged();
+}
+
+#[test]
+fn caught_up_learner_promotes_to_voter() {
+    // AddNode on a learner is a promotion: it keeps its replication progress and starts
+    // counting toward (and voting in) the majority.
+    let mut c = Cluster::new(&[1, 2, 3]);
+    let leader = c.run_until_leader(60);
+    c.propose(leader, b"a");
+    c.propose(leader, b"b");
+
+    c.spawn_blank(4);
+    c.propose_conf_change(leader, ConfChange::AddLearner(4));
+    c.tick_n(6); // learner catches up
+    assert_eq!(c.last_index(4), c.last_index(leader));
+
+    c.propose_conf_change(leader, ConfChange::AddNode(4)); // promote
+    c.tick_n(6);
+    for id in [1, 2, 3, 4] {
+        assert_eq!(c.voters(id), vec![1, 2, 3, 4], "node {id} sees the promotion");
+        assert!(c.learners(id).is_empty(), "node {id}: no learners remain");
+    }
+
+    // The promoted voter genuinely counts: with one *other* follower dead, commits need
+    // 3 of 4 — and succeed only because node 4 now acks as a voter.
+    let downed = [1, 2, 3].into_iter().find(|x| *x != leader).unwrap();
+    c.isolate(downed);
+    let idx = c.propose(leader, b"c");
+    c.tick_n(4);
+    assert_eq!(c.commit_index(leader), idx, "the promoted learner completes the majority");
+    assert_eq!(c.commit_index(4), idx);
+    c.heal();
+    c.tick_n(6);
+    c.assert_logs_converged();
+}
+
+#[test]
+fn learner_added_after_compaction_catches_up_via_snapshot_with_membership() {
+    // A learner added after the leader compacted must be seeded by InstallSnapshot — and the
+    // snapshot's conf_state/learners must teach it the membership (its AddLearner entry is
+    // itself below the compaction point by the time it syncs).
+    let mut c = Cluster::new(&[1, 2, 3]);
+    let leader = c.run_until_leader(60);
+    for i in 0..5 {
+        c.propose(leader, format!("v{i}").as_bytes());
+    }
+    c.spawn_blank(4);
+    c.isolate(4); // present but unreachable while the log gets compacted away
+    c.propose_conf_change(leader, ConfChange::AddLearner(4));
+    c.tick_n(3);
+    let compact_to = c.commit_index(leader);
+    c.compact(leader, compact_to);
+    assert!(c.nodes[&leader].log_entries().is_empty(), "leader compacted its whole log");
+
+    c.heal();
+    c.tick_n(8);
+    assert_eq!(c.commit_index(4), compact_to, "the learner caught up via snapshot");
+    assert!(c.nodes[&4].log_entries().is_empty(), "…not by log replay");
+    assert_eq!(c.voters(4), vec![1, 2, 3], "the snapshot carried the voter set");
+    assert_eq!(c.learners(4), vec![4], "…and the learner set");
+}
+
+#[test]
+fn leadership_transfers_to_the_target() {
+    let mut c = Cluster::new(&[1, 2, 3]);
+    let old = c.run_until_leader(60);
+    c.propose(old, b"a");
+    c.propose(old, b"b");
+    let old_term = c.nodes[&old].current_term();
+    let target = [1, 2, 3].into_iter().find(|x| *x != old).unwrap();
+
+    // The target is caught up, so the handoff fires immediately: TimeoutNow → the target
+    // campaigns in term+1 and wins (its log is complete).
+    c.nodes.get_mut(&old).unwrap().transfer_leadership(target).unwrap();
+    c.pump();
+    assert_eq!(c.leader(), Some(target), "leadership moved to the target");
+    assert!(c.nodes[&target].current_term() > old_term);
+    assert_eq!(c.nodes[&old].role(), Role::Follower, "the old leader stepped down");
+
+    // The new leader serves writes; everyone converges.
+    let idx = c.propose(target, b"c");
+    c.tick_n(3);
+    for id in [1, 2, 3] {
+        assert_eq!(c.commit_index(id), idx);
+    }
+    c.assert_logs_converged();
+}
+
+#[test]
+fn transfer_waits_for_a_lagging_target_and_blocks_proposals() {
+    let mut c = Cluster::new(&[1, 2, 3]);
+    let old = c.run_until_leader(60);
+    let target = [1, 2, 3].into_iter().find(|x| *x != old).unwrap();
+
+    // Put the target behind: it misses two committed entries.
+    c.isolate(target);
+    c.propose(old, b"a");
+    c.propose(old, b"b");
+    c.heal(); // reachable again, but not yet caught up (no tick has run)
+
+    c.nodes.get_mut(&old).unwrap().transfer_leadership(target).unwrap();
+    // While the transfer is pending the leader refuses new writes — the target must be
+    // chasing a log that stands still.
+    assert_eq!(
+        c.nodes.get_mut(&old).unwrap().propose(b"x".to_vec()),
+        Err(arcux_raft::ProposeError::TransferInProgress),
+    );
+    // Delivering the catch-up append completes the handoff.
+    c.pump();
+    c.tick_n(4);
+    assert_eq!(c.leader(), Some(target), "the target took over once caught up");
+    let idx = c.propose(target, b"c");
+    c.tick_n(3);
+    assert_eq!(c.commit_index(old), idx);
+    c.assert_logs_converged();
+}
+
+#[test]
+fn dead_voter_is_replaced_via_learner_then_promotion() {
+    // The full auto-re-replication sequence the PD driver runs, proven deterministically:
+    // a voter dies → add a spare as a LEARNER (no quorum impact while it's cold) → it
+    // catches up → PROMOTE it → REMOVE the dead voter. RF=3 is restored and the group
+    // commits at every step — including while the newcomer is still cold, exactly the
+    // window where adding it as a *voter* would have stalled writes (3-of-4 with only 2 live).
+    let mut c = Cluster::new(&[1, 2, 3]);
+    let leader = c.run_until_leader(60);
+    c.propose(leader, b"a");
+    c.tick_n(3);
+
+    // A follower dies (stays down forever).
+    let dead = [1, 2, 3].into_iter().find(|x| *x != leader).unwrap();
+    c.isolate(dead);
+    c.decommission(dead);
+
+    // Step 1: add the spare as a learner. Writes keep committing with the 2 live voters —
+    // the cold learner has no quorum weight.
+    c.spawn_blank(4);
+    c.propose_conf_change(leader, ConfChange::AddLearner(4));
+    let idx = c.propose(leader, b"during-catchup");
+    c.tick_n(3);
+    assert_eq!(c.commit_index(leader), idx, "2-of-3 keeps committing while the learner is cold");
+
+    // Step 2: the learner catches up.
+    c.tick_n(8);
+    assert_eq!(c.last_index(4), c.last_index(leader));
+
+    // Step 3: promote — instantly safe, its log is complete so it acks immediately.
+    c.propose_conf_change(leader, ConfChange::AddNode(4));
+    // Step 4: drop the dead voter. Quorum returns to 2-of-3 over live nodes.
+    c.tick_n(2); // let the promotion commit before the next change
+    c.propose_conf_change(leader, ConfChange::RemoveNode(dead));
+    c.tick_n(4);
+
+    let expected: Vec<u64> = [1, 2, 3, 4].into_iter().filter(|x| *x != dead).collect();
+    for &id in &expected {
+        assert_eq!(c.voters(id), expected, "node {id}: RF=3 restored over the live set");
+        assert!(c.learners(id).is_empty());
+    }
+    // The repaired group serves writes, and can even survive another single failure.
+    let idx = c.propose(leader, b"repaired");
+    c.tick_n(3);
+    for &id in &expected {
+        assert_eq!(c.commit_index(id), idx);
     }
     c.assert_logs_converged();
 }
