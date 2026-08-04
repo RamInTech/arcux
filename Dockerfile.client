@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+#
+# arcux client image — the interactive `arcux` shell (put / get / delete / scan …).
+#
+#   docker build -f Dockerfile.client -t arcux-client .
+#   docker run -it --rm -e ARCUX_ADDR=http://<server-ip>:50051 arcux-client
+#
+# NOTE: it's an interactive shell, so run it with -it. And ARCUX_ADDR must point
+# at an address the CONTAINER can reach — see the networking notes below the ENV.
+
+# ---- build stage ------------------------------------------------------------
+FROM rust:1-bookworm AS builder
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p arcux-client --bin arcux
+
+# ---- runtime stage ----------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home arcux
+
+COPY --from=builder /src/target/release/arcux /usr/local/bin/arcux
+
+USER arcux
+
+# Which server(s) to talk to. Override at `docker run -e ARCUX_ADDR=...`.
+#   * single node : ARCUX_ADDR=http://<server>:50051
+#   * cluster     : ARCUX_ADDR=http://n1:50061,http://n2:50062,http://n3:50063
+#   * region-aware: also set ARCUX_PD=http://<pd>:2379
+#
+# Reaching the server from inside the container:
+#   * server on the DOCKER HOST (your Mac): use host.docker.internal, e.g.
+#       -e ARCUX_ADDR=http://host.docker.internal:50051
+#     ("127.0.0.1" here means the CONTAINER itself, not your machine.)
+#   * server on ANOTHER machine: use that machine's LAN IP.
+#   * server in a compose network: use the service name.
+ENV ARCUX_ADDR=http://host.docker.internal:50051
+
+ENTRYPOINT ["arcux"]

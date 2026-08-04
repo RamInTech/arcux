@@ -29,11 +29,17 @@ The **catalog** (`server/src/catalog.rs`) is the `table name → regime` map, po
 
 Each `CP` region is replicated as its own **independent Raft group** across the region's replica set. A node that hosts multiple CP regions runs multiple Raft groups in parallel, each with its own leader, its own log, and its own majority — completely independent of the other groups', even though they share the same physical nodes. A write commits only once it's durably replicated to a **majority** of that region's voters, giving Snapshot Isolation and zero acknowledged-write loss across a leader failure. Multi-key transactions replicate too: each `prewrite`/`commit` is itself a Raft-committed command, so every replica reaches the same conflict decision deterministically (full Percolator-style 2PC, not just single-key writes).
 
+When a transaction spans **multiple regions**, its fate hinges on one atomic write — committing the transaction's designated **primary** key in its region. That single commit is the linearization point for the whole transaction, so the regions never have to agree with each other, only with the primary. Each step is a Raft proposal routed to the key's own region: the coordinator prewrites every region's slice (primary region first) through that region's log, commits the primary, then finalizes the secondaries. A reader that later meets a leftover lock asks the **primary's** region leader for the transaction's fate (a `CheckTxnStatus` RPC — which may live on a different node), then rolls the key it found forward or back through that key's region. A coordinator can crash mid-commit and any subsequent reader completes the cleanup — recovery is a property of the protocol, not a separate subsystem. The coordinator itself holds no durable state; the primary lock is the only source of truth.
+
 A client that hits a non-leader replica gets redirected (`NotLeader`) and retries against the current leader — this redirection is transparent to application code, and is handled automatically by the client SDK's cluster mode.
+
+CP regions are also **self-healing**: when a node dies, PD's failure detector notices the silence and the cluster re-replicates without operator action — a spare node starts hosting the region at runtime and joins as a non-voting **learner** (so the cold replica never stalls writes), catches up by log replay or snapshot, is promoted to voter, and the dead member is dropped — restoring full replication. Decommissioning a *live* leader is equally graceful: leadership is handed to a caught-up peer (`TimeoutNow`) before removal.
 
 ### AP regions: leaderless, always available
 
 Each `AP` region has **no leader and no Raft log**. Whichever node a client's write reaches becomes the coordinator: it stamps the write with its local **Hybrid Logical Clock**, applies it locally, acknowledges the client immediately (W=1), and fans the write out best-effort to the region's other replicas. If a peer is unreachable, the write still succeeds — that's the availability trade. Conflicting or re-delivered writes resolve by **Last-Writer-Wins** on the HLC timestamp, so convergence needs no coordination.
+
+Because that fan-out is best-effort, a replica that was partitioned or down when a key was written would otherwise miss it forever. Two mechanisms guarantee the replicas **converge** once they're reachable again: **read-repair** — an AP read consults the replicas, returns the Last-Writer-Wins winner, and heals any stale replica inline — and **anti-entropy** — a background pass that summarizes each replica's data as a **Merkle tree**, exchanges the compact digests, and transfers only the entries under the leaves that differ, so *any* key converges whether or not it's ever read. Together they make AP not just available *during* a partition but provably consistent *after* it heals.
 
 ### One engine, one cluster
 
@@ -65,12 +71,14 @@ Client SDK  ──▶  routes each key to its owning region (and, for CP, to tha
 - [`engine/`](engine/) — the storage engine (`arcux-engine`): write-ahead log, MVCC over an LSM tree, crash recovery, and single-node Percolator transactions.
 - [`rpc/`](rpc/) — the gRPC wire contract (`kv`/`raft`/`pd` protobufs) and generated code.
 - [`pd/`](pd/) — the Placement Driver (`arcux-pd`): cluster timestamp oracle, region registry, per-node membership and failure detection. Runs either single-process or as a **replicated 3-node Raft group** (`arcux-pd --cluster 3`) built on the same `arcux-raft` core, so a PD leader failure keeps the router and never regresses the timestamp oracle.
-- [`raft/`](raft/) — the hand-rolled Raft consensus core (`arcux-raft`): election, replication, commit safety, persistence, snapshotting, membership changes — built transport-free and proven deterministically.
+- [`raft/`](raft/) — the hand-rolled Raft consensus core (`arcux-raft`): election, replication, commit safety, persistence, snapshotting, membership changes, non-voting learners, leadership transfer — built transport-free and proven deterministically.
 - [`server/`](server/) — the `tonic` server (`arcux-server`): binds Raft groups to regions, runs the AP leaderless path, hosts the consistency catalog, and serves the KV/PD RPCs.
   - `raft_group.rs` — per-region Raft group driver.
   - `multiraft.rs` — many region groups multiplexed over one transport, keyed by `group_id`.
   - `hlc.rs` / `ap.rs` — the AP write path (HLC timestamps + leaderless fan-out).
+  - `anti_entropy.rs` — AP convergence: Merkle-digest reconciliation + Last-Writer-Wins merge (background), and read-repair (inline).
   - `catalog.rs` — `create_table(name, CP|AP)` and the region tiling it drives.
+  - `repair.rs` — auto re-replication: PD's failure detector → add-learner → catch up → promote → drop the dead voter.
 - [`client/`](client/) — the async client SDK (`arcux-client`): region-aware routing, transparent retry on stale routes or leader changes, and (for a static cluster with no PD) automatic leader-following.
 
 ## Build & test

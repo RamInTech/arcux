@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1
+#
+# arcux-server (+ arcux-pd) image — the CP/AP data node and the Placement Driver.
+#
+#   docker build -f Dockerfile.server -t arcux-server .
+#   docker run --rm -p 50051:50051 -v arcux-data:/data arcux-server
+#   # …then from anywhere:  ARCUX_ADDR=http://<this-host-ip>:50051 arcux
+#
+# Multi-stage: a Rust builder compiles the release binaries, then a slim Debian
+# runtime carries only the binaries — the final image has no Rust toolchain.
+
+# ---- build stage: compile the release binaries ------------------------------
+FROM rust:1-bookworm AS builder
+WORKDIR /src
+
+# The whole workspace. `protoc` is vendored via the `protoc-bin-vendored` crate,
+# so NO system protobuf compiler is needed here.
+COPY . .
+
+# Build the data node and the Placement Driver. (For much faster incremental
+# rebuilds you can layer in `cargo-chef`; kept simple here so it "just works".)
+RUN cargo build --release -p arcux-server -p arcux-pd
+
+# ---- runtime stage: a slim image with just the server binaries --------------
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    # a non-root user; its home /data is where the node persists engine + Raft logs
+    && useradd --system --create-home --home-dir /data arcux
+
+COPY --from=builder /src/target/release/arcux-server /usr/local/bin/arcux-server
+COPY --from=builder /src/target/release/arcux-pd     /usr/local/bin/arcux-pd
+
+USER arcux
+WORKDIR /data
+VOLUME ["/data"]
+
+# 50051: default single-node listen. 50060-50070: the --cluster shortcut range.
+EXPOSE 50051 50060-50070
+
+# Bind 0.0.0.0 so a published port is reachable from other machines (127.0.0.1
+# would only accept connections from inside the container). Override the args at
+# `docker run` to pass --pd / --voters / --peer / --table etc.
+ENTRYPOINT ["arcux-server"]
+CMD ["--listen", "0.0.0.0:50051", "--data", "/data"]

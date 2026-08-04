@@ -1,0 +1,103 @@
+# A full 3-node replicated CP cluster on one host — the tidy way to run the real
+# thing without three physical machines.
+#
+#   docker compose up --build          # start nodes 1,2,3 (they elect a leader)
+#   docker compose run --rm client     # an interactive shell, leader-following
+#   docker compose stop arcux1         # "kill" a node → watch the others re-elect
+#   docker compose down -v             # stop everything and wipe the data volumes
+#
+# The three nodes form one Raft group over the compose network, reaching each other
+# by service name (arcux1/arcux2/arcux3). Each listens on 0.0.0.0 so its port is
+# reachable both inside the network and from your host (published below). Because
+# they share this one host's clock, `LocalClock` is a consistent timestamp source —
+# no PD needed for correctness at this scale.
+
+# Shared config for the three identical nodes (built once from Dockerfile.server).
+x-node: &node
+  image: arcux-server:latest
+  build:
+    context: .
+    dockerfile: Dockerfile.server
+  restart: unless-stopped   # a crashed node restarts; a manually `stop`ped one stays down
+
+services:
+  arcux1:
+    <<: *node
+    command:
+      - "-n"
+      - "1"
+      - "--listen"
+      - "0.0.0.0:50061"
+      - "--data"
+      - "/data"
+      - "--voters"
+      - "1,2,3"
+      - "--peer"
+      - "2=http://arcux2:50062"
+      - "--peer"
+      - "3=http://arcux3:50063"
+    ports:
+      - "50061:50061"      # reachable from your host at http://127.0.0.1:50061
+    volumes:
+      - arcux1-data:/data
+
+  arcux2:
+    <<: *node
+    command:
+      - "-n"
+      - "2"
+      - "--listen"
+      - "0.0.0.0:50062"
+      - "--data"
+      - "/data"
+      - "--voters"
+      - "1,2,3"
+      - "--peer"
+      - "1=http://arcux1:50061"
+      - "--peer"
+      - "3=http://arcux3:50063"
+    ports:
+      - "50062:50062"
+    volumes:
+      - arcux2-data:/data
+
+  arcux3:
+    <<: *node
+    command:
+      - "-n"
+      - "3"
+      - "--listen"
+      - "0.0.0.0:50063"
+      - "--data"
+      - "/data"
+      - "--voters"
+      - "1,2,3"
+      - "--peer"
+      - "1=http://arcux1:50061"
+      - "--peer"
+      - "2=http://arcux2:50062"
+    ports:
+      - "50063:50063"
+    volumes:
+      - arcux3-data:/data
+
+  # The interactive shell — not started by `up` (it's under a profile); launch it
+  # with `docker compose run --rm client`. It talks to all three nodes by service
+  # name and follows the leader across elections/failover.
+  client:
+    image: arcux-client:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    profiles: ["cli"]
+    depends_on: [arcux1, arcux2, arcux3]
+    environment:
+      ARCUX_ADDR: "http://arcux1:50061,http://arcux2:50062,http://arcux3:50063"
+    # keep STDIN open + allocate a TTY so the interactive prompt works under `run`
+    stdin_open: true
+    tty: true
+
+volumes:
+  arcux1-data:
+  arcux2-data:
+  arcux3-data:

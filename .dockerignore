@@ -1,0 +1,15 @@
+# Keep the Docker build context small & clean — never ship build output or local data.
+target/
+**/target/
+.git/
+.gitignore
+
+# Local run artifacts (data dirs the server/PD write to)
+arcux-data/
+arcux-cat/
+arcux-n*/
+
+# Editor / tooling
+.claude/
+scratchpad/
+*.log
