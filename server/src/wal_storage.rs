@@ -191,7 +191,7 @@ impl Storage for WalStorage {
         self.base() + 1
     }
 
-    fn compact(&mut self, index: u64, term: u64, conf_state: Vec<u64>, data: Vec<u8>) {
+    fn compact(&mut self, index: u64, term: u64, conf_state: Vec<u64>, learners: Vec<u64>, data: Vec<u8>) {
         if index <= self.base() {
             return; // already compacted at or past this point
         }
@@ -204,6 +204,7 @@ impl Storage for WalStorage {
             last_included_index: index,
             last_included_term: term,
             conf_state,
+            learners,
             data,
         });
         atomic_write(&self.snapshot_path(), &encode_snapshot(self.snap.as_ref().unwrap()))
@@ -265,38 +266,58 @@ fn decode_hard_state(b: &[u8]) -> HardState {
     HardState { current_term, voted_for }
 }
 
-/// Snapshot file: `[last_included_index:u64 BE][last_included_term:u64 BE][n:u32 BE]
-/// [conf_voter:u64 BE * n][data...]`, where `conf_state` is the group membership (Phase 4b++
-/// rest).
+/// Snapshot file: `[last_included_index:u64 BE][last_included_term:u64 BE][nv:u32 BE]
+/// [voter:u64 BE * nv][nl:u32 BE][learner:u64 BE * nl][data...]`, where `conf_state` is the
+/// group's voters and `learners` its non-voting replicas (Phase 4b++ rest).
 fn encode_snapshot(s: &Snapshot) -> Vec<u8> {
-    let mut b = Vec::with_capacity(20 + s.conf_state.len() * 8 + s.data.len());
+    let mut b =
+        Vec::with_capacity(24 + (s.conf_state.len() + s.learners.len()) * 8 + s.data.len());
     b.extend_from_slice(&s.last_included_index.to_be_bytes());
     b.extend_from_slice(&s.last_included_term.to_be_bytes());
     b.extend_from_slice(&(s.conf_state.len() as u32).to_be_bytes());
     for v in &s.conf_state {
         b.extend_from_slice(&v.to_be_bytes());
     }
+    b.extend_from_slice(&(s.learners.len() as u32).to_be_bytes());
+    for l in &s.learners {
+        b.extend_from_slice(&l.to_be_bytes());
+    }
     b.extend_from_slice(&s.data);
     b
 }
 
 fn decode_snapshot(b: &[u8]) -> Option<Snapshot> {
-    if b.len() < 20 {
+    if b.len() < 24 {
         return None;
     }
     let last_included_index = u64::from_be_bytes(b[..8].try_into().unwrap());
     let last_included_term = u64::from_be_bytes(b[8..16].try_into().unwrap());
-    let n = u32::from_be_bytes(b[16..20].try_into().unwrap()) as usize;
-    let mut conf_state = Vec::with_capacity(n);
-    let mut p = 20;
-    for _ in 0..n {
-        if p + 8 > b.len() {
+    let mut p = 16;
+    let read_ids = |b: &[u8], p: &mut usize| -> Option<Vec<u64>> {
+        if *p + 4 > b.len() {
             return None;
         }
-        conf_state.push(u64::from_be_bytes(b[p..p + 8].try_into().unwrap()));
-        p += 8;
-    }
-    Some(Snapshot { last_included_index, last_included_term, conf_state, data: b[p..].to_vec() })
+        let n = u32::from_be_bytes(b[*p..*p + 4].try_into().unwrap()) as usize;
+        *p += 4;
+        let mut ids = Vec::with_capacity(n);
+        for _ in 0..n {
+            if *p + 8 > b.len() {
+                return None;
+            }
+            ids.push(u64::from_be_bytes(b[*p..*p + 8].try_into().unwrap()));
+            *p += 8;
+        }
+        Some(ids)
+    };
+    let conf_state = read_ids(b, &mut p)?;
+    let learners = read_ids(b, &mut p)?;
+    Some(Snapshot {
+        last_included_index,
+        last_included_term,
+        conf_state,
+        learners,
+        data: b[p..].to_vec(),
+    })
 }
 
 // ---- small fs utilities --------------------------------------------------------------
@@ -394,7 +415,7 @@ mod tests {
         {
             let mut s = WalStorage::open(dir.path()).unwrap();
             s.append(&[entry(1, 1, b"a"), entry(1, 2, b"b"), entry(2, 3, b"c"), entry(2, 4, b"d")]);
-            s.compact(3, 2, vec![1, 2, 3], b"state@3".to_vec());
+            s.compact(3, 2, vec![1, 2, 3], vec![4], b"state@3".to_vec());
 
             assert_eq!(s.first_index(), 4);
             assert_eq!(s.last_index(), 4);
@@ -416,6 +437,7 @@ mod tests {
                 last_included_index: 3,
                 last_included_term: 2,
                 conf_state: vec![1, 2, 3],
+                learners: vec![4],
                 data: b"state@3".to_vec(),
             },
             "snapshot incl. membership survives restart",
@@ -437,6 +459,7 @@ mod tests {
                 last_included_index: 10,
                 last_included_term: 4,
                 conf_state: vec![1, 2, 3],
+                learners: vec![],
                 data: b"installed".to_vec(),
             });
             assert_eq!(s.first_index(), 11);

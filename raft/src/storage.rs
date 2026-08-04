@@ -15,13 +15,14 @@ use crate::message::{Entry, HardState};
 
 /// A point-in-time snapshot: the state machine's committed state through
 /// `last_included_index` (opaque `data`, produced/applied by the integration layer), the
-/// group membership as of that index (`conf_state`, Phase 4b++ rest), and the log position it
-/// covers. Once taken, the log keeps only entries **above** the snapshot.
+/// group membership as of that index (`conf_state` voters + `learners`, Phase 4b++ rest), and
+/// the log position it covers. Once taken, the log keeps only entries **above** the snapshot.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub last_included_index: u64,
     pub last_included_term: u64,
     pub conf_state: Vec<u64>,
+    pub learners: Vec<u64>,
     pub data: Vec<u8>,
 }
 
@@ -56,9 +57,9 @@ pub trait Storage {
     /// The first index the log could still hold: `snapshot index + 1` (or `1`).
     fn first_index(&self) -> u64;
     /// Record a snapshot of committed state through `index` (already applied by the caller),
-    /// with the membership `conf_state` as of that index, and discard log entries with index
-    /// `<= index`. Durable before returning.
-    fn compact(&mut self, index: u64, term: u64, conf_state: Vec<u64>, data: Vec<u8>);
+    /// with the membership (`conf_state` voters + `learners`) as of that index, and discard
+    /// log entries with index `<= index`. Durable before returning.
+    fn compact(&mut self, index: u64, term: u64, conf_state: Vec<u64>, learners: Vec<u64>, data: Vec<u8>);
     /// Install a snapshot received from the leader: adopt its meta + data and drop the log
     /// (its entries are superseded). Durable before returning.
     fn apply_snapshot(&mut self, snap: Snapshot);
@@ -154,7 +155,7 @@ impl Storage for MemStorage {
         self.base() + 1
     }
 
-    fn compact(&mut self, index: u64, term: u64, conf_state: Vec<u64>, data: Vec<u8>) {
+    fn compact(&mut self, index: u64, term: u64, conf_state: Vec<u64>, learners: Vec<u64>, data: Vec<u8>) {
         let base = self.base();
         if index <= base {
             return; // already compacted at or past this point
@@ -165,6 +166,7 @@ impl Storage for MemStorage {
             last_included_index: index,
             last_included_term: term,
             conf_state,
+            learners,
             data,
         });
     }
@@ -195,7 +197,7 @@ mod tests {
         assert_eq!(s.first_index(), 1);
         assert_eq!(s.last_index(), 5);
 
-        s.compact(3, 1, vec![1, 2, 3], b"snap@3".to_vec());
+        s.compact(3, 1, vec![1, 2, 3], vec![9], b"snap@3".to_vec());
 
         // Boundary + offsets.
         assert_eq!(s.first_index(), 4);
@@ -214,13 +216,14 @@ mod tests {
         assert_eq!(snap.last_included_index, 3);
         assert_eq!(snap.last_included_term, 1);
         assert_eq!(snap.conf_state, vec![1, 2, 3]);
+        assert_eq!(snap.learners, vec![9], "the learner set rides in the snapshot");
         assert_eq!(snap.data, b"snap@3");
     }
 
     #[test]
     fn append_after_compaction_continues_at_absolute_index() {
         let mut s = seed(5);
-        s.compact(5, 1, vec![], b"snap@5".to_vec());
+        s.compact(5, 1, vec![], vec![], b"snap@5".to_vec());
         assert_eq!(s.first_index(), 6);
         assert_eq!(s.last_index(), 5); // no entries above the snapshot yet
 
@@ -234,8 +237,8 @@ mod tests {
     #[test]
     fn compact_is_idempotent_and_ignores_stale_index() {
         let mut s = seed(5);
-        s.compact(3, 1, vec![], b"a".to_vec());
-        s.compact(2, 1, vec![], b"stale".to_vec()); // below current snapshot: ignored
+        s.compact(3, 1, vec![], vec![], b"a".to_vec());
+        s.compact(2, 1, vec![], vec![], b"stale".to_vec()); // below current snapshot: ignored
         assert_eq!(s.first_index(), 4);
         assert_eq!(s.snapshot().unwrap().data, b"a");
     }
@@ -243,7 +246,7 @@ mod tests {
     #[test]
     fn truncate_suffix_after_compaction() {
         let mut s = seed(6);
-        s.compact(3, 1, vec![], b"snap".to_vec());
+        s.compact(3, 1, vec![], vec![], b"snap".to_vec());
         s.truncate_suffix(5); // drop indices >= 5
         assert_eq!(s.last_index(), 4);
         assert_eq!(s.entries(4, 6), vec![ent(1, 4)]);
@@ -261,6 +264,7 @@ mod tests {
             last_included_index: 10,
             last_included_term: 4,
             conf_state: vec![1, 2, 3],
+            learners: vec![],
             data: b"installed".to_vec(),
         });
         assert_eq!(s.first_index(), 11);
