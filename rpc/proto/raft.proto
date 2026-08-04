@@ -13,6 +13,9 @@ service RaftService {
   // Server-streaming to establish the Phase-4 replication pipeline shape.
   rpc AppendEntries(AppendEntriesRequest) returns (stream AppendEntriesResponse);
   rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+  // Leadership transfer (Phase 4b++ rest): the leader tells a fully-caught-up target to
+  // campaign immediately, skipping its randomized election timeout.
+  rpc TimeoutNow(TimeoutNowRequest) returns (TimeoutNowResponse);
 }
 
 message LogEntry {
@@ -61,10 +64,21 @@ message InstallSnapshotRequest {
   uint64 last_included_term = 4;
   bytes data = 5;
   uint64 group_id = 6;  // Phase 4b++: which region's Raft group (MultiRaft multiplexing)
-  repeated uint64 conf_state = 7;  // Phase 4b++ rest: group membership as of the snapshot
+  repeated uint64 conf_state = 7;  // Phase 4b++ rest: group voters as of the snapshot
+  repeated uint64 learners = 8;    // Phase 4b++ rest: non-voting learners as of the snapshot
   reserved 50 to 99;
 }
 message InstallSnapshotResponse {
   uint64 term = 1;
+  reserved 50 to 99;
+}
+
+message TimeoutNowRequest {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  uint64 group_id = 3;  // which region's Raft group (MultiRaft multiplexing)
+  reserved 50 to 99;
+}
+message TimeoutNowResponse {
   reserved 50 to 99;
 }
