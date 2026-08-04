@@ -13,9 +13,15 @@
 /// groups (MultiRaft). v5 (Phase 5): added the internal `kv.ReplicateAp` RPC for the
 /// leaderless AP write path. v6 (Phase 4b++ rest): added `LogEntry.entry_type` (config-change
 /// entries) and `InstallSnapshotRequest.conf_state` (membership carried by a snapshot) for
-/// single-server membership changes. All additions are field-/RPC-additive, so older peers
-/// stay wire-compatible.
-pub const VERSION: u32 = 6;
+/// single-server membership changes. v7 (Phase 5, cross-region Percolator): added the
+/// `kv.CheckTxnStatus` + `kv.ResolveLock` RPCs (consult the primary region for a txn's fate;
+/// roll a region's keys forward/back through its own Raft log). v8 (Phase 4b++ rest, auto
+/// re-replication): added `InstallSnapshotRequest.learners` (non-voting membership carried by
+/// a snapshot) and the `raft.TimeoutNow` RPC (leadership transfer). All additions are
+/// field-/RPC-additive, so older peers stay wire-compatible. v9 (Phase 5b, AP anti-entropy):
+/// added the `kv.ApDigest` + `kv.ApFetch` RPCs (Merkle-digest reconciliation + read-repair for
+/// the leaderless AP path). All additions are field-/RPC-additive.
+pub const VERSION: u32 = 9;
 
 /// KV API v1 — the transactional + autocommit surface (fully implemented in Phase 2).
 pub mod kv {

@@ -37,6 +37,21 @@ service KvService {
   // Internal (node→node): replicate an AP write to a peer replica (Phase 5). Leaderless +
   // HLC-stamped + Last-Writer-Wins; the coordinator that took the client write fans it out.
   rpc ReplicateAp(ReplicateApRequest) returns (ReplicateApResponse);
+  // Internal (node→node): AP anti-entropy (Phase 5b). ApDigest returns a peer's compact
+  // Merkle leaf hashes for an AP region; the caller diffs against its own to find divergent
+  // buckets, then ApFetch pulls those buckets' (or specific keys') latest versions to
+  // Last-Writer-Wins-merge — the background convergence the best-effort fan-out can't promise.
+  rpc ApDigest(ApDigestRequest) returns (ApDigestResponse);
+  rpc ApFetch(ApFetchRequest) returns (ApFetchResponse);
+  // Cross-region Percolator (Phase 5): ask a transaction's **primary** region for its fate,
+  // so a reader that meets a secondary lock — whose primary may live in another region —
+  // learns whether to roll the key forward or back. Evaluated on the primary's region leader;
+  // an expired primary lock is rolled back through Raft before the verdict is reported.
+  rpc CheckTxnStatus(CheckTxnStatusRequest) returns (CheckTxnStatusResponse);
+  // Cross-region Percolator (Phase 5): roll a set of keys (all owned by one region) **forward**
+  // to commit_ts (> 0) or **back** (== 0). Drives secondary finalization and reader-driven
+  // resolution; each is applied through the key region's Raft log.
+  rpc ResolveLock(ResolveLockRequest) returns (ResolveLockResponse);
 }
 
 // Routing context a region-aware client attaches to every data request: the region
@@ -223,5 +238,72 @@ message ReplicateApRequest {
   reserved 50 to 99;
 }
 message ReplicateApResponse {
+  reserved 50 to 99;
+}
+
+// --- AP anti-entropy (Phase 5b) ---
+
+// One key's latest version on a replica — the reconcile unit (mirrors the core `Version`).
+message ApEntry {
+  bytes key = 1;
+  uint64 hlc = 2;        // the version's HLC stamp (the Last-Writer-Wins rank)
+  bytes value = 3;       // empty when is_delete
+  bool is_delete = 4;    // a tombstone can itself win by LWW
+  reserved 50 to 99;
+}
+
+message ApDigestRequest {
+  uint64 region_id = 1;
+  reserved 50 to 99;
+}
+message ApDigestResponse {
+  repeated fixed64 leaves = 1;  // the region's Merkle leaf hashes (compact digest)
+  reserved 50 to 99;
+}
+
+message ApFetchRequest {
+  uint64 region_id = 1;
+  repeated uint32 buckets = 2;  // fetch every key whose Merkle bucket is in this set…
+  repeated bytes keys = 3;      // …and/or these specific keys (used by read-repair)
+  reserved 50 to 99;
+}
+message ApFetchResponse {
+  repeated ApEntry entries = 1;
+  reserved 50 to 99;
+}
+
+// --- cross-region Percolator (Phase 5) ---
+
+// A transaction's fate, as told by its primary key (the mirror of engine `TxnStatus`).
+enum TxnFate {
+  COMMITTED = 0;    // committed at `commit_ts` → roll the encountered key forward
+  ROLLED_BACK = 1;  // dead (never committed / lock expired) → roll the key back
+  LOCKED = 2;       // primary lock still alive (`ttl` not expired) → wait and retry
+}
+
+message CheckTxnStatusRequest {
+  bytes primary = 1;    // the transaction's primary key (from the secondary lock)
+  uint64 start_ts = 2;  // the locked transaction's start_ts
+  uint64 now_ts = 3;    // the reader's timestamp — drives TTL expiry of the primary lock
+  Context context = 4;
+  reserved 50 to 99;
+}
+message CheckTxnStatusResponse {
+  TxnFate fate = 1;
+  uint64 commit_ts = 2;  // set when fate == COMMITTED
+  uint64 ttl = 3;        // set when fate == LOCKED
+  KeyError error = 4;    // NotLeader / RegionStale ⇒ re-route to the primary's leader
+  reserved 50 to 99;
+}
+
+message ResolveLockRequest {
+  repeated bytes keys = 1;  // all in one region
+  uint64 start_ts = 2;
+  uint64 commit_ts = 3;     // 0 ⇒ roll back; > 0 ⇒ roll forward at this commit_ts
+  Context context = 4;
+  reserved 50 to 99;
+}
+message ResolveLockResponse {
+  KeyError error = 1;  // NotLeader / RegionStale ⇒ re-route to the keys' region leader
   reserved 50 to 99;
 }
