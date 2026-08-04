@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use crate::db::Engine;
 use crate::error::{Error, Result};
-use crate::keys::{decode_data_key, Cf};
+use crate::keys::{decode_data_key, decode_write_value, encode_data_key, Cf, Value};
 use crate::memtable::MemValue;
 
 /// A forward merging iterator over one CF, in key order across all levels (newest-wins).
@@ -41,6 +41,10 @@ impl Iterator for MergeIter<'_> {
         }
     }
 }
+
+/// One key's latest committed version from [`Engine::scan_versions`]:
+/// `(key, commit_ts, value, is_delete)` (`is_delete` ⇒ a tombstone, `value` empty).
+pub type VersionedKv = (Vec<u8>, u64, Vec<u8>, bool);
 
 impl Engine {
     /// A merging iterator over `cf`, yielding every entry `≥ from` in key order.
@@ -95,6 +99,51 @@ impl Engine {
                 Ok(None) => {} // no visible version (tombstone / all newer than read_ts)
                 Err(Error::KeyIsLocked(_)) => {} // in-flight lock — invisible at this snapshot
                 Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
+    /// The **latest committed version** of every key in `[start, end)` as
+    /// `(key, commit_ts, value, is_delete)`, in key order (`limit` `0` = unlimited).
+    ///
+    /// Unlike [`scan`](Self::scan), this exposes the version's **commit timestamp** (for AP
+    /// keys, the HLC stamp) and includes **tombstones** (`is_delete`) — exactly what AP
+    /// anti-entropy needs to reconcile replicas by Last-Writer-Wins: compare each key's version
+    /// across replicas and take the higher, where a delete is just a versioned tombstone that
+    /// can itself win. There is no snapshot `read_ts`: it always reports the newest version.
+    pub fn scan_versions(&self, start: &[u8], end: &[u8], limit: usize) -> Result<Vec<VersionedKv>> {
+        let mut out = Vec::new();
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+
+        for entry in self.iter_cf(Cf::Write, start) {
+            let (wkey, wval) = entry?;
+            let Some((user_key, commit_ts)) = decode_data_key(&wkey) else {
+                continue;
+            };
+            if !end.is_empty() && user_key >= end {
+                break;
+            }
+            // The Write CF lists versions newest-first per key, so the first one we see for a
+            // user key is its latest commit.
+            if !seen.insert(user_key.to_vec()) {
+                continue;
+            }
+            // The Write entry points at the transaction's start_ts, where the Default value
+            // (the payload, or a delete tombstone) lives.
+            let MemValue::Put(sb) = &wval else { continue };
+            let Some(start_ts) = decode_write_value(sb) else { continue };
+            let Some(vb) = self.get_cf_raw(Cf::Default, &encode_data_key(user_key, start_ts))? else {
+                continue; // dangling commit pointer (shouldn't happen)
+            };
+            let (value, is_delete) = match Value::decode(&vb) {
+                Some(Value::Put(v)) => (v, false),
+                Some(Value::Delete) => (Vec::new(), true),
+                None => continue,
+            };
+            out.push((user_key.to_vec(), commit_ts, value, is_delete));
+            if limit != 0 && out.len() >= limit {
+                break;
             }
         }
         Ok(out)
@@ -172,6 +221,26 @@ mod tests {
         }
         let two = e.scan(b"", b"", 1000, 2, true).unwrap();
         assert_eq!(keys(&two), vec![b"a".to_vec(), b"b".to_vec()]);
+    }
+
+    #[test]
+    fn scan_versions_exposes_timestamps_and_tombstones() {
+        let (_d, e) = open();
+        put(&e, b"a", b"1", 10, 20);
+        put(&e, b"b", b"2", 10, 20);
+        put(&e, b"b", b"2b", 30, 40); // a newer version of b
+        del(&e, b"a", 50, 60); // a is deleted at commit_ts 60
+
+        let vs = e.scan_versions(b"", b"", 0).unwrap();
+        // Latest version per key, with its commit_ts; the delete surfaces as a tombstone.
+        assert_eq!(vs.len(), 2);
+        assert_eq!(vs[0], (b"a".to_vec(), 60, Vec::new(), true), "a: newest is the tombstone @60");
+        assert_eq!(vs[1], (b"b".to_vec(), 40, b"2b".to_vec(), false), "b: newest value @40");
+
+        // Half-open range + limit behave like `scan`.
+        let only_b = e.scan_versions(b"b", b"", 0).unwrap();
+        assert_eq!(only_b.len(), 1);
+        assert_eq!(only_b[0].0, b"b".to_vec());
     }
 
     #[test]

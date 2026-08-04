@@ -152,6 +152,26 @@ impl Engine {
         }
     }
 
+    /// Read-only sibling of [`check_txn_status`](Self::check_txn_status): report the primary's
+    /// fate from its current committed state **without mutating** — it never rolls an expired
+    /// lock back. A live lock owned by `start_ts` is reported as [`TxnStatus::Locked`]
+    /// *regardless of its TTL*, leaving the expiry decision (and the replicated roll-back it
+    /// triggers) to the caller. This is what a `CheckTxnStatus` RPC handler evaluates on the
+    /// primary's region leader before it proposes any roll-back through Raft — in a replicated
+    /// region all writes, including expired-lock GC, must go through the log, not a side read.
+    pub fn check_txn_status_peek(&self, primary: &[u8], start_ts: u64) -> Result<TxnStatus> {
+        if let Some(b) = self.get_cf_raw(Cf::Lock, primary)? {
+            let plock = Lock::decode(&b).ok_or_else(|| Error::corruption("primary lock decode"))?;
+            if plock.start_ts == start_ts {
+                return Ok(TxnStatus::Locked { ttl: plock.ttl });
+            }
+        }
+        match self.find_commit_ts(primary, start_ts)? {
+            Some(commit_ts) => Ok(TxnStatus::Committed(commit_ts)),
+            None => Ok(TxnStatus::RolledBack),
+        }
+    }
+
     /// Resolve a leftover lock on `key` by consulting its `primary` (assumed **local** —
     /// same engine). The cross-region generalization is in `server::cross_txn`, which asks
     /// the primary's region for the [`TxnStatus`] and then rolls `key` the same way here.
