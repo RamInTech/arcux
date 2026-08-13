@@ -128,6 +128,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let (name, regime) = spec
                     .split_once('=')
                     .ok_or_else(|| format!("--table must be <name>=<cp|ap>, got {spec:?}"))?;
+                if name.is_empty() {
+                    return Err(format!(
+                        "--table name must not be empty (got {spec:?}) — \"\" is the reserved default/untabled namespace"
+                    )
+                    .into());
+                }
                 let regime = match regime.to_ascii_lowercase().as_str() {
                     "cp" => Regime::Cp,
                     "ap" => Regime::Ap,

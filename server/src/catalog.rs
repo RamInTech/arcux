@@ -28,6 +28,7 @@ impl Catalog {
     /// Declare `name` a CP or AP table — it owns the key-prefix `name/`. Re-declaring the same
     /// name overwrites its regime.
     pub fn create_table(&mut self, name: &str, regime: Regime) {
+        debug_assert!(!name.is_empty(), "\"\" is the reserved default namespace, not a declarable table");
         let prefix = table_prefix(name);
         match self.tables.iter_mut().find(|(p, _)| *p == prefix) {
             Some(entry) => entry.1 = regime,
@@ -102,7 +103,7 @@ impl Catalog {
 
 /// The smallest key strictly greater than every key having `prefix` — i.e. the exclusive end
 /// of the prefix range (`b"a/"` → `b"a0"`). `None` when `prefix` is all `0xff` (no upper bound).
-fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut end = prefix.to_vec();
     while let Some(last) = end.last_mut() {
         if *last < 0xff {
@@ -172,6 +173,18 @@ mod tests {
         cat.create_table("t", Regime::Cp);
         cat.create_table("t", Regime::Ap);
         assert_eq!(cat.regime_for(b"t/k"), Regime::Ap);
+    }
+
+    #[test]
+    fn empty_name_is_rejected_in_debug_builds() {
+        // "" is the reserved default/untabled namespace (see `table_prefix`); it must never be
+        // declarable as a real table. In debug builds this is a debug_assert (see create_table);
+        // the authoritative guard for user input lives at the --table CLI parser.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cat = Catalog::new();
+            cat.create_table("", Regime::Cp);
+        }));
+        assert!(result.is_err(), "create_table(\"\", _) must panic (debug_assert) in a debug build");
     }
 
     #[test]

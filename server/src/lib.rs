@@ -1370,7 +1370,34 @@ impl KvService for KvApi {
         &self,
         request: Request<kv::ScanRequest>,
     ) -> Result<Response<kv::ScanResponse>, Status> {
-        let req = request.into_inner();
+        let mut req = request.into_inner();
+
+        // Empty start_key and end_key together mean "scan the whole table" — the server derives
+        // the table's own bounds from the catalog rather than the client guessing them. Empty
+        // table + empty bounds is the one unsupported case: the untabled "" default namespace
+        // isn't a single contiguous range (see catalog.rs), so there's nothing to derive.
+        let whole_table = req.start_key.is_empty() && req.end_key.is_empty();
+        if whole_table && req.table.is_empty() {
+            return Err(Status::invalid_argument(
+                "scan: the untabled default namespace (\"\") has no contiguous range — pass an \
+                 explicit [start, end) or scope the scan to a declared table",
+            ));
+        }
+        let prefix = catalog::table_prefix(&req.table);
+        if whole_table {
+            req.start_key = prefix.clone();
+            req.end_key = catalog::prefix_successor(&prefix).unwrap_or_default();
+        } else {
+            req.start_key = [prefix.clone(), req.start_key].concat();
+            // An empty end is bounded to the active table (not the whole keyspace), consistent
+            // with put/get/delete always being table-scoped once a table is in play.
+            req.end_key = if req.end_key.is_empty() {
+                catalog::prefix_successor(&prefix).unwrap_or_default()
+            } else {
+                [prefix, req.end_key].concat()
+            };
+        }
+
         // `ScanResponse` carries no error field, so a stale route surfaces as a gRPC status.
         if self.state.check_context(&req.context, &req.start_key).is_some() {
             return Err(Status::failed_precondition("region stale; re-resolve and rescan"));

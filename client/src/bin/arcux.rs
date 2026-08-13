@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "use" => match args.get(1).map(String::as_str) {
                 Some("none" | "-") => {
                     current_table = None;
-                    println!("{DIM}cleared — put/get/delete need an explicit <table> again{RESET}");
+                    println!("{DIM}cleared — put/get/delete now default to the untabled \"\" (CP) namespace unless given <table> inline{RESET}");
                 }
                 Some(t) => {
                     current_table = Some(t.to_string());
@@ -202,9 +202,10 @@ fn resolve_endpoints() -> Vec<String> {
 
 /// Run one KV command; returns an error (printed, not fatal) rather than exiting the shell.
 ///
-/// `table` is the `use`-selected default (see `main`'s `"use"` arm): put/get/delete accept it
-/// either explicit (`put <table> <key> <value>`, unchanged) or, once a table's been `use`d,
-/// omitted (`put <key> <value>`) — the two forms never collide because they differ in arg count.
+/// `table` is the `use`-selected session default (see `main`'s `"use"` arm). put/get/delete/scan
+/// accept a table either explicit (`put <table> <key> <value>`, unchanged) or omitted — omitted
+/// resolves to `use`'s selection if any, else the untabled `""` default namespace (always CP),
+/// per `default_table` below. The two forms never collide because they differ in arg count.
 async fn dispatch(
     client: &mut Client,
     args: &[String],
@@ -217,7 +218,7 @@ async fn dispatch(
             println!("OK  {DIM}commit_ts {ts}{RESET}");
         }
         ["put", key, value] => {
-            let ts = client.put(require_table(table)?, key.as_bytes().to_vec(), value.as_bytes().to_vec()).await?;
+            let ts = client.put(default_table(table), key.as_bytes().to_vec(), value.as_bytes().to_vec()).await?;
             println!("OK  {DIM}commit_ts {ts}{RESET}");
         }
         ["get", table, key] => print_value(client.get(*table, key.as_bytes().to_vec()).await?),
@@ -225,19 +226,33 @@ async fn dispatch(
             let ts: u64 = read_ts.parse().map_err(|_| format!("read_ts must be a u64, got {read_ts:?}"))?;
             print_value(client.get_at(*table, key.as_bytes().to_vec(), ts).await?);
         }
-        ["get", key] => print_value(client.get(require_table(table)?, key.as_bytes().to_vec()).await?),
+        ["get", key] => print_value(client.get(default_table(table), key.as_bytes().to_vec()).await?),
         ["del" | "delete", table, key] => {
             let ts = client.delete(*table, key.as_bytes().to_vec()).await?;
             println!("OK  {DIM}commit_ts {ts}{RESET}");
         }
         ["del" | "delete", key] => {
-            let ts = client.delete(require_table(table)?, key.as_bytes().to_vec()).await?;
+            let ts = client.delete(default_table(table), key.as_bytes().to_vec()).await?;
             println!("OK  {DIM}commit_ts {ts}{RESET}");
         }
-        ["scan", start, end] => print_pairs(client.scan(start.as_bytes().to_vec(), end.as_bytes().to_vec(), 0).await?),
+        ["scan"] => match table {
+            Some(t) => print_pairs(client.scan(t.clone(), vec![], vec![], 0).await?),
+            None => {
+                return Err(
+                    "usage: scan <start> <end> [limit] | scan <table> — or 'use <table>' first for bare 'scan'"
+                        .into(),
+                )
+            }
+        },
+        ["scan", table_arg] => print_pairs(client.scan(table_arg.to_string(), vec![], vec![], 0).await?),
+        ["scan", start, end] => {
+            print_pairs(client.scan(default_table(table), start.as_bytes().to_vec(), end.as_bytes().to_vec(), 0).await?)
+        }
         ["scan", start, end, limit] => {
             let limit: u32 = limit.parse().map_err(|_| format!("limit must be a u32, got {limit:?}"))?;
-            print_pairs(client.scan(start.as_bytes().to_vec(), end.as_bytes().to_vec(), limit).await?);
+            print_pairs(
+                client.scan(default_table(table), start.as_bytes().to_vec(), end.as_bytes().to_vec(), limit).await?,
+            );
         }
         ["split", key] => {
             let (l, r) = client.split_region(key.as_bytes().to_vec()).await?;
@@ -253,12 +268,11 @@ async fn dispatch(
     Ok(())
 }
 
-/// Resolve the table for an argument-omitted put/get/delete: the `use`-selected default, or an
-/// error telling the user how to fix it (either `use <table>` once, or pass it inline).
-fn require_table(table: &Option<String>) -> Result<String, String> {
-    table
-        .clone()
-        .ok_or_else(|| "no table selected — run 'use <table>' first, or pass it inline: put <table> <key> <value>".to_string())
+/// Resolve the table for an argument-omitted put/get/delete/scan: the `use`-selected default, or
+/// the empty/default namespace `""` (always CP) if none was selected. Never errors — the
+/// beginner-mode contract is that omitting <table> "just works" with zero setup.
+fn default_table(table: &Option<String>) -> String {
+    table.clone().unwrap_or_default()
 }
 
 fn print_banner(endpoints: &[String], mode: &str) {
@@ -282,7 +296,12 @@ commands:
   put [<table>] <key> <value>        write a value (autocommit); prints commit_ts
   get [<table>] <key> [read_ts]      read latest, or the MVCC snapshot at read_ts
   delete [<table>] <key>             delete a key (autocommit)
-  scan <start> <end> [limit]         range scan [start, end) (empty end = to the end)
+  scan <start> <end> [limit]         range scan [start, end) within a table (empty end = to the
+                                      end of that table); table-scoped via 'use' or the default
+  scan <table>                       full-table scan (every key under <table>)
+  scan                               full-table scan of the 'use'-selected table (errors if none
+                                      selected — a bare scan of the whole default store isn't
+                                      supported, since it isn't one contiguous range)
   split <key>                        split the region owning <key> at <key>
   merge <key>                        merge the region starting at <key> leftward
   connect <uri>                      point the shell at a different server
@@ -290,7 +309,9 @@ commands:
   help | quit
 
 notes:
-  <table> is required unless selected via 'use' — omitting it without a 'use' errors
+  <table> is optional — omitted, it defaults to the untabled \"\" namespace (always CP);
+  select one with 'use <table>' for advanced multi-table mode
+  'scan <word>' is always a full-table scan by name, even a mistyped single-word range scan
   values with spaces: put ledger greeting \"hello, arcux\"
   <table> selects CP-vs-AP placement (declared server-side via --table); keys are stored
   without the table prefix, scoped per table internally

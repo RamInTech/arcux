@@ -607,24 +607,38 @@ impl Client {
         Ok(resp.merged.map(|r| r.id).unwrap_or(0))
     }
 
-    /// Range scan — frozen in the wire contract, but the server returns `Unimplemented`
-    /// until the Phase 1b iterator lands.
+    /// Range scan, table-scoped like [`get`](Self::get)/[`put`](Self::put)/[`delete`](Self::delete).
+    /// `table` is `""` for the untabled default namespace (requires an explicit non-empty
+    /// `start_key`/`end_key` — the default namespace isn't one contiguous range) or a declared
+    /// table name (an empty `start_key` *and* empty `end_key` together then mean "the whole
+    /// table" — the server derives its bounds from the catalog, not the client).
     pub async fn scan(
         &mut self,
+        table: impl Into<String>,
         start_key: impl Into<Vec<u8>>,
         end_key: impl Into<Vec<u8>>,
         limit: u32,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let table = table.into();
         let start_key = start_key.into();
         let end_key = end_key.into();
+        // Routing key: for a full-table scan (both bounds empty) route on the table's own prefix
+        // rather than an empty key, which would always resolve to the region owning the very
+        // start of the keyspace regardless of which table was asked for.
+        let route_key = if start_key.is_empty() && end_key.is_empty() {
+            table_prefix(&table)
+        } else {
+            [table_prefix(&table), start_key.clone()].concat()
+        };
         for _ in 0..MAX_ROUTING_ATTEMPTS {
-            let (context, mut kv) = self.prepare(&start_key).await?;
+            let (context, mut kv) = self.prepare(&route_key).await?;
             let req = kv::ScanRequest {
                 start_key: start_key.clone(),
                 end_key: end_key.clone(),
                 limit,
                 read_ts: 0,
                 context,
+                table: table.clone(),
             };
             match kv.scan(req).await {
                 Ok(r) => {
@@ -632,7 +646,7 @@ impl Client {
                 }
                 // A non-leader replies `unavailable`; in cluster mode rotate to the next node.
                 Err(_status) if self.cluster.is_some() => {
-                    self.invalidate(&start_key);
+                    self.invalidate(&route_key);
                     continue;
                 }
                 Err(status) => return Err(ClientError::Rpc(status)),
