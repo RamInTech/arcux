@@ -20,8 +20,10 @@
 /// a snapshot) and the `raft.TimeoutNow` RPC (leadership transfer). All additions are
 /// field-/RPC-additive, so older peers stay wire-compatible. v9 (Phase 5b, AP anti-entropy):
 /// added the `kv.ApDigest` + `kv.ApFetch` RPCs (Merkle-digest reconciliation + read-repair for
-/// the leaderless AP path). All additions are field-/RPC-additive.
-pub const VERSION: u32 = 9;
+/// the leaderless AP path). All additions are field-/RPC-additive. v10 (implicit table
+/// routing): added `table` to `kv.GetRequest`/`kv.PutRequest`/`kv.DeleteRequest` so clients
+/// pass the table name out-of-band instead of embedding it as a `"<table>/"` prefix in `key`.
+pub const VERSION: u32 = 10;
 
 /// KV API v1 — the transactional + autocommit surface (fully implemented in Phase 2).
 pub mod kv {

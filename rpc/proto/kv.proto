@@ -150,6 +150,7 @@ message GetRequest {
   bytes key = 1;
   uint64 read_ts = 2;  // 0 => server allocates "now"
   Context context = 3;
+  string table = 4;  // table name; server/client prepend "<table>/" before routing/storage
   reserved 50 to 99;
 }
 message GetResponse {
@@ -164,6 +165,7 @@ message PutRequest {
   bytes key = 1;
   bytes value = 2;
   Context context = 3;
+  string table = 4;  // table name; server/client prepend "<table>/" before routing/storage
   reserved 50 to 99;
 }
 message PutResponse {
@@ -175,6 +177,7 @@ message PutResponse {
 message DeleteRequest {
   bytes key = 1;
   Context context = 2;
+  string table = 3;  // table name; server/client prepend "<table>/" before routing/storage
   reserved 50 to 99;
 }
 message DeleteResponse {
