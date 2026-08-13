@@ -23,7 +23,10 @@
 /// the leaderless AP path). All additions are field-/RPC-additive. v10 (implicit table
 /// routing): added `table` to `kv.GetRequest`/`kv.PutRequest`/`kv.DeleteRequest` so clients
 /// pass the table name out-of-band instead of embedding it as a `"<table>/"` prefix in `key`.
-pub const VERSION: u32 = 10;
+/// v11 (table-aware scan): added `table` to `kv.ScanRequest`, mirroring v10's Get/Put/Delete
+/// treatment, plus a "whole table" mode (empty `start_key`/`end_key` + non-empty `table`) so a
+/// full-table scan doesn't require the client to know the table's byte-range bounds.
+pub const VERSION: u32 = 11;
 
 /// KV API v1 — the transactional + autocommit surface (fully implemented in Phase 2).
 pub mod kv {
