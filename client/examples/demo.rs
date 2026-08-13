@@ -20,9 +20,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut c = Client::connect(uri)?;
 
     // 1. Single-key autocommit put, then snapshot read at "now".
-    let commit_ts = c.put(b"greeting".to_vec(), b"hello, arcux".to_vec()).await?;
+    let commit_ts = c.put("", b"greeting".to_vec(), b"hello, arcux".to_vec()).await?;
     println!("put  greeting              committed @ ts {commit_ts}");
-    let got = c.get(b"greeting".to_vec()).await?;
+    let got = c.get("", b"greeting".to_vec()).await?;
     println!("get  greeting           -> {}", render(&got));
 
     // 2. Multi-key transaction (first mutation is the primary) committed atomically.
@@ -35,11 +35,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("txn  {{alice,bob}}            committed @ ts {txn_ts}");
 
     // 3. Read both keys back at the post-commit snapshot.
-    println!("get  acct:alice         -> {}", render(&c.get(b"acct:alice".to_vec()).await?));
-    println!("get  acct:bob           -> {}", render(&c.get(b"acct:bob".to_vec()).await?));
+    println!("get  acct:alice         -> {}", render(&c.get("", b"acct:alice".to_vec()).await?));
+    println!("get  acct:bob           -> {}", render(&c.get("", b"acct:bob".to_vec()).await?));
 
     // 4. A key that was never written reads as absent.
-    println!("get  acct:carol         -> {}", render(&c.get(b"acct:carol".to_vec()).await?));
+    println!("get  acct:carol         -> {}", render(&c.get("", b"acct:carol".to_vec()).await?));
 
     println!("✓ demo complete");
     Ok(())

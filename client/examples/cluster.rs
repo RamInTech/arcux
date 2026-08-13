@@ -21,8 +21,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut c = Client::connect_with_pd(node, pd)?;
 
     // One region covers the whole keyspace; the client routes to it via PD.
-    c.put(b"apple".to_vec(), b"1".to_vec()).await?;
-    c.put(b"mango".to_vec(), b"2".to_vec()).await?;
+    c.put("", b"apple".to_vec(), b"1".to_vec()).await?;
+    c.put("", b"mango".to_vec(), b"2".to_vec()).await?;
     println!("put apple, mango         (single whole-keyspace region)");
 
     // Split at "m": "apple" now lives in the left region, "mango" in the right.
@@ -31,12 +31,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The client still cached the pre-split route, so these writes hit RegionStale,
     // re-resolve from PD, and retry — transparently to us.
-    c.put(b"zebra".to_vec(), b"3".to_vec()).await?;
-    c.put(b"acorn".to_vec(), b"4".to_vec()).await?;
+    c.put("", b"zebra".to_vec(), b"3".to_vec()).await?;
+    c.put("", b"acorn".to_vec(), b"4".to_vec()).await?;
     println!("put zebra, acorn         (re-routed across the split)");
 
     for k in ["acorn", "apple", "mango", "zebra"] {
-        let v = c.get(k.as_bytes().to_vec()).await?;
+        let v = c.get("", k.as_bytes().to_vec()).await?;
         println!("get {k:<8}            -> {}", render(&v));
     }
     println!("✓ cluster demo complete");

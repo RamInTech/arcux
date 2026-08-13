@@ -85,8 +85,12 @@ impl Cluster {
     async fn put(&self, key: &[u8], value: &[u8]) {
         for _ in 0..100 {
             for c in &self.clients {
-                let req =
-                    kv::PutRequest { key: key.to_vec(), value: value.to_vec(), context: None };
+                let req = kv::PutRequest {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                    context: None,
+                    table: String::new(),
+                };
                 match c.clone().put(req).await {
                     Ok(resp) => match resp.into_inner().error.and_then(|e| e.kind) {
                         None => return,
@@ -105,7 +109,12 @@ impl Cluster {
     async fn get_until(&self, key: &[u8], expected: &[u8]) {
         for _ in 0..100 {
             for c in &self.clients {
-                let req = kv::GetRequest { key: key.to_vec(), read_ts: 0, context: None };
+                let req = kv::GetRequest {
+                    key: key.to_vec(),
+                    read_ts: 0,
+                    context: None,
+                    table: String::new(),
+                };
                 if let Ok(resp) = c.clone().get(req).await {
                     let r = resp.into_inner();
                     match r.error.and_then(|e| e.kind) {
@@ -121,13 +130,23 @@ impl Cluster {
 
     /// Put to a specific node (used to show the AP write succeeds on a lone survivor).
     async fn put_on(&self, node: usize, key: &[u8], value: &[u8]) {
-        let req = kv::PutRequest { key: key.to_vec(), value: value.to_vec(), context: None };
+        let req = kv::PutRequest {
+            key: key.to_vec(),
+            value: value.to_vec(),
+            context: None,
+            table: String::new(),
+        };
         let resp = self.clients[node].clone().put(req).await.expect("put rpc").into_inner();
         assert!(resp.error.is_none(), "AP put on node {node} should succeed: {:?}", resp.error);
     }
 
     async fn get_on(&self, node: usize, key: &[u8]) -> Option<Vec<u8>> {
-        let req = kv::GetRequest { key: key.to_vec(), read_ts: 0, context: None };
+        let req = kv::GetRequest {
+                    key: key.to_vec(),
+                    read_ts: 0,
+                    context: None,
+                    table: String::new(),
+                };
         let r = self.clients[node].clone().get(req).await.expect("get rpc").into_inner();
         r.found.then_some(r.value)
     }

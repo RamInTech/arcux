@@ -120,8 +120,13 @@ impl Default for Catalog {
     }
 }
 
-/// A table `t` owns keys under `t/`.
-fn table_prefix(name: &str) -> Vec<u8> {
+/// A table `t` owns keys under `t/`. The empty name is the untabled default — no prefix — so
+/// requests that don't name a table (raw single-node/test usage) route on the bare key exactly
+/// as before tables carried their own request field.
+pub(crate) fn table_prefix(name: &str) -> Vec<u8> {
+    if name.is_empty() {
+        return Vec::new();
+    }
     let mut p = name.as_bytes().to_vec();
     p.push(b'/');
     p

@@ -56,6 +56,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {DIM}routing via {l}{RESET}\n");
     }
 
+    // The `use`-selected default table (§ dispatch) — lets put/get/delete drop the <table>
+    // argument once a table's been selected for the session, instead of repeating it every line.
+    let mut current_table: Option<String> = None;
+
     let stdin = io::stdin();
     let mut line = String::new();
     loop {
@@ -92,11 +96,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 None => eprintln!("usage: connect <uri>"),
             },
+            "use" => match args.get(1).map(String::as_str) {
+                Some("none" | "-") => {
+                    current_table = None;
+                    println!("{DIM}cleared — put/get/delete need an explicit <table> again{RESET}");
+                }
+                Some(t) => {
+                    current_table = Some(t.to_string());
+                    println!("{DIM}using table {t:?} — put/get/delete no longer need <table>{RESET}");
+                }
+                None => match &current_table {
+                    Some(t) => println!("{DIM}current table: {t:?}{RESET}"),
+                    None => println!("{DIM}no table selected — usage: use <table>{RESET}"),
+                },
+            },
             _ => {
                 // Only note a node switch on success — a failed op may have rotated the routing
                 // index (e.g. cycling through unreachable nodes), and announcing it would be
                 // misleading right after "can't reach any server".
-                if run_command(&mut client, &args).await {
+                if run_command(&mut client, &args, &current_table).await {
                     announce_node_change(&client, &mut last_node);
                 } else {
                     last_node = client.current_endpoint();
@@ -112,10 +130,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Run one command, waiting out a mid-election window: in cluster mode a `NoLeader` result is
 /// transient (the cluster is picking a new leader), so retry with a short backoff before giving
 /// up. Any other error is reported immediately. Returns `true` iff the command succeeded.
-async fn run_command(client: &mut Client, args: &[String]) -> bool {
+async fn run_command(client: &mut Client, args: &[String], table: &Option<String>) -> bool {
     let mut announced = false;
     for _ in 0..40 {
-        match dispatch(client, args).await {
+        match dispatch(client, args, table).await {
             Ok(()) => return true,
             // Nodes are up but leaderless (a CP mid-election): wait it out and retry.
             Err(e) if is_no_leader(e.as_ref()) => {
@@ -183,20 +201,37 @@ fn resolve_endpoints() -> Vec<String> {
 }
 
 /// Run one KV command; returns an error (printed, not fatal) rather than exiting the shell.
-async fn dispatch(client: &mut Client, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `table` is the `use`-selected default (see `main`'s `"use"` arm): put/get/delete accept it
+/// either explicit (`put <table> <key> <value>`, unchanged) or, once a table's been `use`d,
+/// omitted (`put <key> <value>`) — the two forms never collide because they differ in arg count.
+async fn dispatch(
+    client: &mut Client,
+    args: &[String],
+    table: &Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
     match a.as_slice() {
-        ["put", key, value] => {
-            let ts = client.put(key.as_bytes().to_vec(), value.as_bytes().to_vec()).await?;
+        ["put", table, key, value] => {
+            let ts = client.put(*table, key.as_bytes().to_vec(), value.as_bytes().to_vec()).await?;
             println!("OK  {DIM}commit_ts {ts}{RESET}");
         }
-        ["get", key] => print_value(client.get(key.as_bytes().to_vec()).await?),
-        ["get", key, read_ts] => {
+        ["put", key, value] => {
+            let ts = client.put(require_table(table)?, key.as_bytes().to_vec(), value.as_bytes().to_vec()).await?;
+            println!("OK  {DIM}commit_ts {ts}{RESET}");
+        }
+        ["get", table, key] => print_value(client.get(*table, key.as_bytes().to_vec()).await?),
+        ["get", table, key, read_ts] => {
             let ts: u64 = read_ts.parse().map_err(|_| format!("read_ts must be a u64, got {read_ts:?}"))?;
-            print_value(client.get_at(key.as_bytes().to_vec(), ts).await?);
+            print_value(client.get_at(*table, key.as_bytes().to_vec(), ts).await?);
+        }
+        ["get", key] => print_value(client.get(require_table(table)?, key.as_bytes().to_vec()).await?),
+        ["del" | "delete", table, key] => {
+            let ts = client.delete(*table, key.as_bytes().to_vec()).await?;
+            println!("OK  {DIM}commit_ts {ts}{RESET}");
         }
         ["del" | "delete", key] => {
-            let ts = client.delete(key.as_bytes().to_vec()).await?;
+            let ts = client.delete(require_table(table)?, key.as_bytes().to_vec()).await?;
             println!("OK  {DIM}commit_ts {ts}{RESET}");
         }
         ["scan", start, end] => print_pairs(client.scan(start.as_bytes().to_vec(), end.as_bytes().to_vec(), 0).await?),
@@ -218,6 +253,14 @@ async fn dispatch(client: &mut Client, args: &[String]) -> Result<(), Box<dyn st
     Ok(())
 }
 
+/// Resolve the table for an argument-omitted put/get/delete: the `use`-selected default, or an
+/// error telling the user how to fix it (either `use <table>` once, or pass it inline).
+fn require_table(table: &Option<String>) -> Result<String, String> {
+    table
+        .clone()
+        .ok_or_else(|| "no table selected — run 'use <table>' first, or pass it inline: put <table> <key> <value>".to_string())
+}
+
 fn print_banner(endpoints: &[String], mode: &str) {
     println!("{CYAN}{BANNER}{RESET}");
     println!("  {DIM}a distributed transactional KV store{RESET}");
@@ -233,19 +276,24 @@ fn print_help() {
     println!(
         "\
 commands:
-  put <key> <value>          write a value (autocommit); prints commit_ts
-  get <key> [read_ts]        read latest, or the MVCC snapshot at read_ts
-  delete <key>               delete a key (autocommit)
-  scan <start> <end> [limit] range scan [start, end) (empty end = to the end)
-  split <key>                split the region owning <key> at <key>
-  merge <key>                merge the region starting at <key> leftward
-  connect <uri>              point the shell at a different server
-  leader                     show the node currently assumed to be the leader
+  use <table>                        select a default table — then put/get/delete can drop <table>
+  use                                show the currently selected table
+  use none                           clear the selection (put/get/delete need <table> again)
+  put [<table>] <key> <value>        write a value (autocommit); prints commit_ts
+  get [<table>] <key> [read_ts]      read latest, or the MVCC snapshot at read_ts
+  delete [<table>] <key>             delete a key (autocommit)
+  scan <start> <end> [limit]         range scan [start, end) (empty end = to the end)
+  split <key>                        split the region owning <key> at <key>
+  merge <key>                        merge the region starting at <key> leftward
+  connect <uri>                      point the shell at a different server
+  leader                             show the node currently assumed to be the leader
   help | quit
 
 notes:
-  values with spaces: put greeting \"hello, arcux\"
-  a \"table\" is a key-prefix (t/...); CP-vs-AP is a server-side placement, not a command yet
+  <table> is required unless selected via 'use' — omitting it without a 'use' errors
+  values with spaces: put ledger greeting \"hello, arcux\"
+  <table> selects CP-vs-AP placement (declared server-side via --table); keys are stored
+  without the table prefix, scoped per table internally
   cluster mode: set ARCUX_CLUSTER=3 (or a comma-separated ARCUX_ADDR) to auto-follow the leader"
     );
 }

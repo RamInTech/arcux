@@ -6,18 +6,18 @@
 //! Server address comes from `$ARCUX_ADDR` (default `http://127.0.0.1:50051`).
 //!
 //! Usage:
-//!   cargo run -p arcux-client --example cli -- put <key> <value>
-//!   cargo run -p arcux-client --example cli -- get <key> [<read_ts>]
-//!   cargo run -p arcux-client --example cli -- delete <key>
+//!   cargo run -p arcux-client --example cli -- put <table> <key> <value>
+//!   cargo run -p arcux-client --example cli -- get <table> <key> [<read_ts>]
+//!   cargo run -p arcux-client --example cli -- delete <table> <key>
 //!
-//! `get <key>` reads the latest version ("now"); `get <key> <read_ts>` reads the MVCC
-//! snapshot at that timestamp — the newest version whose `commit_ts <= read_ts` — so an
-//! older `read_ts` recovers a value that a later write has since superseded.
+//! `get <table> <key>` reads the latest version ("now"); `get <table> <key> <read_ts>` reads
+//! the MVCC snapshot at that timestamp — the newest version whose `commit_ts <= read_ts` — so
+//! an older `read_ts` recovers a value that a later write has since superseded.
 //!
 //! Example (two terminals, one server):
-//!   cargo run -p arcux-client --example cli -- put greeting "hello, arcux"   # terminal A
-//!   cargo run -p arcux-client --example cli -- get greeting                  # terminal B
-//!   cargo run -p arcux-client --example cli -- get greeting 3                # read at ts 3
+//!   cargo run -p arcux-client --example cli -- put ledger greeting "hello, arcux"  # terminal A
+//!   cargo run -p arcux-client --example cli -- get ledger greeting                 # terminal B
+//!   cargo run -p arcux-client --example cli -- get ledger greeting 3               # read at ts 3
 
 use arcux_client::Client;
 
@@ -29,26 +29,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut c = Client::connect(uri)?;
 
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        ["put", key, value] => {
-            let ts = c.put(key.as_bytes().to_vec(), value.as_bytes().to_vec()).await?;
-            println!("OK  put {key:?} = {value:?}  (commit_ts {ts})");
+        ["put", table, key, value] => {
+            let ts = c.put(*table, key.as_bytes().to_vec(), value.as_bytes().to_vec()).await?;
+            println!("OK  put {table}/{key:?} = {value:?}  (commit_ts {ts})");
         }
-        ["get", key] => print_get(c.get(key.as_bytes().to_vec()).await?),
-        ["get", key, read_ts] => {
+        ["get", table, key] => print_get(c.get(*table, key.as_bytes().to_vec()).await?),
+        ["get", table, key, read_ts] => {
             let ts: u64 = read_ts
                 .parse()
                 .map_err(|_| format!("read_ts must be a u64, got {read_ts:?}"))?;
-            print_get(c.get_at(key.as_bytes().to_vec(), ts).await?);
+            print_get(c.get_at(*table, key.as_bytes().to_vec(), ts).await?);
         }
-        ["delete", key] => {
-            let ts = c.delete(key.as_bytes().to_vec()).await?;
-            println!("OK  delete {key:?}  (commit_ts {ts})");
+        ["delete", table, key] => {
+            let ts = c.delete(*table, key.as_bytes().to_vec()).await?;
+            println!("OK  delete {table}/{key:?}  (commit_ts {ts})");
         }
         _ => {
             eprintln!("usage:");
-            eprintln!("  cli -- put <key> <value>");
-            eprintln!("  cli -- get <key> [<read_ts>]");
-            eprintln!("  cli -- delete <key>");
+            eprintln!("  cli -- put <table> <key> <value>");
+            eprintln!("  cli -- get <table> <key> [<read_ts>]");
+            eprintln!("  cli -- delete <table> <key>");
             eprintln!("\nserver: $ARCUX_ADDR (default http://127.0.0.1:50051)");
             std::process::exit(2);
         }

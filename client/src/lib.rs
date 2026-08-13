@@ -92,6 +92,18 @@ fn is_reroute(ke: &kv::KeyError) -> bool {
     matches!(ke.kind, Some(Kind::RegionStale(_)) | Some(Kind::NotLeader(_)))
 }
 
+/// A table `t` owns keys under `t/` — mirrors `arcux_server::catalog::table_prefix`, including
+/// the empty-name-means-no-prefix rule for untabled usage. Used only for local region-routing
+/// lookups; the wire request carries the bare key and table name separately.
+fn table_prefix(table: &str) -> Vec<u8> {
+    if table.is_empty() {
+        return Vec::new();
+    }
+    let mut p = table.as_bytes().to_vec();
+    p.push(b'/');
+    p
+}
+
 /// Build a PUT mutation for use with [`Client::transact`].
 pub fn put_mutation(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Mutation {
     Mutation { op: kv::Op::Put as i32, key: key.into(), value: value.into() }
@@ -442,17 +454,27 @@ impl Client {
     }
 
     /// Snapshot read at "now" (the server picks a fresh `read_ts`).
-    pub async fn get(&mut self, key: impl Into<Vec<u8>>) -> Result<Option<Vec<u8>>> {
-        self.get_at(key, 0).await
+    pub async fn get(&mut self, table: impl Into<String>, key: impl Into<Vec<u8>>) -> Result<Option<Vec<u8>>> {
+        self.get_at(table, key, 0).await
     }
 
     /// Snapshot read at an explicit `read_ts` (0 ⇒ server picks "now").
-    pub async fn get_at(&mut self, key: impl Into<Vec<u8>>, read_ts: u64) -> Result<Option<Vec<u8>>> {
-        let key = key.into();
+    pub async fn get_at(
+        &mut self,
+        table: impl Into<String>,
+        key: impl Into<Vec<u8>>,
+        read_ts: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let table = table.into();
+        let bare_key = key.into();
+        let key = [table_prefix(&table), bare_key.clone()].concat();
         let mut reached_a_node = false;
         for _ in 0..MAX_ROUTING_ATTEMPTS {
             let (context, mut kv) = self.prepare(&key).await?;
-            let resp = match kv.get(kv::GetRequest { key: key.clone(), read_ts, context }).await {
+            let resp = match kv
+                .get(kv::GetRequest { key: bare_key.clone(), read_ts, context, table: table.clone() })
+                .await
+            {
                 Ok(r) => {
                     reached_a_node = true; // a live server answered (leader or a redirect)
                     r.into_inner()
@@ -476,14 +498,26 @@ impl Client {
     }
 
     /// Autocommit single-key put; returns the `commit_ts`. Routed on the key.
-    pub async fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<u64> {
-        let key = key.into();
+    pub async fn put(
+        &mut self,
+        table: impl Into<String>,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+    ) -> Result<u64> {
+        let table = table.into();
+        let bare_key = key.into();
+        let key = [table_prefix(&table), bare_key.clone()].concat();
         let value = value.into();
         let mut reached_a_node = false;
         for _ in 0..MAX_ROUTING_ATTEMPTS {
             let (context, mut kv) = self.prepare(&key).await?;
             let resp = match kv
-                .put(kv::PutRequest { key: key.clone(), value: value.clone(), context })
+                .put(kv::PutRequest {
+                    key: bare_key.clone(),
+                    value: value.clone(),
+                    context,
+                    table: table.clone(),
+                })
                 .await
             {
                 Ok(r) => {
@@ -509,12 +543,17 @@ impl Client {
     }
 
     /// Autocommit single-key delete; returns the `commit_ts`. Routed on the key.
-    pub async fn delete(&mut self, key: impl Into<Vec<u8>>) -> Result<u64> {
-        let key = key.into();
+    pub async fn delete(&mut self, table: impl Into<String>, key: impl Into<Vec<u8>>) -> Result<u64> {
+        let table = table.into();
+        let bare_key = key.into();
+        let key = [table_prefix(&table), bare_key.clone()].concat();
         let mut reached_a_node = false;
         for _ in 0..MAX_ROUTING_ATTEMPTS {
             let (context, mut kv) = self.prepare(&key).await?;
-            let resp = match kv.delete(kv::DeleteRequest { key: key.clone(), context }).await {
+            let resp = match kv
+                .delete(kv::DeleteRequest { key: bare_key.clone(), context, table: table.clone() })
+                .await
+            {
                 Ok(r) => {
                     reached_a_node = true; // a live server answered (leader or a redirect)
                     r.into_inner()

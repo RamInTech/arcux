@@ -847,11 +847,6 @@ fn committed_batch(key: &[u8], value: &Value, start_ts: u64, commit_ts: u64) -> 
     b
 }
 
-/// The state-machine apply function for a replicated group: decode the committed entry's
-/// [`Command`] and execute it against `engine`, **deterministically** (every replica applies
-/// the same log prefix against identical state) by reusing the single-node Percolator. The
-/// returned engine `Result` answers the leader's proposer; a Percolator conflict is an
-/// `Err` here, surfaced to the client as a `KeyError`. An empty entry is the election no-op.
 /// Print a KV data operation on this node's terminal (server-side observability). Keys are
 /// shown as text. CP writes are logged from the apply path (so on **every** replica); AP writes
 /// from the receiving node and again on each peer; reads only on the node that serves them.
@@ -906,6 +901,11 @@ fn prewrite_region(
     result
 }
 
+/// The state-machine apply function for a replicated group: decode the committed entry's
+/// [`Command`] and execute it against `engine`, **deterministically** (every replica applies
+/// the same log prefix against identical state) by reusing the single-node Percolator. The
+/// returned engine `Result` answers the leader's proposer; a Percolator conflict is an
+/// `Err` here, surfaced to the client as a `KeyError`. An empty entry is the election no-op.
 fn make_apply(engine: Arc<Engine>, node_id: u64, region_id: u64) -> ApplyFn {
     Arc::new(move |data: &[u8]| -> Result<(), Error> {
         if data.is_empty() {
@@ -1190,7 +1190,8 @@ impl KvService for KvApi {
         &self,
         request: Request<kv::GetRequest>,
     ) -> Result<Response<kv::GetResponse>, Status> {
-        let req = request.into_inner();
+        let mut req = request.into_inner();
+        req.key = [catalog::table_prefix(&req.table), req.key].concat();
         if let Some(ke) = self.state.check_context(&req.context, &req.key) {
             return Ok(Response::new(kv::GetResponse {
                 found: false,
@@ -1305,7 +1306,8 @@ impl KvService for KvApi {
         &self,
         request: Request<kv::PutRequest>,
     ) -> Result<Response<kv::PutResponse>, Status> {
-        let req = request.into_inner();
+        let mut req = request.into_inner();
+        req.key = [catalog::table_prefix(&req.table), req.key].concat();
         if let Some(ke) = self.state.check_context(&req.context, &req.key) {
             return Ok(Response::new(kv::PutResponse { commit_ts: 0, error: Some(ke) }));
         }
@@ -1335,7 +1337,8 @@ impl KvService for KvApi {
         &self,
         request: Request<kv::DeleteRequest>,
     ) -> Result<Response<kv::DeleteResponse>, Status> {
-        let req = request.into_inner();
+        let mut req = request.into_inner();
+        req.key = [catalog::table_prefix(&req.table), req.key].concat();
         if let Some(ke) = self.state.check_context(&req.context, &req.key) {
             return Ok(Response::new(kv::DeleteResponse { commit_ts: 0, error: Some(ke) }));
         }
