@@ -151,6 +151,29 @@ impl Cluster {
         r.found.then_some(r.value)
     }
 
+    /// Full-table scan, retrying across nodes/rounds like `get_until` (but returning the result
+    /// rather than asserting on it — callers assert). Empty bounds + `table` ⇒ "whole table";
+    /// the server derives the byte-range from the catalog.
+    async fn scan_table(&self, table: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+        for _ in 0..100 {
+            for c in &self.clients {
+                let req = kv::ScanRequest {
+                    start_key: vec![],
+                    end_key: vec![],
+                    limit: 0,
+                    read_ts: 0,
+                    context: None,
+                    table: table.to_string(),
+                };
+                if let Ok(resp) = c.clone().scan(req).await {
+                    return resp.into_inner().pairs.into_iter().map(|kv| (kv.key, kv.value)).collect();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        panic!("scan of table {table:?} never succeeded");
+    }
+
     async fn stop_node(&mut self, idx: usize) {
         if let Some(tx) = self.nodes[idx].shutdown.take() {
             let _ = tx.send(());
@@ -208,6 +231,39 @@ async fn create_table_selects_the_consistency_regime() {
     cluster.put_on(0, b"feed/post2", b"still-liked").await; // succeeds despite 2/3 down
     assert_eq!(cluster.get_on(0, b"feed/post2").await, Some(b"still-liked".to_vec()));
     assert_eq!(cluster.get_on(0, b"feed/post1").await, Some(b"liked".to_vec()));
+
+    cluster.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn full_table_scan_works_for_both_regimes() {
+    let mut cat = Catalog::new();
+    cat.create_table("acct", Regime::Cp);
+    cat.create_table("feed", Regime::Ap);
+    let cluster = Cluster::start(&cat).await;
+
+    cluster.put(b"acct/alice", b"100").await;
+    cluster.put(b"acct/bob", b"200").await;
+    cluster.put_on(0, b"feed/post1", b"liked").await;
+    cluster.put_on(0, b"feed/post2", b"liked-too").await;
+    cluster.get_until(b"acct/bob", b"200").await;
+    cluster.get_until(b"feed/post2", b"liked-too").await;
+
+    // CP full-table scan: bounds ["acct/", "acct0") are derived from the catalog, not the client.
+    let mut acct = cluster.scan_table("acct").await;
+    acct.sort();
+    assert_eq!(
+        acct,
+        vec![(b"acct/alice".to_vec(), b"100".to_vec()), (b"acct/bob".to_vec(), b"200".to_vec())]
+    );
+
+    // AP full-table scan: same rewrite, but must resolve through the leaderless ap_for() path.
+    let mut feed = cluster.scan_table("feed").await;
+    feed.sort();
+    assert_eq!(
+        feed,
+        vec![(b"feed/post1".to_vec(), b"liked".to_vec()), (b"feed/post2".to_vec(), b"liked-too".to_vec())]
+    );
 
     cluster.stop().await;
 }

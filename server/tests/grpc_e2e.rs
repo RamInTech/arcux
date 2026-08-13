@@ -137,15 +137,29 @@ async fn scan_returns_an_ordered_range() {
     }
 
     // A prefix range comes back in key order, half-open [start, end).
-    let pairs = c.scan(b"k/".to_vec(), b"k0".to_vec(), 0).await.unwrap();
+    let pairs = c.scan("", b"k/".to_vec(), b"k0".to_vec(), 0).await.unwrap();
     let keys: Vec<Vec<u8>> = pairs.iter().map(|(k, _)| k.clone()).collect();
     assert_eq!(keys, vec![b"k/a".to_vec(), b"k/b".to_vec(), b"k/c".to_vec(), b"k/d".to_vec()]);
     assert_eq!(pairs[1].1, b"2".to_vec());
 
     // `limit` caps the batch.
-    let two = c.scan(b"k/".to_vec(), b"k0".to_vec(), 2).await.unwrap();
+    let two = c.scan("", b"k/".to_vec(), b"k0".to_vec(), 2).await.unwrap();
     assert_eq!(two.len(), 2);
     assert_eq!(two[0].0, b"k/a".to_vec());
+
+    srv.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn whole_default_namespace_scan_is_rejected() {
+    let srv = TestServer::start().await;
+    let mut c = srv.client();
+
+    // Empty table + empty bounds ⇒ "scan the whole untabled default namespace", which isn't one
+    // contiguous range (see catalog.rs) — the server must reject it, not return an empty result.
+    let err = c.scan("", vec![], vec![], 0).await.unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("no contiguous range"), "unexpected error: {msg}");
 
     srv.stop().await;
 }
