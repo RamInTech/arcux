@@ -98,8 +98,12 @@ impl Cluster {
     async fn leader_put(&self, key: &[u8], value: &[u8]) -> usize {
         for _ in 0..100 {
             for (i, c) in self.clients.iter().enumerate() {
-                let req =
-                    kv::PutRequest { key: key.to_vec(), value: value.to_vec(), context: None };
+                let req = kv::PutRequest {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                    context: None,
+                    table: String::new(),
+                };
                 match c.clone().put(req).await {
                     Ok(resp) => match resp.into_inner().error.and_then(|e| e.kind) {
                         None => return i,
@@ -117,7 +121,12 @@ impl Cluster {
     async fn leader_get(&self, key: &[u8]) -> Option<Vec<u8>> {
         for _ in 0..100 {
             for c in &self.clients {
-                let req = kv::GetRequest { key: key.to_vec(), read_ts: 0, context: None };
+                let req = kv::GetRequest {
+                    key: key.to_vec(),
+                    read_ts: 0,
+                    context: None,
+                    table: String::new(),
+                };
                 match c.clone().get(req).await {
                     Ok(resp) => {
                         let r = resp.into_inner();

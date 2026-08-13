@@ -145,7 +145,12 @@ impl Cluster {
     async fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         for _ in 0..80 {
             for c in &self.clients {
-                let req = kv::GetRequest { key: key.to_vec(), read_ts: 0, context: None };
+                let req = kv::GetRequest {
+                    key: key.to_vec(),
+                    read_ts: 0,
+                    context: None,
+                    table: String::new(),
+                };
                 match c.clone().get(req).await {
                     Ok(resp) => {
                         let r = resp.into_inner();

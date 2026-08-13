@@ -36,6 +36,7 @@ fn kv_messages_roundtrip() {
         key: b"k".to_vec(),
         value: b"v".to_vec(),
         context: Some(kv::Context { region_id: 1, region_epoch: 1 }),
+        table: "t".to_string(),
     });
 
     roundtrip(&kv::SplitRegionResponse {
@@ -112,5 +113,5 @@ fn pd_messages_roundtrip() {
 
 #[test]
 fn version_is_pinned() {
-    assert_eq!(arcux_rpc::VERSION, 9);
+    assert_eq!(arcux_rpc::VERSION, 10);
 }

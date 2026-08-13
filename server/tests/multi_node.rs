@@ -141,10 +141,10 @@ async fn keys_route_to_their_owning_node_and_failure_is_detected() {
 
     // "alpha" lives in node 1's range, "zebra" in node 2's. Both are reachable, proving
     // the client dispatches each key to a *different* owning node.
-    c.put(b"alpha".to_vec(), b"1".to_vec()).await.unwrap();
-    c.put(b"zebra".to_vec(), b"2".to_vec()).await.unwrap();
-    assert_eq!(c.get(b"alpha".to_vec()).await.unwrap(), Some(b"1".to_vec()));
-    assert_eq!(c.get(b"zebra".to_vec()).await.unwrap(), Some(b"2".to_vec()));
+    c.put("", b"alpha".to_vec(), b"1".to_vec()).await.unwrap();
+    c.put("", b"zebra".to_vec(), b"2".to_vec()).await.unwrap();
+    assert_eq!(c.get("", b"alpha".to_vec()).await.unwrap(), Some(b"1".to_vec()));
+    assert_eq!(c.get("", b"zebra".to_vec()).await.unwrap(), Some(b"2".to_vec()));
 
     // Stop node 2; PD must mark it down within the detector's bound.
     cluster.stop_node(2).await;
@@ -156,8 +156,8 @@ async fn keys_route_to_their_owning_node_and_failure_is_detected() {
 
     // Node 1's data is still served; node 2's range is now unroutable — concrete proof the
     // two keys really lived on two different nodes.
-    assert_eq!(c.get(b"alpha".to_vec()).await.unwrap(), Some(b"1".to_vec()));
-    assert!(c.get(b"zebra".to_vec()).await.is_err(), "the stopped node's keys are unreachable");
+    assert_eq!(c.get("", b"alpha".to_vec()).await.unwrap(), Some(b"1".to_vec()));
+    assert!(c.get("", b"zebra".to_vec()).await.is_err(), "the stopped node's keys are unreachable");
     // Node 1 is still alive.
     assert!(!cluster.pd.members.is_down(1));
 
@@ -170,28 +170,28 @@ async fn split_then_merge_keep_traffic_flowing() {
     let mut c = cluster.client();
 
     // Warm the cache and write into node 1's region.
-    c.put(b"g".to_vec(), b"v1".to_vec()).await.unwrap();
+    c.put("", b"g".to_vec(), b"v1".to_vec()).await.unwrap();
 
     // Split node 1's region at "f": [-inf,"f") | ["f","m"). The client still caches the
     // pre-split route (epoch 1); the next write to "g" gets RegionStale, re-resolves from
     // PD, and retries — transparently.
     let (left, right) = c.split_region(b"f".to_vec()).await.unwrap();
     assert_ne!(left, right, "split yields two distinct regions");
-    c.put(b"g".to_vec(), b"v2".to_vec()).await.unwrap();
-    assert_eq!(c.get(b"g".to_vec()).await.unwrap(), Some(b"v2".to_vec()));
+    c.put("", b"g".to_vec(), b"v2".to_vec()).await.unwrap();
+    assert_eq!(c.get("", b"g".to_vec()).await.unwrap(), Some(b"v2".to_vec()));
 
     // Keys on both sides of the split, and node 2's range, all still serve.
-    c.put(b"alpha".to_vec(), b"a".to_vec()).await.unwrap();
-    assert_eq!(c.get(b"alpha".to_vec()).await.unwrap(), Some(b"a".to_vec()));
-    c.put(b"zebra".to_vec(), b"z".to_vec()).await.unwrap();
-    assert_eq!(c.get(b"zebra".to_vec()).await.unwrap(), Some(b"z".to_vec()));
+    c.put("", b"alpha".to_vec(), b"a".to_vec()).await.unwrap();
+    assert_eq!(c.get("", b"alpha".to_vec()).await.unwrap(), Some(b"a".to_vec()));
+    c.put("", b"zebra".to_vec(), b"z".to_vec()).await.unwrap();
+    assert_eq!(c.get("", b"zebra".to_vec()).await.unwrap(), Some(b"z".to_vec()));
 
     // Merge ["f","m") back into [-inf,"f"); traffic to "g" keeps flowing across the change.
     c.merge_region(b"f".to_vec()).await.unwrap();
-    c.put(b"g".to_vec(), b"v3".to_vec()).await.unwrap();
-    assert_eq!(c.get(b"g".to_vec()).await.unwrap(), Some(b"v3".to_vec()));
+    c.put("", b"g".to_vec(), b"v3".to_vec()).await.unwrap();
+    assert_eq!(c.get("", b"g".to_vec()).await.unwrap(), Some(b"v3".to_vec()));
     // The pre-split/merge data is intact.
-    assert_eq!(c.get(b"alpha".to_vec()).await.unwrap(), Some(b"a".to_vec()));
+    assert_eq!(c.get("", b"alpha".to_vec()).await.unwrap(), Some(b"a".to_vec()));
 
     cluster.stop().await;
 }

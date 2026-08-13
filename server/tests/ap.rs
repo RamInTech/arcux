@@ -83,7 +83,12 @@ impl Cluster {
 
     /// Put on a specific node (the AP coordinator). Returns the HLC stamp (commit_ts).
     async fn put(&self, node: usize, key: &[u8], value: &[u8]) -> u64 {
-        let req = kv::PutRequest { key: key.to_vec(), value: value.to_vec(), context: None };
+        let req = kv::PutRequest {
+            key: key.to_vec(),
+            value: value.to_vec(),
+            context: None,
+            table: String::new(),
+        };
         let resp = self.clients[node].clone().put(req).await.expect("put rpc").into_inner();
         assert!(resp.error.is_none(), "AP put should never error: {:?}", resp.error);
         resp.commit_ts
@@ -91,7 +96,12 @@ impl Cluster {
 
     /// Read on a specific node (any AP replica serves).
     async fn get(&self, node: usize, key: &[u8]) -> Option<Vec<u8>> {
-        let req = kv::GetRequest { key: key.to_vec(), read_ts: 0, context: None };
+        let req = kv::GetRequest {
+            key: key.to_vec(),
+            read_ts: 0,
+            context: None,
+            table: String::new(),
+        };
         let r = self.clients[node].clone().get(req).await.expect("get rpc").into_inner();
         match r.error.and_then(|e| e.kind) {
             None => r.found.then_some(r.value),

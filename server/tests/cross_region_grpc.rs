@@ -182,8 +182,12 @@ impl Coordinator<'_> {
     async fn seed(&self, key: &[u8], value: &[u8]) {
         for _ in 0..100 {
             for c in self.clients {
-                let req =
-                    kv::PutRequest { key: key.to_vec(), value: value.to_vec(), context: None };
+                let req = kv::PutRequest {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                    context: None,
+                    table: String::new(),
+                };
                 match c.clone().put(req).await {
                     Ok(resp) => match resp.into_inner().error.and_then(|e| e.kind) {
                         None => return,
@@ -369,7 +373,7 @@ impl Coordinator<'_> {
     async fn get_once(&self, key: &[u8], read_ts: u64) -> GetOnce {
         for _ in 0..80 {
             for c in self.clients {
-                let req = kv::GetRequest { key: key.to_vec(), read_ts, context: None };
+                let req = kv::GetRequest { key: key.to_vec(), read_ts, context: None, table: String::new() };
                 match c.clone().get(req).await {
                     Ok(resp) => {
                         let r = resp.into_inner();

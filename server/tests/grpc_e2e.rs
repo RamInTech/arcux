@@ -51,9 +51,9 @@ async fn put_then_get_roundtrips() {
     let srv = TestServer::start().await;
     let mut c = srv.client();
 
-    c.put(b"alpha".to_vec(), b"one".to_vec()).await.unwrap();
-    assert_eq!(c.get(b"alpha".to_vec()).await.unwrap(), Some(b"one".to_vec()));
-    assert_eq!(c.get(b"missing".to_vec()).await.unwrap(), None);
+    c.put("", b"alpha".to_vec(), b"one".to_vec()).await.unwrap();
+    assert_eq!(c.get("", b"alpha".to_vec()).await.unwrap(), Some(b"one".to_vec()));
+    assert_eq!(c.get("", b"missing".to_vec()).await.unwrap(), None);
 
     srv.stop().await;
 }
@@ -72,8 +72,8 @@ async fn multi_key_transaction_is_visible() {
         .unwrap();
     assert!(commit_ts > 0);
 
-    assert_eq!(c.get(b"acct:a".to_vec()).await.unwrap(), Some(b"100".to_vec()));
-    assert_eq!(c.get(b"acct:b".to_vec()).await.unwrap(), Some(b"50".to_vec()));
+    assert_eq!(c.get("", b"acct:a".to_vec()).await.unwrap(), Some(b"100".to_vec()));
+    assert_eq!(c.get("", b"acct:b".to_vec()).await.unwrap(), Some(b"50".to_vec()));
 
     srv.stop().await;
 }
@@ -118,11 +118,11 @@ async fn snapshot_read_honours_commit_ts() {
     let srv = TestServer::start().await;
     let mut c = srv.client();
 
-    let commit_ts = c.put(b"k".to_vec(), b"v1".to_vec()).await.unwrap();
+    let commit_ts = c.put("", b"k".to_vec(), b"v1".to_vec()).await.unwrap();
     // Strictly before the commit: invisible.
-    assert_eq!(c.get_at(b"k".to_vec(), commit_ts - 1).await.unwrap(), None);
+    assert_eq!(c.get_at("", b"k".to_vec(), commit_ts - 1).await.unwrap(), None);
     // At the commit timestamp: visible.
-    assert_eq!(c.get_at(b"k".to_vec(), commit_ts).await.unwrap(), Some(b"v1".to_vec()));
+    assert_eq!(c.get_at("", b"k".to_vec(), commit_ts).await.unwrap(), Some(b"v1".to_vec()));
 
     srv.stop().await;
 }
@@ -133,7 +133,7 @@ async fn scan_returns_an_ordered_range() {
     let mut c = srv.client();
 
     for (k, v) in [("k/a", "1"), ("k/b", "2"), ("k/c", "3"), ("k/d", "4"), ("other", "x")] {
-        c.put(k.as_bytes().to_vec(), v.as_bytes().to_vec()).await.unwrap();
+        c.put("", k.as_bytes().to_vec(), v.as_bytes().to_vec()).await.unwrap();
     }
 
     // A prefix range comes back in key order, half-open [start, end).

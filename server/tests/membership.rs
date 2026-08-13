@@ -98,7 +98,12 @@ async fn connect_retry(ep: &str) -> KvServiceClient<Channel> {
 async fn leader_put(clients: &[KvServiceClient<Channel>], key: &[u8], value: &[u8]) {
     for _ in 0..150 {
         for c in clients {
-            let req = kv::PutRequest { key: key.to_vec(), value: value.to_vec(), context: None };
+            let req = kv::PutRequest {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                context: None,
+                table: String::new(),
+            };
             match c.clone().put(req).await {
                 Ok(resp) => match resp.into_inner().error.and_then(|e| e.kind) {
                     None => return,

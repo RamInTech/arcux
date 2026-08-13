@@ -120,7 +120,7 @@ impl Cluster {
     }
 
     async fn get(&self, node: usize, key: &[u8]) -> Option<Vec<u8>> {
-        let req = kv::GetRequest { key: key.to_vec(), read_ts: 0, context: None };
+        let req = kv::GetRequest { key: key.to_vec(), read_ts: 0, context: None, table: String::new() };
         let r = self.clients[node].clone().get(req).await.expect("get rpc").into_inner();
         r.found.then_some(r.value)
     }

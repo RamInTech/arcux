@@ -93,9 +93,9 @@ async fn routed_client_reads_and_writes_through_pd() {
     let mut c = cluster.client();
 
     // The client resolves the whole-keyspace region from PD and routes to the node.
-    c.put(b"alpha".to_vec(), b"one".to_vec()).await.unwrap();
-    assert_eq!(c.get(b"alpha".to_vec()).await.unwrap(), Some(b"one".to_vec()));
-    assert_eq!(c.get(b"missing".to_vec()).await.unwrap(), None);
+    c.put("", b"alpha".to_vec(), b"one".to_vec()).await.unwrap();
+    assert_eq!(c.get("", b"alpha".to_vec()).await.unwrap(), Some(b"one".to_vec()));
+    assert_eq!(c.get("", b"missing".to_vec()).await.unwrap(), None);
 
     // Timestamps come from PD's oracle and advance.
     let t1 = c.begin().await.unwrap();
@@ -111,8 +111,8 @@ async fn split_makes_stale_route_refresh_and_retry() {
     let mut c = cluster.client();
 
     // Warm the cache with the whole-keyspace region (epoch 1) and write a key.
-    c.put(b"m".to_vec(), b"v1".to_vec()).await.unwrap();
-    assert_eq!(c.get(b"m".to_vec()).await.unwrap(), Some(b"v1".to_vec()));
+    c.put("", b"m".to_vec(), b"v1".to_vec()).await.unwrap();
+    assert_eq!(c.get("", b"m".to_vec()).await.unwrap(), Some(b"v1".to_vec()));
 
     // Split the keyspace at "m": left [-inf, "m") and right ["m", +inf), both epoch 2.
     let (left, right) = c.split_region(b"m".to_vec()).await.unwrap();
@@ -121,16 +121,16 @@ async fn split_makes_stale_route_refresh_and_retry() {
     // The client still caches the pre-split region (epoch 1). Writing "z" routes with
     // the stale epoch → the node replies RegionStale → the client re-resolves from PD
     // (now the right region) and retries, all transparently.
-    c.put(b"z".to_vec(), b"v2".to_vec()).await.unwrap();
-    assert_eq!(c.get(b"z".to_vec()).await.unwrap(), Some(b"v2".to_vec()));
+    c.put("", b"z".to_vec(), b"v2".to_vec()).await.unwrap();
+    assert_eq!(c.get("", b"z".to_vec()).await.unwrap(), Some(b"v2".to_vec()));
 
     // "a" lands in the left region (also epoch 2) after a refresh.
-    c.put(b"a".to_vec(), b"v3".to_vec()).await.unwrap();
-    assert_eq!(c.get(b"a".to_vec()).await.unwrap(), Some(b"v3".to_vec()));
+    c.put("", b"a".to_vec(), b"v3".to_vec()).await.unwrap();
+    assert_eq!(c.get("", b"a".to_vec()).await.unwrap(), Some(b"v3".to_vec()));
 
     // The key written before the split is still readable (storage is not partitioned in
     // Phase 3 — only routing is).
-    assert_eq!(c.get(b"m".to_vec()).await.unwrap(), Some(b"v1".to_vec()));
+    assert_eq!(c.get("", b"m".to_vec()).await.unwrap(), Some(b"v1".to_vec()));
 
     cluster.stop().await;
 }
@@ -150,6 +150,7 @@ async fn stale_epoch_is_rejected_with_region_stale() {
             key: b"a".to_vec(),
             value: b"x".to_vec(),
             context: Some(kv::Context { region_id: 1, region_epoch: 1 }),
+            table: String::new(),
         })
         .await
         .unwrap()

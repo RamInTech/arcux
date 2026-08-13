@@ -183,7 +183,12 @@ impl Cluster {
         for _ in 0..200 {
             for c in &self.clients {
                 let req =
-                    kv::PutRequest { key: key.to_vec(), value: value.to_vec(), context: None };
+                    kv::PutRequest {
+                        key: key.to_vec(),
+                        value: value.to_vec(),
+                        context: None,
+                        table: String::new(),
+                    };
                 match c.clone().put(req).await {
                     Ok(resp) => match resp.into_inner().error.and_then(|e| e.kind) {
                         None => return,
@@ -201,7 +206,12 @@ impl Cluster {
     async fn leader_get(&self, key: &[u8]) -> Option<Vec<u8>> {
         for _ in 0..200 {
             for c in &self.clients {
-                let req = kv::GetRequest { key: key.to_vec(), read_ts: 0, context: None };
+                let req = kv::GetRequest {
+                    key: key.to_vec(),
+                    read_ts: 0,
+                    context: None,
+                    table: String::new(),
+                };
                 match c.clone().get(req).await {
                     Ok(resp) => {
                         let r = resp.into_inner();

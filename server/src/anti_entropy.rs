@@ -1,35 +1,31 @@
-//! AP anti-entropy — the reconcile core (Phase 5b).
+//! AP anti-entropy — the reconcile core.
 //!
 //! The AP write path is leaderless and W=1: a write is acked after the *local* apply, then
-//! fanned out **best-effort** to peers ([`crate::ap`]). That fan-out only reaches replicas that
-//! are up *at write time*, so a peer that was partitioned (or crashed) when a key was written
-//! simply never receives it — and nothing in the write path ever re-delivers it. Two replicas
-//! drift apart forever. **Anti-entropy** is the background force that removes that drift:
-//! replicas periodically compare their data and heal the differences, so AP becomes not just
-//! *available during* a partition but *convergent after* it heals.
+//! fanned out best-effort to peers ([`crate::ap`]). That fan-out only reaches replicas that are
+//! up *at write time* — a peer that was partitioned or crashed never receives the write, and
+//! nothing in the write path re-delivers it. Anti-entropy is the background process that removes
+//! this drift: replicas periodically compare their data and heal the differences, making AP
+//! convergent after a partition heals, not just available during one.
 //!
-//! ## The intuition: compare cheaply, transfer little
+//! ## Comparison strategy
 //!
-//! Shipping a whole region to a peer just to discover almost nothing differs is absurd, so we
-//! summarize each replica's data with a **Merkle tree** (hash tree) and compare *that*:
+//! Each replica summarizes its data with a Merkle tree over [`LEAVES`] buckets:
 //!
-//! * bucket every key into one of [`LEAVES`] leaves (by a hash of the key, so both replicas
-//!   bucket the *same* key identically regardless of what else each holds);
-//! * a leaf's hash folds in every `(key, version)` it contains — so a leaf hash changes iff
-//!   any key in it has a different latest version on the two replicas;
-//! * internal nodes hash their children up to a single **root**.
+//! * every key is bucketed by a hash of the key only, so both replicas bucket it identically;
+//! * a leaf's hash folds in every `(key, version)` it contains, so it changes iff any key in it
+//!   has a different latest version between replicas;
+//! * internal nodes hash their children up to a single root.
 //!
-//! Two replicas exchange the compact leaf hashes (a few KB), [`diff`] descends the tree, and
-//! only the **differing leaves' entries** are then fetched and merged. The merge itself is
-//! just **Last-Writer-Wins on the HLC** ([`to_adopt`]): adopt a peer's version of a key when it
-//! is newer than (or missing from) our own — the exact rule AP reads already use, so no new
-//! conflict resolver is needed, only *delivery* of the winning version.
+//! Replicas exchange the compact leaf hashes, [`diff`] descends the tree to find the differing
+//! leaves, and only those leaves' entries are fetched and merged. The merge rule is
+//! Last-Writer-Wins on the HLC ([`to_adopt`]): adopt a peer's version when it's newer than (or
+//! missing from) our own — the same rule AP reads already use, so no new conflict resolver is
+//! needed, only delivery of the winning version.
 //!
-//! This module is the pure, transport-free **core**: it works on `Vec<Version>` and hashes,
-//! with no engine or gRPC dependency, so the whole reconcile decision is deterministically
-//! testable. The `server` integration reads `Version`s from the engine
-//! ([`arcux_engine::Engine::scan_versions`]) and moves digests/entries over the `ApDigest` /
-//! `ApFetch` RPCs.
+//! This module is the transport-free core: it operates on `Vec<Version>` and hashes, with no
+//! engine or gRPC dependency, so reconcile decisions are deterministically testable. The
+//! `server` integration reads `Version`s via [`arcux_engine::Engine::scan_versions`] and moves
+//! digests/entries over the `ApDigest` / `ApFetch` RPCs.
 
 use std::collections::HashMap;
 
@@ -63,7 +59,6 @@ pub fn bucket_of(key: &[u8]) -> usize {
 /// Build the per-leaf digest of `versions`: each leaf's hash folds in the `(key, version)` of
 /// every key bucketed there, in a canonical (key-sorted) order so it's replica-independent.
 pub fn digest(versions: &[Version]) -> Digest {
-    // Collect each leaf's (key, version) pairs, then hash them in sorted order.
     let mut buckets: Vec<Vec<(&[u8], u64)>> = vec![Vec::new(); LEAVES];
     for v in versions {
         buckets[bucket_of(&v.key)].push((&v.key, v.version));
@@ -109,13 +104,13 @@ impl MerkleTree {
     /// is the exact set of buckets that need their entries reconciled.
     fn differing_leaves(&self, other: &MerkleTree) -> Vec<usize> {
         let mut out = Vec::new();
-        let mut stack = vec![1usize]; // start at the root
+        let mut stack = vec![1usize];
         while let Some(i) = stack.pop() {
             if self.nodes[i] == other.nodes[i] {
-                continue; // identical subtree — skip it entirely
+                continue;
             }
             if i >= LEAVES {
-                out.push(i - LEAVES); // a leaf, and it differs
+                out.push(i - LEAVES);
             } else {
                 stack.push(2 * i);
                 stack.push(2 * i + 1);
@@ -187,7 +182,6 @@ mod tests {
         let a = vec![v(b"k1", 10), v(b"k2", 20), v(b"post/99", 30)];
         let b = a.clone();
         assert_eq!(diff(&digest(&a), &digest(&b)), Vec::<usize>::new());
-        // Root hashes match too.
         assert_eq!(MerkleTree::from_digest(&digest(&a)).root(), MerkleTree::from_digest(&digest(&b)).root());
     }
 

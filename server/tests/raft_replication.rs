@@ -88,7 +88,12 @@ impl Cluster {
         for _ in 0..80 {
             for (i, c) in self.clients.iter().enumerate() {
                 let mut c = c.clone();
-                let req = kv::PutRequest { key: key.clone(), value: value.clone(), context: None };
+                let req = kv::PutRequest {
+                    key: key.clone(),
+                    value: value.clone(),
+                    context: None,
+                    table: String::new(),
+                };
                 match c.put(req).await {
                     Ok(resp) => match resp.into_inner().error.and_then(|e| e.kind) {
                         None => return (0, i), // committed (commit_ts not asserted here)
@@ -108,7 +113,12 @@ impl Cluster {
         for _ in 0..80 {
             for c in &self.clients {
                 let mut c = c.clone();
-                let req = kv::GetRequest { key: key.clone(), read_ts: 0, context: None };
+                let req = kv::GetRequest {
+                    key: key.clone(),
+                    read_ts: 0,
+                    context: None,
+                    table: String::new(),
+                };
                 match c.get(req).await {
                     Ok(resp) => {
                         let r = resp.into_inner();
@@ -208,7 +218,12 @@ async fn a_follower_redirects_with_not_leader() {
     let follower = (0..cluster.clients.len()).find(|i| *i != leader).expect("a follower exists");
     let mut c = cluster.clients[follower].clone();
     let resp = c
-        .put(kv::PutRequest { key: b"b".to_vec(), value: b"2".to_vec(), context: None })
+        .put(kv::PutRequest {
+            key: b"b".to_vec(),
+            value: b"2".to_vec(),
+            context: None,
+            table: String::new(),
+        })
         .await
         .expect("rpc ok")
         .into_inner();
