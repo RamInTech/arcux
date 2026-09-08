@@ -359,19 +359,16 @@ impl Client {
         }
     }
 
-    /// The error to return when the retry loop is exhausted. In cluster mode this splits on
-    /// whether any node actually answered: if one did but none was leader it's `NoLeader` (a
-    /// mid-election window, worth retrying); if *no* node could be reached at all it's
-    /// `Unreachable` (the cluster is down — no election to wait out).
+    /// The error to return when the retry loop is exhausted, in **any** mode (direct, PD-routed,
+    /// or cluster): if a node answered but kept redirecting (`NotLeader`/`RegionStale`) it's
+    /// `NoLeader` — a mid-election window worth retrying (e.g. a CP region a live `create_table`
+    /// just founded, still electing its first leader); if *no* node could be reached at all it's
+    /// `Unreachable`, with no election to wait out.
     fn exhausted(&self, reached_a_node: bool) -> ClientError {
-        if self.cluster.is_some() {
-            if reached_a_node {
-                ClientError::NoLeader
-            } else {
-                ClientError::Unreachable
-            }
+        if reached_a_node {
+            ClientError::NoLeader
         } else {
-            routing_exhausted()
+            ClientError::Unreachable
         }
     }
 
@@ -676,8 +673,4 @@ fn lazy_channel(uri: &str) -> Result<Channel> {
     Ok(Channel::from_shared(uri.to_string())
         .map_err(|e| ClientError::Key(format!("invalid endpoint: {e}")))?
         .connect_lazy())
-}
-
-fn routing_exhausted() -> ClientError {
-    ClientError::Key("routing retries exhausted (region kept moving?)".to_string())
 }
