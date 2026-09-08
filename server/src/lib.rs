@@ -191,6 +191,13 @@ pub struct AppState {
     ap: Option<ApReplication>,
     /// This node's hybrid logical clock — the timestamp source for AP writes.
     hlc: Arc<Hlc>,
+    /// Tables declared so far and their regimes (startup `--table` flags, plus any live
+    /// `CreateTable` calls). Two readers: a friendly "table already exists" check ahead of the
+    /// routing-table split machinery (not load-bearing — a re-declaration would be rejected
+    /// there too, just less clearly), and [`ListTables`](KvService::list_tables), for which this
+    /// *is* the source of truth — the startup [`catalog::Catalog`] is consumed to compute
+    /// placements and then dropped, so nothing else survives to answer "what tables exist?".
+    declared: std::sync::Mutex<Vec<(String, Regime)>>,
 }
 
 impl AppState {
@@ -211,6 +218,7 @@ impl AppState {
             raft: None,
             ap: None,
             hlc: Arc::new(Hlc::new()),
+            declared: std::sync::Mutex::new(Vec::new()),
         }))
     }
 
@@ -239,6 +247,7 @@ impl AppState {
             raft: None,
             ap: None,
             hlc: Arc::new(Hlc::new()),
+            declared: std::sync::Mutex::new(Vec::new()),
         });
         state.heartbeat().await?; // register, adopt our assignment, become routable
         Ok(state)
@@ -298,7 +307,7 @@ impl AppState {
         // Per region: a CP region gets a Raft group (durable log, applies into the shared
         // engine); an AP region gets a leaderless replica set (just its peers to forward to).
         let mut groups = HashMap::new();
-        let mut ap = ApReplication::new();
+        let ap = ApReplication::new();
         for p in placements {
             match p.regime {
                 Regime::Cp => {
@@ -333,6 +342,7 @@ impl AppState {
             raft: Some(MultiRaft::new(groups)),
             ap: Some(ap),
             hlc: Arc::new(Hlc::new()),
+            declared: std::sync::Mutex::new(Vec::new()),
         }))
     }
 
@@ -361,8 +371,7 @@ impl AppState {
         &self,
         placement: RegionPlacement,
     ) -> Result<RaftGroup, Box<dyn std::error::Error + Send + Sync>> {
-        let mr = self.raft.as_ref().ok_or("node is not in replicated (multiraft) mode")?;
-        if let Some(g) = mr.group(placement.region_id) {
+        if let Some(g) = self.raft.as_ref().and_then(|mr| mr.group(placement.region_id)) {
             return Ok(g);
         }
         // Make the region routable here (group_for goes key → region → group).
@@ -375,23 +384,57 @@ impl AppState {
         });
         self.regions.adopt(regions)?;
 
-        let storage = wal_storage::WalStorage::open(
-            self.engine.options().data_dir.join("raft").join(placement.region_id.to_string()),
-        )?;
+        // Empty bootstrap: membership comes from the leader's log, exactly like a
+        // deterministic-harness `spawn_blank` node.
+        self.start_cp_group(placement.region_id, placement.start, placement.end, Vec::new(), placement.peers)
+    }
+
+    /// **Found a brand-new region** on this node at runtime (the `CreateTable` path) — unlike
+    /// [`host_region`](Self::host_region), the routing entry is already carved (by the caller,
+    /// via [`RegionRegistry::split`]) and bootstrap uses **real voters** (this node, at
+    /// minimum) so the fresh group can campaign and serve immediately — there's no existing
+    /// leader to send it a snapshot the way re-replication's blank-learner join has.
+    fn found_region(
+        &self,
+        region_id: u64,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        voters: Vec<u64>,
+        peers: HashMap<u64, String>,
+    ) -> Result<RaftGroup, Box<dyn std::error::Error + Send + Sync>> {
+        self.start_cp_group(region_id, start, end, voters, peers)
+    }
+
+    /// Open the region's WAL storage, start its Raft group, and register it in [`MultiRaft`].
+    /// Shared by [`host_region`](Self::host_region) (empty-bootstrap join) and
+    /// [`found_region`](Self::found_region) (real-voters founding) — they differ only in
+    /// `voters` and in whether the routing table was already updated by the caller.
+    fn start_cp_group(
+        &self,
+        region_id: u64,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        voters: Vec<u64>,
+        peers: HashMap<u64, String>,
+    ) -> Result<RaftGroup, Box<dyn std::error::Error + Send + Sync>> {
+        let mr = self.raft.as_ref().ok_or("node is not in replicated (multiraft) mode")?;
+        if let Some(g) = mr.group(region_id) {
+            return Ok(g);
+        }
+        let storage =
+            wal_storage::WalStorage::open(self.engine.options().data_dir.join("raft").join(region_id.to_string()))?;
         let group = raft_group::start(GroupOptions {
-            group_id: placement.region_id,
+            group_id: region_id,
             id: self.node_id,
-            // Empty bootstrap: membership comes from the leader's log, exactly like a
-            // deterministic-harness `spawn_blank` node.
-            voters: Vec::new(),
-            peers: placement.peers,
+            voters,
+            peers,
             storage,
-            apply: make_apply(self.engine.clone(), self.node_id, placement.region_id),
-            snapshot: make_snapshot(self.engine.clone(), placement.start, placement.end),
+            apply: make_apply(self.engine.clone(), self.node_id, region_id),
+            snapshot: make_snapshot(self.engine.clone(), start, end),
             restore: make_restore(self.engine.clone()),
             tick: Duration::from_millis(DEFAULT_RAFT_TICK_MS),
         });
-        Ok(mr.insert(placement.region_id, group))
+        Ok(mr.insert(region_id, group))
     }
 
     /// The id of the **AP** region serving `key`, if this node hosts it (route key → region →
@@ -437,6 +480,15 @@ impl AppState {
             .await?
             .map_err(|e| Status::internal(format!("ap apply: {e}")))?;
         Ok(())
+    }
+
+    /// Record the tables declared up front (a real node's `--table` flags), so
+    /// [`ListTables`](KvService::list_tables) can report them and [`CreateTable`](KvService::create_table)
+    /// rejects a re-declaration. [`serve_catalog`] calls this after tiling; a caller that builds
+    /// its node through [`open_multiraft`](Self::open_multiraft) directly (placements carry
+    /// regions, not table names) uses it to say which names those regions came from.
+    pub fn declare_tables(&self, tables: Vec<(String, Regime)>) {
+        *self.declared.lock().unwrap() = tables;
     }
 
     /// Set the background AP anti-entropy period (ms). A large value effectively disables the
@@ -1472,6 +1524,125 @@ impl KvService for KvApi {
         Ok(Response::new(kv::MergeRegionResponse { merged: Some(region_info(&merged)) }))
     }
 
+    /// Declare a new table and stand up its region live — no restart. Single-node only for
+    /// now: the new region's sole voter is this node, and there's no PD/multi-node push to
+    /// tell other replicas about it (see `arcux.md`'s "Dynamic table creation" entry). Rejects
+    /// a re-declared name and rejects a target key range that already holds data — carving a
+    /// region out of one with live data would mean splitting an existing Raft group's log,
+    /// which isn't supported.
+    async fn create_table(
+        &self,
+        request: Request<kv::CreateTableRequest>,
+    ) -> Result<Response<kv::CreateTableResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("create_table: name must not be empty"));
+        }
+        let regime = match kv::Regime::try_from(req.regime) {
+            Ok(kv::Regime::Cp) => Regime::Cp,
+            Ok(kv::Regime::Ap) => Regime::Ap,
+            Err(_) => return Err(Status::invalid_argument("create_table: invalid regime")),
+        };
+        if self.state.declared.lock().unwrap().iter().any(|(n, _)| n == &req.name) {
+            return Err(Status::already_exists(format!("table {:?} is already declared", req.name)));
+        }
+
+        let start = catalog::table_prefix(&req.name);
+        let end = catalog::prefix_successor(&start).unwrap_or_default();
+
+        // Emptiness check: the target range must hold no live data (see the module doc above).
+        let state = self.state.clone();
+        let (scan_start, scan_end) = (start.clone(), end.clone());
+        let existing = run_blocking(move || state.engine.scan(&scan_start, &scan_end, u64::MAX, 1, true))
+            .await?
+            .map_err(|e| Status::internal(format!("create_table: emptiness check failed: {e}")))?;
+        if !existing.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "create_table: the range for {:?} already has data — dynamic creation requires an empty range",
+                req.name
+            )));
+        }
+
+        // Carve the routing table: narrow at `start`, then at `end`, unless a boundary is
+        // already there. Two `RegionRegistry::split` calls — the same operation `SplitRegion`
+        // already performs — mint a fresh, stable id for the carved-out middle piece.
+        let already_at_start = self.state.regions.route(&start).map(|r| r.start == start).unwrap_or(false);
+        if !already_at_start {
+            let regions = self.state.regions.clone();
+            let s = start.clone();
+            run_blocking(move || regions.split(&s))
+                .await?
+                .map_err(|e| Status::internal(format!("create_table: {e}")))?;
+        }
+        if !end.is_empty() {
+            let already_at_end = self.state.regions.route(&start).map(|r| r.end == end).unwrap_or(false);
+            if !already_at_end {
+                let regions = self.state.regions.clone();
+                let e = end.clone();
+                run_blocking(move || regions.split(&e))
+                    .await?
+                    .map_err(|err| Status::internal(format!("create_table: {err}")))?;
+            }
+        }
+        let region = self
+            .state
+            .regions
+            .route(&start)
+            .ok_or_else(|| Status::internal("create_table: carve failed"))?;
+
+        // Found the new region live, keyed by the carved id.
+        match regime {
+            Regime::Cp => {
+                self.state
+                    .found_region(region.id, region.start.clone(), region.end.clone(), vec![self.state.node_id], HashMap::new())
+                    .map_err(|e| Status::internal(format!("create_table: {e}")))?;
+            }
+            Regime::Ap => {
+                let Some(ap) = self.state.ap.as_ref() else {
+                    return Err(Status::failed_precondition(
+                        "create_table: node is not in AP-capable (multiraft) mode",
+                    ));
+                };
+                ap.insert(region.id, &HashMap::new());
+            }
+        }
+
+        self.state.declared.lock().unwrap().push((req.name.clone(), regime));
+
+        // Tell PD about the new topology so clients re-routing after a RegionStale see it.
+        if let Err(e) = self.state.heartbeat().await {
+            return Err(Status::internal(format!("create_table applied but PD heartbeat failed: {e}")));
+        }
+        Ok(Response::new(kv::CreateTableResponse { region: Some(region_info(&region)) }))
+    }
+
+    /// List this node's declared tables and their regimes. Node-local, mirroring
+    /// [`create_table`](Self::create_table)'s scope: with no PD-served catalog yet, a table
+    /// created live on another node isn't visible here. Reads in-memory state only — no engine
+    /// or routing work, and nothing to report to PD.
+    async fn list_tables(
+        &self,
+        _request: Request<kv::ListTablesRequest>,
+    ) -> Result<Response<kv::ListTablesResponse>, Status> {
+        let mut tables: Vec<kv::TableInfo> = self
+            .state
+            .declared
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, regime)| kv::TableInfo {
+                name: name.clone(),
+                regime: match regime {
+                    Regime::Cp => kv::Regime::Cp as i32,
+                    Regime::Ap => kv::Regime::Ap as i32,
+                },
+            })
+            .collect();
+        // Sorted, so the listing doesn't leak startup-flag/creation ordering.
+        tables.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(Response::new(kv::ListTablesResponse { tables }))
+    }
+
     async fn replicate_ap(
         &self,
         request: Request<kv::ReplicateApRequest>,
@@ -1815,6 +1986,7 @@ pub async fn serve_catalog(
 
     let clock: Arc<dyn TimestampSource> = Arc::new(LocalClock::new());
     let state = AppState::open_multiraft(opts, node_id, placements, clock)?;
+    state.declare_tables(tables.clone());
     let listener = TcpListener::bind(addr).await?;
 
     let map = tables

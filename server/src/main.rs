@@ -5,6 +5,7 @@
 //!                [--pd <addr:port>] [--address <uri>]
 //!                [--cluster <N> [--base-port <p>]]
 //!                [--voters <id,id,...> --peer <id>=<addr> ...]
+//!                [--table <name>=cp|ap ...] [--dynamic-tables]
 //!
 //! Modes, selected by which flags are present:
 //!
@@ -44,6 +45,8 @@ arcux-server [--data <dir>] [--listen <addr:port>] [--node-id <n>]
       --voters    <id,...>     replicated CP (explicit): the full voter set
       --peer      <id>=<addr>  address of another voter (repeatable)
       --table     <name>=cp|ap declare a table's regime (repeatable); undeclared keys are CP
+      --dynamic-tables         start in catalog mode with zero tables, so the client's
+                                'create table <name> <cp|ap>' works live, no restart
 
 easy local 3-node cluster (one per terminal):
   arcux-server -n 1 -c 3
@@ -53,7 +56,10 @@ easy local 3-node cluster (one per terminal):
 
 single node with a CP table and an AP table:
   arcux-server --table ledger=cp --table likes=ap
-=> keys under ledger/ are strongly consistent (Raft); likes/ is leaderless AP";
+=> keys under ledger/ are strongly consistent (Raft); likes/ is leaderless AP
+
+single node, declare tables live from the client instead of flags:
+  arcux-server --dynamic-tables";
 
 /// Normalize a bare `addr:port` to a full `http://` URI (leaving an explicit scheme as-is).
 fn as_uri(s: &str) -> String {
@@ -76,6 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut cluster: Option<u64> = None;
     let mut base_port: u16 = 50060;
     let mut tables: Vec<(String, Regime)> = Vec::new();
+    let mut dynamic_tables = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -141,6 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 };
                 tables.push((name.to_string(), regime));
             }
+            "--dynamic-tables" => dynamic_tables = true,
             "--help" | "-h" => {
                 println!("{HELP}");
                 return Ok(());
@@ -176,9 +184,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Catalog mode: --table declarations tile the keyspace into per-regime regions (CP tables
     // as Raft groups, AP tables leaderless). Runs single-node unless a replica set was given.
-    if !tables.is_empty() {
+    // --dynamic-tables enters the same mode with zero initial declarations, so a live
+    // `CreateTable` call has a multiraft node to attach new regions to from the very first call.
+    if !tables.is_empty() || dynamic_tables {
         if pd.is_some() {
-            return Err("--table (catalog mode) and --pd are mutually exclusive".into());
+            return Err("--table/--dynamic-tables (catalog mode) and --pd are mutually exclusive".into());
         }
         let voters = if voters.is_empty() { vec![node_id] } else { voters };
         if !voters.contains(&node_id) {

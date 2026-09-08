@@ -604,6 +604,44 @@ impl Client {
         Ok(resp.merged.map(|r| r.id).unwrap_or(0))
     }
 
+    /// Declare a new table and stand up its region live — no restart. Single-node only for now
+    /// (see `kv.CreateTable`'s doc): not routed by key, so it's sent to whichever node this
+    /// call reaches. Returns the new region's `(id, start, end)`.
+    pub async fn create_table(
+        &mut self,
+        name: impl Into<String>,
+        regime: kv::Regime,
+    ) -> Result<(u64, Vec<u8>, Vec<u8>)> {
+        let name = name.into();
+        let (_ctx, mut kv) = self.prepare(&[]).await?;
+        let resp = kv
+            .create_table(kv::CreateTableRequest { name, regime: regime as i32 })
+            .await
+            .map_err(ClientError::Rpc)?
+            .into_inner();
+        let region =
+            resp.region.ok_or_else(|| ClientError::Key("create_table: no region in response".into()))?;
+        Ok((region.id, region.start_key, region.end_key))
+    }
+
+    /// The declared tables and their regimes, sorted by name. Node-local like
+    /// [`create_table`](Self::create_table) (see `kv.ListTables`): this reports what the node
+    /// the call reaches knows, not a cluster-wide catalog. The untabled `""` default namespace
+    /// is never listed — it is always CP and always available.
+    pub async fn list_tables(&mut self) -> Result<Vec<(String, kv::Regime)>> {
+        let (_ctx, mut kv) = self.prepare(&[]).await?;
+        let resp = kv
+            .list_tables(kv::ListTablesRequest {})
+            .await
+            .map_err(ClientError::Rpc)?
+            .into_inner();
+        Ok(resp
+            .tables
+            .into_iter()
+            .map(|t| (t.name, kv::Regime::try_from(t.regime).unwrap_or(kv::Regime::Cp)))
+            .collect())
+    }
+
     /// Range scan, table-scoped like [`get`](Self::get)/[`put`](Self::put)/[`delete`](Self::delete).
     /// `table` is `""` for the untabled default namespace (requires an explicit non-empty
     /// `start_key`/`end_key` — the default namespace isn't one contiguous range) or a declared

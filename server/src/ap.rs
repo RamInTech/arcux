@@ -10,6 +10,7 @@
 //! (Last-Writer-Wins).
 
 use std::collections::HashMap;
+use std::sync::RwLock;
 
 use arcux_rpc::kv;
 use arcux_rpc::kv::kv_service_client::KvServiceClient;
@@ -20,18 +21,20 @@ struct ApRegion {
     peers: Vec<KvServiceClient<Channel>>,
 }
 
-/// The node's AP regions, keyed by region id.
+/// The node's AP regions, keyed by region id. Interior-mutable so a region can be **added at
+/// runtime** — mirrors [`crate::multiraft::MultiRaft`]'s `RwLock<HashMap<..>>`, needed so a
+/// live `CreateTable` can register a new AP region without a restart.
 pub struct ApReplication {
-    regions: HashMap<u64, ApRegion>,
+    regions: RwLock<HashMap<u64, ApRegion>>,
 }
 
 impl ApReplication {
     pub fn new() -> ApReplication {
-        ApReplication { regions: HashMap::new() }
+        ApReplication { regions: RwLock::new(HashMap::new()) }
     }
 
     /// Register an AP region with the addresses of its other replicas.
-    pub fn insert(&mut self, region_id: u64, peer_addrs: &HashMap<u64, String>) {
+    pub fn insert(&self, region_id: u64, peer_addrs: &HashMap<u64, String>) {
         let peers = peer_addrs
             .values()
             .filter_map(|addr| {
@@ -40,30 +43,31 @@ impl ApReplication {
                     .map(|e| KvServiceClient::new(e.connect_lazy()))
             })
             .collect();
-        self.regions.insert(region_id, ApRegion { peers });
+        self.regions.write().unwrap().insert(region_id, ApRegion { peers });
     }
 
     /// Whether this node hosts AP region `region_id`.
     pub fn hosts(&self, region_id: u64) -> bool {
-        self.regions.contains_key(&region_id)
+        self.regions.read().unwrap().contains_key(&region_id)
     }
 
     /// The ids of every AP region this node hosts (the anti-entropy driver iterates these).
     pub fn region_ids(&self) -> Vec<u64> {
-        self.regions.keys().copied().collect()
+        self.regions.read().unwrap().keys().copied().collect()
     }
 
     /// Clones of the peer replica clients for `region_id` — used by anti-entropy (digest /
     /// fetch) and read-repair to talk to the other replicas. Empty if the region isn't hosted.
     pub fn peers_of(&self, region_id: u64) -> Vec<KvServiceClient<Channel>> {
-        self.regions.get(&region_id).map(|r| r.peers.clone()).unwrap_or_default()
+        self.regions.read().unwrap().get(&region_id).map(|r| r.peers.clone()).unwrap_or_default()
     }
 
     /// Fan a write out to the region's peer replicas — best-effort, each in its own task.
     /// Returns immediately; the coordinator has already applied locally and acked (W=1).
     pub fn fanout(&self, region_id: u64, key: Vec<u8>, value: Vec<u8>, is_delete: bool, hlc_ts: u64) {
-        let Some(region) = self.regions.get(&region_id) else { return };
-        for client in &region.peers {
+        let peers = self.regions.read().unwrap().get(&region_id).map(|r| r.peers.clone());
+        let Some(peers) = peers else { return };
+        for client in &peers {
             let mut client = client.clone();
             let req = kv::ReplicateApRequest {
                 region_id,

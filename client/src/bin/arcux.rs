@@ -16,6 +16,7 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use arcux_client::{Client, ClientError};
+use arcux_rpc::kv::Regime;
 
 const BANNER: &str = r"
    █████╗ ██████╗  ██████╗██╗   ██╗██╗  ██╗
@@ -262,6 +263,12 @@ async fn dispatch(
             let id = client.merge_region(key.as_bytes().to_vec()).await?;
             println!("OK  {DIM}merged region {id}{RESET}");
         }
+        ["create", "table", name, regime] => {
+            let regime = parse_regime(regime)?;
+            let (id, start, end) = client.create_table(name.to_string(), regime).await?;
+            println!("OK  {DIM}region {id} [{}, {}){RESET}", render(&start), render(&end));
+        }
+        ["tables"] => print_tables(client.list_tables().await?),
         [other, ..] => return Err(format!("unknown command {other:?} — try 'help'").into()),
         [] => {}
     }
@@ -271,6 +278,15 @@ async fn dispatch(
 /// Resolve the table for an argument-omitted put/get/delete/scan: the `use`-selected default, or
 /// the empty/default namespace `""` (always CP) if none was selected. Never errors — the
 /// beginner-mode contract is that omitting <table> "just works" with zero setup.
+/// Parse a `create table`'s regime argument — matches `arcux-server --table`'s parser.
+fn parse_regime(s: &str) -> Result<Regime, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "cp" => Ok(Regime::Cp),
+        "ap" => Ok(Regime::Ap),
+        other => Err(format!("regime must be cp or ap, got {other:?}")),
+    }
+}
+
 fn default_table(table: &Option<String>) -> String {
     table.clone().unwrap_or_default()
 }
@@ -304,6 +320,9 @@ commands:
                                       supported, since it isn't one contiguous range)
   split <key>                        split the region owning <key> at <key>
   merge <key>                        merge the region starting at <key> leftward
+  create table <name> <cp|ap>        declare a new table and host its region live, no restart
+                                      (single-node only; fails if the range already has data)
+  tables                             list the declared tables and each one's CP/AP regime
   connect <uri>                      point the shell at a different server
   leader                             show the node currently assumed to be the leader
   help | quit
@@ -336,6 +355,24 @@ fn print_pairs(pairs: Vec<(Vec<u8>, Vec<u8>)>) {
         println!("  {} = {}", render(k), render(v));
     }
     println!("{DIM}{} row(s){RESET}", pairs.len());
+}
+
+/// Print the declared tables and their regimes. The untabled `""` default namespace is never in
+/// the listing (it is reserved, not declarable), so both branches say so — otherwise an empty
+/// listing reads as "there is nowhere to write", which is exactly wrong.
+fn print_tables(tables: Vec<(String, Regime)>) {
+    if tables.is_empty() {
+        println!("{DIM}no tables declared — keys still work in the default namespace (CP){RESET}");
+        println!("{DIM}declare one with 'create table <name> <cp|ap>'{RESET}");
+        return;
+    }
+    let width = tables.iter().map(|(n, _)| n.chars().count()).max().unwrap_or(4).max(4);
+    println!("  {BOLD}{:<width$}  REGIME{RESET}", "NAME", width = width);
+    for (name, regime) in &tables {
+        let regime = if *regime == Regime::Ap { "AP" } else { "CP" };
+        println!("  {name:<width$}  {regime}", width = width);
+    }
+    println!("{DIM}{} table(s); undeclared keys go to the default namespace (CP){RESET}", tables.len());
 }
 
 /// Render bytes as UTF-8 if valid, else as a byte-array debug string.
