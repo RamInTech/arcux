@@ -182,11 +182,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = listen.parse()?;
     let opts = Options::new(data_dir.unwrap_or_else(|| "./arcux-data".to_string()));
 
+    // A data directory that already holds table declarations selects catalog mode on its own,
+    // so restarting a node restores its tables without having to remember the flags that
+    // created them. (Errors here — a corrupt catalog — stop startup rather than silently
+    // falling through to direct mode, which would ignore every declaration in the file.)
+    let persisted_tables = arcux_server::table_store::load(&opts.data_dir)?;
+
     // Catalog mode: --table declarations tile the keyspace into per-regime regions (CP tables
     // as Raft groups, AP tables leaderless). Runs single-node unless a replica set was given.
     // --dynamic-tables enters the same mode with zero initial declarations, so a live
     // `CreateTable` call has a multiraft node to attach new regions to from the very first call.
-    if !tables.is_empty() || dynamic_tables {
+    if !tables.is_empty() || dynamic_tables || !persisted_tables.is_empty() {
         if pd.is_some() {
             return Err("--table/--dynamic-tables (catalog mode) and --pd are mutually exclusive".into());
         }

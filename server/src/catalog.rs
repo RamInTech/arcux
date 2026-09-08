@@ -121,6 +121,53 @@ impl Default for Catalog {
     }
 }
 
+/// Combine the tables persisted in a node's [`crate::table_store`] with the `--table` flags it
+/// was started with, producing the set the startup [`Catalog`] is built from. Name-sorted, so
+/// the resulting tiling is deterministic regardless of flag or file order.
+///
+/// A name present in only one source is taken as-is — that is what restores a table declared
+/// live by `kv.CreateTable`. A name in both with the same regime is the ordinary case of an
+/// operator who keeps passing their original flags.
+///
+/// A name in both with **different** regimes is an error, and the node refuses to start. There
+/// is no `ALTER … SET consistency`, so a disagreement is an operator mistake rather than an
+/// intent to change; resolving it silently either way would swap a table's consistency
+/// guarantee underneath data already written under the other one.
+pub fn merge_declarations(
+    persisted: &[(String, Regime)],
+    flags: &[(String, Regime)],
+) -> Result<Vec<(String, Regime)>, String> {
+    let mut merged: Vec<(String, Regime)> = persisted.to_vec();
+    for (name, flag_regime) in flags {
+        match merged.iter().find(|(n, _)| n == name) {
+            Some((_, persisted_regime)) if persisted_regime != flag_regime => {
+                // One line, single-quoted: a startup error surfaces through `Box<dyn Error>`'s
+                // Debug formatting, which escapes both quotes and newlines into noise.
+                return Err(format!(
+                    "table '{name}' is declared {} in the data directory's catalog but --table \
+                     says {}; a table's regime cannot be changed after creation — drop the flag \
+                     to keep {}, or start with a fresh data directory",
+                    regime_name(*persisted_regime),
+                    regime_name(*flag_regime),
+                    regime_name(*persisted_regime),
+                ))
+            }
+            Some(_) => {}
+            None => merged.push((name.clone(), *flag_regime)),
+        }
+    }
+    merged.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(merged)
+}
+
+fn regime_name(regime: Regime) -> &'static str {
+    if regime == Regime::Ap {
+        "ap"
+    } else {
+        "cp"
+    }
+}
+
 /// A table `t` owns keys under `t/`. The empty name is the untabled default — no prefix — so
 /// requests that don't name a table (raw single-node/test usage) route on the bare key exactly
 /// as before tables carried their own request field.
@@ -136,6 +183,42 @@ pub(crate) fn table_prefix(name: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cp(name: &str) -> (String, Regime) {
+        (name.to_string(), Regime::Cp)
+    }
+    fn ap(name: &str) -> (String, Regime) {
+        (name.to_string(), Regime::Ap)
+    }
+
+    #[test]
+    fn merge_restores_persisted_tables_and_adds_new_flags() {
+        // `clicks` was created live and persisted; `ledger` comes from a --table flag.
+        let merged = merge_declarations(&[ap("clicks")], &[cp("ledger")]).unwrap();
+        assert_eq!(merged, vec![ap("clicks"), cp("ledger")]);
+    }
+
+    #[test]
+    fn merge_accepts_a_flag_that_repeats_the_persisted_regime() {
+        // The ordinary case: the operator keeps passing the flags they always did.
+        let merged = merge_declarations(&[cp("ledger")], &[cp("ledger")]).unwrap();
+        assert_eq!(merged, vec![cp("ledger")]);
+    }
+
+    #[test]
+    fn merge_rejects_a_flag_that_contradicts_the_persisted_regime() {
+        // Silently taking either side would swap the consistency guarantee under existing data.
+        let err = merge_declarations(&[ap("clicks")], &[cp("clicks")]).unwrap_err();
+        assert!(err.contains("clicks"), "message should name the table: {err}");
+        assert!(err.contains("ap") && err.contains("cp"), "should name both regimes: {err}");
+    }
+
+    #[test]
+    fn merge_is_name_sorted_so_tiling_is_deterministic() {
+        let merged = merge_declarations(&[cp("orders"), ap("clicks")], &[cp("acct")]).unwrap();
+        let names: Vec<&str> = merged.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["acct", "clicks", "orders"]);
+    }
 
     #[test]
     fn declared_tables_select_their_regime() {

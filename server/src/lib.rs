@@ -53,6 +53,7 @@ pub mod raft_cmd;
 pub mod raft_group;
 pub mod raft_transport;
 pub mod repair;
+pub mod table_store;
 pub mod wal_storage;
 
 use ap::ApReplication;
@@ -198,6 +199,15 @@ pub struct AppState {
     /// *is* the source of truth — the startup [`catalog::Catalog`] is consumed to compute
     /// placements and then dropped, so nothing else survives to answer "what tables exist?".
     declared: std::sync::Mutex<Vec<(String, Regime)>>,
+    /// The voter set this node's regions are replicated across. A single entry means a
+    /// single-node deployment, which is the only shape [`CreateTable`](KvService::create_table)
+    /// supports — see the guard there.
+    voters: Vec<u64>,
+    /// Serializes [`CreateTable`](KvService::create_table). Its duplicate-name check and its
+    /// record of the new table straddle several `.await` points, so without this two concurrent
+    /// calls for the same name could both pass the check. Async-aware because it is held across
+    /// those awaits.
+    create_table_lock: tokio::sync::Mutex<()>,
 }
 
 impl AppState {
@@ -219,6 +229,8 @@ impl AppState {
             ap: None,
             hlc: Arc::new(Hlc::new()),
             declared: std::sync::Mutex::new(Vec::new()),
+            voters: vec![1],
+            create_table_lock: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -248,6 +260,8 @@ impl AppState {
             ap: None,
             hlc: Arc::new(Hlc::new()),
             declared: std::sync::Mutex::new(Vec::new()),
+            voters: vec![node_id],
+            create_table_lock: tokio::sync::Mutex::new(()),
         });
         state.heartbeat().await?; // register, adopt our assignment, become routable
         Ok(state)
@@ -304,6 +318,10 @@ impl AppState {
                 .collect(),
         )?;
 
+        // Every region in a catalog tiling shares one replica set, so any placement names it.
+        let voters =
+            placements.first().map(|p| p.voters.clone()).unwrap_or_else(|| vec![node_id]);
+
         // Per region: a CP region gets a Raft group (durable log, applies into the shared
         // engine); an AP region gets a leaderless replica set (just its peers to forward to).
         let mut groups = HashMap::new();
@@ -343,6 +361,8 @@ impl AppState {
             ap: Some(ap),
             hlc: Arc::new(Hlc::new()),
             declared: std::sync::Mutex::new(Vec::new()),
+            voters,
+            create_table_lock: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -489,6 +509,11 @@ impl AppState {
     /// regions, not table names) uses it to say which names those regions came from.
     pub fn declare_tables(&self, tables: Vec<(String, Regime)>) {
         *self.declared.lock().unwrap() = tables;
+    }
+
+    /// The tables declared on this node, as [`ListTables`](KvService::list_tables) reports them.
+    pub fn declared_tables(&self) -> Vec<(String, Regime)> {
+        self.declared.lock().unwrap().clone()
     }
 
     /// Set the background AP anti-entropy period (ms). A large value effectively disables the
@@ -1543,6 +1568,23 @@ impl KvService for KvApi {
             Ok(kv::Regime::Ap) => Regime::Ap,
             Err(_) => return Err(Status::invalid_argument("create_table: invalid regime")),
         };
+
+        // Single-node only. A live create carves this node's routing table and founds the region
+        // with only this node as a voter; nothing pushes that to the other replicas. They would
+        // keep the old, wider region and — because a catalog tiling numbers regions by position —
+        // the same region id would name a different key range on different nodes.
+        if self.state.voters.len() > 1 {
+            return Err(Status::failed_precondition(
+                "create_table: not supported on a multi-node cluster yet — the other nodes would \
+                 not learn about the table and would disagree about region routing. Declare it \
+                 with --table <name>=cp|ap on every node instead.",
+            ));
+        }
+
+        // Held for the whole handler: the duplicate check below and the record of the new table
+        // straddle several `.await`s, so concurrent calls for one name could otherwise both pass.
+        let _create_guard = self.state.create_table_lock.lock().await;
+
         if self.state.declared.lock().unwrap().iter().any(|(n, _)| n == &req.name) {
             return Err(Status::already_exists(format!("table {:?} is already declared", req.name)));
         }
@@ -1609,6 +1651,16 @@ impl KvService for KvApi {
 
         self.state.declared.lock().unwrap().push((req.name.clone(), regime));
 
+        // Make the declaration durable before acking, so a restart restores the table with its
+        // regime instead of silently re-tiling it back into the default CP namespace. On failure
+        // the next boot tiles from the catalog without this entry, dropping the half-created
+        // region — so the node self-corrects rather than coming back inconsistent.
+        let data_dir = self.state.engine.options().data_dir.clone();
+        let snapshot = self.state.declared.lock().unwrap().clone();
+        run_blocking(move || table_store::save(&data_dir, &snapshot))
+            .await?
+            .map_err(|e| Status::internal(format!("create_table: persisting the catalog failed: {e}")))?;
+
         // Tell PD about the new topology so clients re-routing after a RegionStale see it.
         if let Err(e) = self.state.heartbeat().await {
             return Err(Status::internal(format!("create_table applied but PD heartbeat failed: {e}")));
@@ -1626,9 +1678,7 @@ impl KvService for KvApi {
     ) -> Result<Response<kv::ListTablesResponse>, Status> {
         let mut tables: Vec<kv::TableInfo> = self
             .state
-            .declared
-            .lock()
-            .unwrap()
+            .declared_tables()
             .iter()
             .map(|(name, regime)| kv::TableInfo {
                 name: name.clone(),
@@ -1978,18 +2028,11 @@ pub async fn serve_catalog(
     peers: HashMap<u64, String>,
     tables: Vec<(String, Regime)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut cat = catalog::Catalog::new();
-    for (name, regime) in &tables {
-        cat.create_table(name, *regime);
-    }
-    let placements = cat.placements(voters.clone(), peers);
-
-    let clock: Arc<dyn TimestampSource> = Arc::new(LocalClock::new());
-    let state = AppState::open_multiraft(opts, node_id, placements, clock)?;
-    state.declare_tables(tables.clone());
+    let state = open_catalog_node(opts, node_id, voters.clone(), peers, tables)?;
     let listener = TcpListener::bind(addr).await?;
 
-    let map = tables
+    let map = state
+        .declared_tables()
         .iter()
         .map(|(n, r)| format!("{n}={}", if *r == Regime::Ap { "AP" } else { "CP" }))
         .collect::<Vec<_>>()
@@ -2002,6 +2045,43 @@ pub async fn serve_catalog(
 
     serve_on(state, listener, shutdown_signal()).await?;
     Ok(())
+}
+
+/// Build a catalog-driven node's [`AppState`] without binding a socket — the half of
+/// [`serve_catalog`] that decides which tables exist and tiles the keyspace for them.
+///
+/// The declarations come from two places: whatever this data directory already recorded (via
+/// [`table_store`]) and the `--table` flags in `tables`. Merging them is what makes a live
+/// `kv.CreateTable` durable — startup flags alone would drop it, silently re-tiling an AP table
+/// back into the default CP namespace. A flag contradicting a persisted regime is an error and
+/// the node refuses to start; see [`catalog::merge_declarations`].
+///
+/// Split out from `serve_catalog` so tests can drive the real startup path — including the
+/// restore-after-restart behaviour — rather than a copy of it that could drift.
+pub fn open_catalog_node(
+    opts: Options,
+    node_id: u64,
+    voters: Vec<u64>,
+    peers: HashMap<u64, String>,
+    tables: Vec<(String, Regime)>,
+) -> Result<Arc<AppState>, Box<dyn std::error::Error + Send + Sync>> {
+    let persisted = table_store::load(&opts.data_dir)?;
+    let tables = catalog::merge_declarations(&persisted, &tables)?;
+
+    let mut cat = catalog::Catalog::new();
+    for (name, regime) in &tables {
+        cat.create_table(name, *regime);
+    }
+    let placements = cat.placements(voters, peers);
+
+    // Record the merged set, so a table introduced by a `--table` flag survives a later restart
+    // without it — the same durability a live-created table now gets.
+    table_store::save(&opts.data_dir, &tables)?;
+
+    let clock: Arc<dyn TimestampSource> = Arc::new(LocalClock::new());
+    let state = AppState::open_multiraft(opts, node_id, placements, clock)?;
+    state.declare_tables(tables);
+    Ok(state)
 }
 
 async fn shutdown_signal() {
