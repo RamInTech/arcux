@@ -65,6 +65,14 @@ fn kv_messages_roundtrip() {
         kind: Some(kv::key_error::Kind::RegionStale(kv::RegionStale { new_epoch: 5 })),
     };
     roundtrip(&kv::PrewriteResponse { errors: vec![stale] });
+
+    roundtrip(&kv::CreateTableRequest { name: "clicks".into(), regime: kv::Regime::Ap as i32 });
+    roundtrip(&kv::ListTablesResponse {
+        tables: vec![
+            kv::TableInfo { name: "clicks".into(), regime: kv::Regime::Ap as i32 },
+            kv::TableInfo { name: "ledger".into(), regime: kv::Regime::Cp as i32 },
+        ],
+    });
 }
 
 #[test]
@@ -113,5 +121,5 @@ fn pd_messages_roundtrip() {
 
 #[test]
 fn version_is_pinned() {
-    assert_eq!(arcux_rpc::VERSION, 11);
+    assert_eq!(arcux_rpc::VERSION, 13);
 }

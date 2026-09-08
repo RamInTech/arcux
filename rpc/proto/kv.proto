@@ -34,6 +34,15 @@ service KvService {
   // inverse of SplitRegion). Both halves must live on this node; the epoch is bumped and
   // the new topology reported to PD on the next heartbeat.
   rpc MergeRegion(MergeRegionRequest) returns (MergeRegionResponse);
+  // Declare a new table and stand up its region live, no restart (single-node only for now —
+  // no PD/multi-node placement push exists yet). Fails if the name is already declared or the
+  // target key range already holds data (live splitting of an existing region's data is not
+  // supported; pick an unused prefix).
+  rpc CreateTable(CreateTableRequest) returns (CreateTableResponse);
+  // List the tables declared on this node (startup --table flags plus any live CreateTable),
+  // each with its regime. Node-local, like CreateTable — there is no PD-served catalog yet, so
+  // this reports what *this* node knows, not a cluster-wide view.
+  rpc ListTables(ListTablesRequest) returns (ListTablesResponse);
   // Internal (node→node): replicate an AP write to a peer replica (Phase 5). Leaderless +
   // HLC-stamped + Last-Writer-Wins; the coordinator that took the client write fans it out.
   rpc ReplicateAp(ReplicateApRequest) returns (ReplicateApResponse);
@@ -228,6 +237,37 @@ message MergeRegionRequest {
 }
 message MergeRegionResponse {
   RegionInfo merged = 1;   // left id, range [left.start, right.end), epoch bumped
+  reserved 50 to 99;
+}
+
+// --- dynamic table creation (single-node) ---
+
+enum Regime {
+  CP = 0;
+  AP = 1;
+}
+message CreateTableRequest {
+  string name = 1;
+  Regime regime = 2;
+  reserved 50 to 99;
+}
+message CreateTableResponse {
+  RegionInfo region = 1;  // the newly carved region hosting the table
+  reserved 50 to 99;
+}
+
+message ListTablesRequest {
+  reserved 50 to 99;
+}
+message TableInfo {
+  string name = 1;
+  Regime regime = 2;
+  reserved 50 to 99;
+}
+message ListTablesResponse {
+  // Declared tables, sorted by name. The untabled "" default namespace is never an entry —
+  // it is reserved rather than declarable, and is always CP.
+  repeated TableInfo tables = 1;
   reserved 50 to 99;
 }
 

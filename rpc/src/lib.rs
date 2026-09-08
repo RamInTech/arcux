@@ -26,7 +26,12 @@
 /// v11 (table-aware scan): added `table` to `kv.ScanRequest`, mirroring v10's Get/Put/Delete
 /// treatment, plus a "whole table" mode (empty `start_key`/`end_key` + non-empty `table`) so a
 /// full-table scan doesn't require the client to know the table's byte-range bounds.
-pub const VERSION: u32 = 11;
+/// v12 (dynamic table creation): added `kv.Regime` + the `kv.CreateTable` RPC — declares a new
+/// table and stands up its region live on an already-running (single) node, no restart.
+/// v13 (table introspection): added `kv.TableInfo` + the `kv.ListTables` RPC — reports the
+/// tables a node has declared (startup flags plus live `CreateTable`s) and each one's regime,
+/// so a client can discover the catalog instead of having to already know it.
+pub const VERSION: u32 = 13;
 
 /// KV API v1 — the transactional + autocommit surface (fully implemented in Phase 2).
 pub mod kv {
