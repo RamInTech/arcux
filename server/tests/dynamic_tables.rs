@@ -9,16 +9,17 @@ use std::net::SocketAddr;
 use arcux_client::{Client, ClientError};
 use arcux_engine::Options;
 use arcux_rpc::kv::Regime;
-use arcux_server::catalog::Catalog;
 use arcux_server::multiraft::Regime as ServerRegime;
-use arcux_server::{serve_on, AppState};
+use arcux_server::serve_on;
 use tokio::net::TcpListener;
 
 struct TestServer {
     addr: SocketAddr,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     handle: tokio::task::JoinHandle<()>,
-    _dir: tempfile::TempDir,
+    /// `None` when the caller owns the data directory, which is how a restart test keeps the
+    /// same directory alive across two successive nodes.
+    _dir: Option<tempfile::TempDir>,
 }
 
 impl TestServer {
@@ -31,20 +32,24 @@ impl TestServer {
     }
 
     /// The same node, but with tables declared up front — what `--table name=cp|ap` gives a real
-    /// binary. Mirrors `serve_catalog`: tile from the catalog, then record the names/regimes so
-    /// `ListTables` can report them (placements alone carry regions, not table names).
+    /// binary.
     async fn start_with_tables(tables: Vec<(String, ServerRegime)>) -> TestServer {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut cat = Catalog::new();
-        for (name, regime) in &tables {
-            cat.create_table(name, *regime);
-        }
-        let placements = cat.placements(vec![1], Default::default());
-        let clock: std::sync::Arc<dyn arcux_server::TimestampSource> =
-            std::sync::Arc::new(arcux_server::LocalClock::new());
-        let state = AppState::open_multiraft(Options::new(dir.path()), 1, placements, clock)
-            .expect("open_multiraft");
-        state.declare_tables(tables);
+        let mut srv = TestServer::start_at(dir.path(), tables, vec![1]).await.expect("start");
+        srv._dir = Some(dir);
+        srv
+    }
+
+    /// A node on a caller-owned directory, through the **real** startup path
+    /// (`open_catalog_node`: load the persisted catalog, merge the `--table` flags, tile, save).
+    /// Restart tests depend on that being the same code `serve_catalog` runs, not a copy.
+    async fn start_at(
+        data_dir: &std::path::Path,
+        tables: Vec<(String, ServerRegime)>,
+        voters: Vec<u64>,
+    ) -> Result<TestServer, Box<dyn std::error::Error + Send + Sync>> {
+        let state =
+            arcux_server::open_catalog_node(Options::new(data_dir), 1, voters, Default::default(), tables)?;
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -54,7 +59,7 @@ impl TestServer {
             })
             .await;
         });
-        TestServer { addr, shutdown: Some(tx), handle, _dir: dir }
+        Ok(TestServer { addr, shutdown: Some(tx), handle, _dir: None })
     }
 
     fn client(&self) -> Client {
@@ -81,6 +86,18 @@ async fn put_until_ready(c: &mut Client, table: &str, key: &[u8], value: &[u8]) 
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
     }
     panic!("put_until_ready: {table:?} never became writable");
+}
+
+/// The read-side counterpart. A CP region restored at startup is a fresh Raft group that has to
+/// win an election before it can serve, so the first read after a restart races that election.
+async fn get_until_ready(c: &mut Client, table: &str, key: &[u8]) -> Option<Vec<u8>> {
+    for _ in 0..50 {
+        if let Ok(v) = c.get(table, key.to_vec()).await {
+            return v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+    panic!("get_until_ready: {table:?} never became readable");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -168,6 +185,109 @@ async fn a_live_created_table_appears_in_the_listing() {
         c.list_tables().await.unwrap(),
         vec![("clicks".to_string(), Regime::Ap), ("orders".to_string(), Regime::Cp)]
     );
+
+    srv.stop().await;
+}
+
+/// The regression test for the whole persistence gap: before the catalog was durable, a restart
+/// re-tiled from the (empty) startup flags, so both tables vanished from `tables` and the AP one
+/// silently came back CP — a consistency guarantee changing with no error — while its data was
+/// still readable and its range could no longer be re-declared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_created_table_survives_a_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let srv = TestServer::start_at(dir.path(), vec![], vec![1]).await.expect("start");
+    let mut c = srv.client();
+    c.create_table("orders", Regime::Cp).await.unwrap();
+    c.create_table("clicks", Regime::Ap).await.unwrap();
+    put_until_ready(&mut c, "orders", b"o1", b"100").await;
+    c.put("clicks", b"c1".to_vec(), b"tap".to_vec()).await.unwrap();
+    srv.stop().await;
+
+    // Restart on the same directory with no flags at all — what a plain restart looks like.
+    let srv = TestServer::start_at(dir.path(), vec![], vec![1]).await.expect("restart");
+    let mut c = srv.client();
+
+    assert_eq!(
+        c.list_tables().await.unwrap(),
+        vec![("clicks".to_string(), Regime::Ap), ("orders".to_string(), Regime::Cp)],
+        "declarations and regimes must survive; clicks must not come back CP"
+    );
+    assert_eq!(get_until_ready(&mut c, "orders", b"o1").await, Some(b"100".to_vec()));
+    assert_eq!(get_until_ready(&mut c, "clicks", b"c1").await, Some(b"tap".to_vec()));
+
+    // And the range is still owned by its table, so nothing is stranded needing a re-declare.
+    let err = c.create_table("clicks", Regime::Ap).await.unwrap_err();
+    match err {
+        ClientError::Rpc(status) => assert!(
+            status.message().contains("already declared"),
+            "expected an already-declared error, got: {}",
+            status.message()
+        ),
+        other => panic!("expected an Rpc error, got {other:?}"),
+    }
+
+    srv.stop().await;
+}
+
+/// A table first introduced by a `--table` flag is recorded too, so it keeps its regime on a
+/// later restart that omits the flag — the same durability a live-created table gets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flag_declared_table_is_persisted_and_survives_without_the_flag() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let srv = TestServer::start_at(dir.path(), vec![("events".to_string(), ServerRegime::Ap)], vec![1])
+        .await
+        .expect("start");
+    srv.stop().await;
+
+    let srv = TestServer::start_at(dir.path(), vec![], vec![1]).await.expect("restart");
+    let mut c = srv.client();
+    assert_eq!(c.list_tables().await.unwrap(), vec![("events".to_string(), Regime::Ap)]);
+    srv.stop().await;
+}
+
+/// A regime cannot be changed after creation, so a flag disagreeing with what is on disk is an
+/// operator error. Refusing to start beats silently picking a side — taking the flag is exactly
+/// the silent AP-to-CP downgrade this work removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flag_contradicting_the_persisted_regime_refuses_to_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let srv = TestServer::start_at(dir.path(), vec![], vec![1]).await.expect("start");
+    let mut c = srv.client();
+    c.create_table("clicks", Regime::Ap).await.unwrap();
+    srv.stop().await;
+
+    let started =
+        TestServer::start_at(dir.path(), vec![("clicks".to_string(), ServerRegime::Cp)], vec![1]).await;
+    let msg = match started {
+        Ok(_) => panic!("a contradicting --table flag must abort startup"),
+        Err(e) => e.to_string(),
+    };
+    assert!(msg.contains("clicks"), "message should name the table: {msg}");
+    assert!(msg.contains("ap") && msg.contains("cp"), "should name both regimes: {msg}");
+}
+
+/// Live creation is single-node only. On a cluster the other nodes would never learn about the
+/// table, and because a catalog tiling numbers regions by position, the same region id would
+/// name a different key range on each node. Reject it rather than diverge silently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_table_is_rejected_on_a_multi_node_cluster() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let srv = TestServer::start_at(dir.path(), vec![], vec![1, 2, 3]).await.expect("start");
+    let mut c = srv.client();
+
+    let err = c.create_table("orders", Regime::Cp).await.unwrap_err();
+    match err {
+        ClientError::Rpc(status) => assert!(
+            status.message().contains("multi-node cluster"),
+            "unexpected message: {}",
+            status.message()
+        ),
+        other => panic!("expected an Rpc error, got {other:?}"),
+    }
 
     srv.stop().await;
 }
