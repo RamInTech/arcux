@@ -31,7 +31,11 @@
 /// v13 (table introspection): added `kv.TableInfo` + the `kv.ListTables` RPC — reports the
 /// tables a node has declared (startup flags plus live `CreateTable`s) and each one's regime,
 /// so a client can discover the catalog instead of having to already know it.
-pub const VERSION: u32 = 13;
+/// v14 (PD learns about tables): added `pd.Regime` + `pd.TableDecl`, `regime`/`voters` on
+/// `pd.Region` (a single `node_id` cannot describe a three-voter region), `tables` on
+/// `pd.HeartbeatRequest`, and the `pd.ListTables` RPC — so PD holds the cluster-wide catalog
+/// view and can report nodes that disagree about a table's regime.
+pub const VERSION: u32 = 14;
 
 /// KV API v1 — the transactional + autocommit surface (fully implemented in Phase 2).
 pub mod kv {

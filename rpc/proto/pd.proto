@@ -21,6 +21,25 @@ service PdService {
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   // Phase 3: the whole aggregated region view, for client routing caches + tooling.
   rpc ListRegions(ListRegionsRequest) returns (ListRegionsResponse);
+  // The cluster-wide catalog as PD has heard it: the union of every node's declared tables,
+  // plus any table two nodes describe with *different* regimes. Nothing checks today that a
+  // cluster was started with matching --table flags, and a mismatch silently tiles and routes
+  // the same keys differently on different nodes; this is how that becomes visible.
+  rpc ListTables(ListTablesRequest) returns (ListTablesResponse);
+}
+
+// How a range is served. Mirrors kv.Regime, which is a different proto package — PD's copy is
+// kept separate so the placement contract doesn't depend on the KV one.
+enum Regime {
+  CP = 0;
+  AP = 1;
+}
+
+// One table's declaration, as a node reports it.
+message TableDecl {
+  string name = 1;
+  Regime regime = 2;
+  reserved 50 to 99;
 }
 
 // A region as PD sees it (the canonical placement record).
@@ -31,6 +50,10 @@ message Region {
   uint64 epoch = 4;
   uint64 node_id = 5;   // owning data node (Phase 3b); 0 => unplaced/legacy
   string address = 6;   // owning node's serving endpoint, e.g. "http://127.0.0.1:50051"
+  Regime regime = 7;            // how this range is served (CP => Raft, AP => leaderless)
+  repeated uint64 voters = 8;   // the region's replica set; empty => unreplicated/legacy.
+                                // node_id above names one holder, which cannot describe a
+                                // three-voter region on its own.
   reserved 50 to 99;
 }
 
@@ -62,6 +85,8 @@ message HeartbeatRequest {
   uint64 node_id = 1;
   repeated Region regions = 2;  // the regions this node currently owns
   string address = 3;           // this node's serving endpoint (Phase 3b)
+  repeated TableDecl tables = 4;  // the tables this node has declared (--table flags plus any
+                                  // live CreateTable); empty for a node with no catalog
   reserved 50 to 99;
 }
 message HeartbeatResponse {
@@ -77,5 +102,24 @@ message ListRegionsRequest {
 }
 message ListRegionsResponse {
   repeated Region regions = 1;  // all regions PD knows about, sorted by start_key
+  reserved 50 to 99;
+}
+
+message ListTablesRequest {
+  reserved 50 to 99;
+}
+// One table two nodes describe differently — a misconfigured cluster, since a table's regime
+// decides how its keys are tiled and routed.
+message TableConflict {
+  string name = 1;
+  Regime regime = 2;      // what `node_id` reports
+  uint64 node_id = 3;
+  Regime other_regime = 4;  // what `other_node_id` reports
+  uint64 other_node_id = 5;
+  reserved 50 to 99;
+}
+message ListTablesResponse {
+  repeated TableDecl tables = 1;        // union across nodes, sorted by name
+  repeated TableConflict conflicts = 2; // empty when every node agrees
   reserved 50 to 99;
 }

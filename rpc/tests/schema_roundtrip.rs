@@ -87,6 +87,8 @@ fn pd_messages_roundtrip() {
             epoch: 2,
             node_id: 1,
             address: "http://n1".into(),
+            regime: pd::Regime::Cp as i32,
+            voters: vec![1, 2, 3],
         },
         pd::Region {
             id: 2,
@@ -95,10 +97,17 @@ fn pd_messages_roundtrip() {
             epoch: 2,
             node_id: 2,
             address: "http://n2".into(),
+            regime: pd::Regime::Cp as i32,
+            voters: vec![1, 2, 3],
         },
     ];
     roundtrip(&pd::ListRegionsResponse { regions: regions.clone() });
-    roundtrip(&pd::HeartbeatRequest { node_id: 7, regions, address: "http://n7".into() });
+    roundtrip(&pd::HeartbeatRequest {
+        node_id: 7,
+        regions,
+        address: "http://n7".into(),
+        tables: vec![],
+    });
     roundtrip(&pd::HeartbeatResponse {
         regions: vec![pd::Region {
             id: 1,
@@ -107,8 +116,30 @@ fn pd_messages_roundtrip() {
             epoch: 1,
             node_id: 7,
             address: "http://n7".into(),
+            regime: pd::Regime::Cp as i32,
+            voters: vec![1, 2, 3],
         }],
     });
+    roundtrip(&pd::HeartbeatRequest {
+        node_id: 1,
+        regions: vec![],
+        address: "http://n1".into(),
+        tables: vec![
+            pd::TableDecl { name: "ledger".into(), regime: pd::Regime::Cp as i32 },
+            pd::TableDecl { name: "events".into(), regime: pd::Regime::Ap as i32 },
+        ],
+    });
+    roundtrip(&pd::ListTablesResponse {
+        tables: vec![pd::TableDecl { name: "events".into(), regime: pd::Regime::Ap as i32 }],
+        conflicts: vec![pd::TableConflict {
+            name: "events".into(),
+            regime: pd::Regime::Ap as i32,
+            node_id: 1,
+            other_regime: pd::Regime::Cp as i32,
+            other_node_id: 2,
+        }],
+    });
+
     roundtrip(&pd::GetRegionResponse {
         region_id: 2,
         start_key: b"m".to_vec(),
@@ -121,5 +152,5 @@ fn pd_messages_roundtrip() {
 
 #[test]
 fn version_is_pinned() {
-    assert_eq!(arcux_rpc::VERSION, 13);
+    assert_eq!(arcux_rpc::VERSION, 14);
 }
