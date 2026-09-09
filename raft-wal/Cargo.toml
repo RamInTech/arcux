@@ -1,0 +1,17 @@
+[package]
+name = "arcux-raft-wal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "arcux: a durable arcux-raft Storage backed by the engine's WAL, shared by the data nodes and PD."
+
+[lib]
+name = "arcux_raft_wal"
+path = "src/lib.rs"
+
+[dependencies]
+arcux-engine = { path = "../engine" }
+arcux-raft = { path = "../raft" }
+
+[dev-dependencies]
+tempfile.workspace = true

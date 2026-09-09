@@ -18,6 +18,7 @@ arcux-engine = { path = "../engine" }
 arcux-rpc = { path = "../rpc" }
 arcux-pd = { path = "../pd" }
 arcux-raft = { path = "../raft" }
+arcux-raft-wal = { path = "../raft-wal" }
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true

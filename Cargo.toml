@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["engine", "rpc", "pd", "raft", "server", "client"]
+members = ["engine", "rpc", "pd", "raft", "raft-wal", "server", "client"]
 
 # Phase 1 populated `engine/`. Phase 2 added the network layer: `rpc/` (frozen wire
 # contract), `server/` (tonic server over the engine), `client/` (async SDK). Phase 3

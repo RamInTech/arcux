@@ -23,7 +23,7 @@ use arcux_rpc::kv::key_error::Kind;
 use arcux_rpc::kv::kv_service_client::KvServiceClient;
 use arcux_rpc::kv::{self};
 use arcux_server::multiraft::{Regime, RegionPlacement};
-use arcux_server::wal_storage::WalStorage;
+use arcux_raft_wal::WalStorage;
 use arcux_server::{serve_on, AppState, LocalClock, TimestampSource};
 use tokio::net::TcpListener;
 use tonic::transport::Channel;

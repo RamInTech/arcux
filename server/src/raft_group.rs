@@ -28,7 +28,7 @@ use arcux_rpc::raft::raft_service_client::RaftServiceClient;
 use tonic::transport::Channel;
 
 use crate::raft_transport as xport;
-use crate::wal_storage::WalStorage;
+use arcux_raft_wal::WalStorage;
 
 /// Applies a committed entry's bytes to the state machine, returning the engine outcome.
 /// The leader's proposer sees this result (a Percolator conflict surfaces here as `Err`);

@@ -46,6 +46,7 @@ name = "arcux-pd"
 version = "0.1.0"
 dependencies = [
  "arcux-raft",
+ "arcux-raft-wal",
  "arcux-rpc",
  "prost",
  "tempfile",
@@ -57,6 +58,15 @@ dependencies = [
 [[package]]
 name = "arcux-raft"
 version = "0.1.0"
+
+[[package]]
+name = "arcux-raft-wal"
+version = "0.1.0"
+dependencies = [
+ "arcux-engine",
+ "arcux-raft",
+ "tempfile",
+]
 
 [[package]]
 name = "arcux-rpc"
@@ -77,6 +87,7 @@ dependencies = [
  "arcux-engine",
  "arcux-pd",
  "arcux-raft",
+ "arcux-raft-wal",
  "arcux-rpc",
  "prost",
  "tempfile",

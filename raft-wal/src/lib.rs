@@ -1,5 +1,10 @@
 //! `WalStorage` — a durable [`arcux_raft::Storage`] backed by the Phase-1 WAL.
 //!
+//! Its own crate so both users can reach it: the data nodes (a log per region Raft group) and
+//! **PD** (whose replicated placement/TSO state must survive a full-cluster restart). It can't
+//! live in either `server` or `pd` — `server` depends on `pd`, so `pd` can't import from it —
+//! nor in `raft` (deliberately dependency-free) or `engine` (which knows nothing of Raft).
+//!
 //! The Raft core writes its crash-critical state — `HardState` (term + vote) and the log —
 //! through the [`Storage`] trait, and the safety proof requires it to be durable **before**
 //! the node acts on it (vote before replying `RequestVote`, entry before replying
