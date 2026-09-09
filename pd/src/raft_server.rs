@@ -21,6 +21,7 @@ use arcux_rpc::pd::pd_service_server::{PdService, PdServiceServer};
 use arcux_rpc::pd::{
     GetRegionRequest, GetRegionResponse, GetTimestampRequest, GetTimestampResponse,
     HeartbeatRequest, HeartbeatResponse, ListRegionsRequest, ListRegionsResponse,
+    ListTablesRequest, ListTablesResponse,
 };
 use arcux_rpc::raft::raft_service_server::{RaftService, RaftServiceServer};
 use arcux_rpc::raft::{
@@ -29,7 +30,10 @@ use arcux_rpc::raft::{
 };
 
 use crate::cluster::now_ms;
-use crate::convert::{from_proto, placed_to_proto, to_proto};
+use crate::convert::{
+    list_tables_response, placed_to_proto, replica_set_from_proto, replica_set_to_proto,
+    table_decl_from_proto,
+};
 use crate::raft_group::{self, PdGroup, PdGroupOptions};
 
 /// The `PdService` handler for a replicated node. Clones share the same [`PdGroup`].
@@ -93,13 +97,27 @@ impl PdService for ReplicatedPdApi {
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let req = request.into_inner();
-        let reported = req.regions.iter().map(from_proto).collect();
-        match self.group.heartbeat(req.node_id, req.address, reported, now_ms()).await {
-            Some(assigned) => {
-                Ok(Response::new(HeartbeatResponse { regions: assigned.iter().map(to_proto).collect() }))
-            }
+        let reported = req.regions.iter().map(replica_set_from_proto).collect();
+        let tables = req.tables.iter().map(table_decl_from_proto).collect();
+        match self.group.heartbeat(req.node_id, req.address, reported, tables, now_ms()).await {
+            Some(assigned) => Ok(Response::new(HeartbeatResponse {
+                regions: assigned.iter().map(replica_set_to_proto).collect(),
+            })),
             None => Err(self.redirect()),
         }
+    }
+
+    /// The cluster-wide catalog PD has heard, plus any table two nodes describe differently.
+    /// Leader-served like the other reads, so the view reflects the committed log.
+    async fn list_tables(
+        &self,
+        _request: Request<ListTablesRequest>,
+    ) -> Result<Response<ListTablesResponse>, Status> {
+        if !self.group.is_leader() {
+            return Err(self.redirect());
+        }
+        let fsm = self.group.fsm();
+        Ok(Response::new(list_tables_response(fsm.tables(), fsm.table_conflicts())))
     }
 
     async fn list_regions(
@@ -186,12 +204,14 @@ where
     let interval = fd_interval_ms.max(1);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(interval));
+        let mut logged_conflicts: Vec<String> = Vec::new();
         loop {
             tick.tick().await;
             if sweeper.is_leader() {
                 for id in sweeper.fsm().members().sweep(now_ms(), fd_timeout_ms) {
                     eprintln!("[pd raft] leader: node {id} marked down (no heartbeat in {fd_timeout_ms}ms)");
                 }
+                crate::server::warn_on_conflicts(sweeper.fsm().members(), &mut logged_conflicts);
             }
         }
     });
@@ -205,13 +225,21 @@ where
 
 /// Build a PD Raft group for `node_id` in the `addrs` topology and start it. The returned handle
 /// drives replication; pair it with [`serve_on`] to expose the services.
-pub fn start_group(node_id: u64, addrs: std::collections::HashMap<u64, String>) -> PdGroup {
+/// Start a PD replica whose Raft log lives under `data_dir`. The log is durable, so the
+/// committed TSO high-water and placement survive a full-cluster restart — without which a new
+/// leader could reissue a timestamp a previous one already served.
+pub fn start_group(
+    node_id: u64,
+    addrs: std::collections::HashMap<u64, String>,
+    data_dir: impl AsRef<std::path::Path>,
+) -> std::io::Result<PdGroup> {
     let voters: Vec<u64> = {
         let mut v: Vec<u64> = addrs.keys().copied().collect();
         v.sort_unstable();
         v
     };
-    raft_group::start(PdGroupOptions { id: node_id, voters, addrs })
+    let storage = arcux_raft_wal::WalStorage::open(data_dir.as_ref().join("raft"))?;
+    Ok(raft_group::start(PdGroupOptions { id: node_id, voters, addrs, storage }))
 }
 
 /// Default failure-detector timing for a replicated PD (mirrors the single-process server).
@@ -224,10 +252,16 @@ pub async fn serve(
     node_id: u64,
     addrs: std::collections::HashMap<u64, String>,
     listen: std::net::SocketAddr,
+    data_dir: impl AsRef<std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let group = start_group(node_id, addrs);
+    let data_dir = data_dir.as_ref();
+    let group = start_group(node_id, addrs, data_dir)?;
     let listener = TcpListener::bind(listen).await?;
-    eprintln!("arcux-pd (replicated) node {node_id} listening on {}", listener.local_addr()?);
+    eprintln!(
+        "arcux-pd (replicated) node {node_id} listening on {} (data {})",
+        listener.local_addr()?,
+        data_dir.display()
+    );
     let shutdown = async move {
         let _ = tokio::signal::ctrl_c().await;
         eprintln!("arcux-pd node {node_id} shutting down");

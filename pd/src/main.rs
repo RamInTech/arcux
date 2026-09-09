@@ -19,7 +19,7 @@ const PD_BASE_PORT: u16 = 2379;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut data_dir = String::from("./arcux-pd-data");
+    let mut data_dir: Option<String> = None;
     let mut listen: Option<String> = None;
     let mut node_id: Option<u64> = None;
     let mut cluster: Option<u64> = None;
@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--data" | "-d" => data_dir = args.next().ok_or("--data requires a directory")?,
+            "--data" | "-d" => data_dir = Some(args.next().ok_or("--data requires a directory")?),
             "--listen" | "-l" => listen = Some(args.next().ok_or("--listen requires an addr:port")?),
             "--node-id" | "-n" => {
                 node_id = Some(args.next().ok_or("--node-id requires an id")?.parse()?)
@@ -53,11 +53,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if cluster.is_some() || node_id.is_some() || !peers.is_empty() {
         let id = node_id.ok_or("replicated mode needs --node-id / -n")?;
         let (addrs, bind) = topology(id, cluster, listen, peers)?;
-        return arcux_pd::raft_server::serve(id, addrs, bind).await;
+        // Per-node by default, so `-c N` on one host doesn't have three replicas sharing a log.
+        let data_dir = data_dir.unwrap_or_else(|| format!("./arcux-pd-n{id}"));
+        std::fs::create_dir_all(&data_dir)?;
+        return arcux_pd::raft_server::serve(id, addrs, bind, &data_dir).await;
     }
 
     // Single-process mode (Phase 3).
     let listen = listen.unwrap_or_else(|| format!("127.0.0.1:{PD_BASE_PORT}"));
+    let data_dir = data_dir.unwrap_or_else(|| String::from("./arcux-pd-data"));
     std::fs::create_dir_all(&data_dir)?;
     let addr: SocketAddr = listen.parse()?;
     arcux_pd::server::serve(data_dir, addr).await
@@ -115,7 +119,9 @@ Replicated 3-node group (PD-on-Raft):
   arcux-pd -n <id> --listen <addr> --peer <id>=<addr> ...   # explicit topology
 
 Flags:
-  -d, --data <dir>        single-process TSO watermark dir (default ./arcux-pd-data)
+  -d, --data <dir>        data directory: the TSO watermark (single-process) or the
+                          Raft log (replicated). Default ./arcux-pd-data, or
+                          ./arcux-pd-n<id> in replicated mode
   -l, --listen <addr>     serving address (host:port)
   -n, --node-id <id>      this node's id (required for replicated mode)
   -c, --cluster <N>       derive a localhost N-node topology

@@ -25,10 +25,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arcux_raft::{Config, EntryType, MemStorage, Message, ProposeError, RaftNode};
+use arcux_raft::{Config, EntryType, MemStorage, Message, ProposeError, RaftNode, Storage};
 
 use crate::persist::{get_bytes, get_u32, get_u64, put_bytes};
-use crate::{Membership, PlacedRegion, Region};
+use crate::cluster::{regime_of, regime_tag};
+use crate::{Membership, PlacedRegion, Regime, Region, ReplicaSet, TableConflict};
 
 /// How far ahead of the current need a `ReserveTs` raises the high-water. Larger ⇒ fewer Raft
 /// round-trips on the timestamp path, at the cost of more timestamps skipped on a failover
@@ -47,7 +48,14 @@ pub enum PdCmd {
     /// Record a data node's heartbeat: its serving `address`, the `regions` it owns, and the
     /// wall-clock `now` (ms, for liveness). Applied via [`Membership::heartbeat`] on every
     /// replica, giving one shared placement + liveness view.
-    Heartbeat { node_id: u64, address: String, regions: Vec<Region>, now: u64 },
+    Heartbeat {
+        node_id: u64,
+        address: String,
+        regions: Vec<ReplicaSet>,
+        /// The tables this node has declared, so PD holds the cluster-wide catalog view.
+        tables: Vec<(String, Regime)>,
+        now: u64,
+    },
 }
 
 impl PdCmd {
@@ -61,14 +69,19 @@ impl PdCmd {
                 out.push(1);
                 out.extend_from_slice(&upper.to_be_bytes());
             }
-            PdCmd::Heartbeat { node_id, address, regions, now } => {
+            PdCmd::Heartbeat { node_id, address, regions, tables, now } => {
                 out.push(2);
                 out.extend_from_slice(&node_id.to_be_bytes());
                 out.extend_from_slice(&now.to_be_bytes());
                 put_bytes(&mut out, address.as_bytes());
                 out.extend_from_slice(&(regions.len() as u32).to_be_bytes());
-                for r in regions {
-                    put_region(&mut out, r);
+                for rs in regions {
+                    put_replica_set(&mut out, rs);
+                }
+                out.extend_from_slice(&(tables.len() as u32).to_be_bytes());
+                for (name, regime) in tables {
+                    put_bytes(&mut out, name.as_bytes());
+                    out.push(regime_tag(*regime));
                 }
             }
         }
@@ -89,9 +102,17 @@ impl PdCmd {
                 let n = get_u32(bytes, &mut pos)? as usize;
                 let mut regions = Vec::with_capacity(n);
                 for _ in 0..n {
-                    regions.push(get_region(bytes, &mut pos)?);
+                    regions.push(get_replica_set(bytes, &mut pos)?);
                 }
-                Some(PdCmd::Heartbeat { node_id, address, regions, now })
+                let t = get_u32(bytes, &mut pos)? as usize;
+                let mut tables = Vec::with_capacity(t);
+                for _ in 0..t {
+                    let name = String::from_utf8(get_bytes(bytes, &mut pos)?.to_vec()).ok()?;
+                    let regime = regime_of(*bytes.get(pos)?)?;
+                    pos += 1;
+                    tables.push((name, regime));
+                }
+                Some(PdCmd::Heartbeat { node_id, address, regions, tables, now })
             }
             _ => None,
         }
@@ -124,8 +145,8 @@ impl PdFsm {
             PdCmd::ReserveTs { upper } => {
                 self.tso_upper.fetch_max(upper, Ordering::SeqCst);
             }
-            PdCmd::Heartbeat { node_id, address, regions, now } => {
-                self.members.heartbeat(node_id, address, regions, now);
+            PdCmd::Heartbeat { node_id, address, regions, tables, now } => {
+                self.members.heartbeat(node_id, address, regions, tables, now);
             }
         }
     }
@@ -133,6 +154,42 @@ impl PdFsm {
     /// The committed TSO high-water — an upper bound on every timestamp handed out so far.
     pub fn tso_upper(&self) -> u64 {
         self.tso_upper.load(Ordering::SeqCst)
+    }
+
+    /// The cluster-wide catalog — every table any node has declared, name-sorted.
+    pub fn tables(&self) -> Vec<(String, Regime)> {
+        self.members.tables()
+    }
+
+    /// Tables two nodes describe with different regimes: a misconfigured cluster.
+    pub fn table_conflicts(&self) -> Vec<TableConflict> {
+        self.members.table_conflicts()
+    }
+
+    /// Serialize the whole applied state, for a Raft snapshot at the compaction point.
+    ///
+    /// `tso_upper` is the field that **must** be exact: it is what stops a new leader reissuing
+    /// a timestamp a previous leader already served, so losing it is a Snapshot Isolation
+    /// violation. Membership is included for completeness — it would self-heal from the next
+    /// round of heartbeats, but a snapshot that quietly omits state is a trap for later.
+    pub fn snapshot(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.tso_upper().to_be_bytes());
+        self.members.encode_into(&mut out);
+        out
+    }
+
+    /// Adopt a snapshot's state, replacing what this replica had — used when a follower that
+    /// fell behind the leader's log installs one. `fetch_max` on the watermark keeps it
+    /// monotonic even against an older snapshot arriving late.
+    pub fn restore(&self, bytes: &[u8]) -> bool {
+        if bytes.len() < 8 {
+            return false;
+        }
+        let upper = u64::from_be_bytes(bytes[..8].try_into().expect("8 bytes"));
+        let Some(()) = self.members.decode_from(&bytes[8..]) else { return false };
+        self.tso_upper.fetch_max(upper, Ordering::SeqCst);
+        true
     }
 
     /// Route a key to its owning region + node (leader-served in a running cluster).
@@ -147,8 +204,13 @@ impl PdFsm {
 
     /// The regions currently assigned to `node_id` — what the leader echoes back in a
     /// heartbeat response once the heartbeat has committed.
-    pub fn regions_of(&self, node_id: u64) -> Vec<Region> {
-        self.members.list().into_iter().filter(|p| p.node_id == node_id).map(|p| p.region).collect()
+    pub fn regions_of(&self, node_id: u64) -> Vec<ReplicaSet> {
+        self.members
+            .list()
+            .into_iter()
+            .filter(|p| p.node_id == node_id)
+            .map(|p| ReplicaSet { region: p.region, regime: p.regime, voters: p.voters })
+            .collect()
     }
 
     /// The underlying membership registry (for the failure-detector sweep + introspection).
@@ -174,26 +236,58 @@ pub struct Ready {
 /// caller ([`tick`](Self::tick)s, [`step`](Self::step)s, and routes [`ready`](Self::ready)'s
 /// outbound messages) — so it runs identically under the deterministic test harness and, later,
 /// over gRPC.
-pub struct PdReplica {
-    node: RaftNode<MemStorage>,
+/// How far the log may run past the last snapshot before this replica compacts. Mirrors the
+/// region groups' threshold (`server/src/raft_group.rs`); PD's state is small, so a snapshot is
+/// cheap and there is no reason to let the log grow.
+const COMPACT_THRESHOLD: u64 = 64;
+
+/// Generic over its [`Storage`] so the deterministic harness keeps running in memory (real
+/// fsyncs would make `pd/tests/raft_pd.rs` slow and less deterministic, which is the whole point
+/// of that harness) while a real node runs on a durable log.
+pub struct PdReplica<S: Storage = MemStorage> {
+    node: RaftNode<S>,
     fsm: Arc<PdFsm>,
     /// The next timestamp this node may hand out locally (leader only). Kept `<= fsm.tso_upper`;
     /// reset to the committed high-water whenever this node wins leadership, so it starts
     /// strictly above every timestamp any prior leader could have issued.
     served: u64,
     was_leader: bool,
+    /// Index of the no-op appended on winning leadership. While set, this replica has won but
+    /// has not yet applied its own term's entries, so the TSO cursor reset is still pending.
+    pending_reset: Option<u64>,
 }
 
-impl PdReplica {
+impl PdReplica<MemStorage> {
     /// A replica of the `voters` group with the given `id`, starting as a follower with empty
-    /// state (rebuilt from the committed log).
-    pub fn new(id: u64, voters: Vec<u64>) -> PdReplica {
-        PdReplica {
-            node: RaftNode::new(Config::new(id, voters), MemStorage::new()),
-            fsm: Arc::new(PdFsm::new()),
-            served: 0,
-            was_leader: false,
-        }
+    /// state (rebuilt from the committed log). **In-memory** — for the deterministic tests; a
+    /// real node wants [`with_storage`](PdReplica::with_storage) so its state survives a restart.
+    pub fn new(id: u64, voters: Vec<u64>) -> PdReplica<MemStorage> {
+        PdReplica::with_storage(id, voters, MemStorage::new())
+    }
+}
+
+impl<S: Storage> PdReplica<S> {
+    /// A replica backed by `storage`. With a durable one, the committed TSO high-water and
+    /// placement survive a full-cluster restart — which the replicated **catalog** will depend
+    /// on, since unlike placement it is not rebuilt by the next round of heartbeats.
+    pub fn with_storage(id: u64, voters: Vec<u64>, storage: S) -> PdReplica<S> {
+        let node = RaftNode::new(Config::new(id, voters), storage);
+        let fsm = Arc::new(PdFsm::new());
+        // Rebuild the applied state from whatever the log/snapshot already held.
+        let mut replica = PdReplica { node, fsm, served: 0, was_leader: false, pending_reset: None };
+        replica.recover();
+        replica
+    }
+
+    /// Seed the FSM from a snapshot durable storage already holds. Only the snapshot — the log
+    /// entries above it replay through the normal [`ready`](Self::ready) path once this node
+    /// learns the commit index again (a restarted node's commit index starts at 0 and is
+    /// re-established by an election or the leader). The snapshot has no such path: its entries
+    /// were compacted away, so nothing will ever re-deliver them.
+    fn recover(&mut self) {
+        let Some(snap) = self.node.storage().snapshot() else { return };
+        self.fsm.restore(&snap.data);
+        self.served = self.fsm.tso_upper();
     }
 
     pub fn id(&self) -> u64 {
@@ -227,6 +321,12 @@ impl PdReplica {
 
     /// Propose a command (leader only); the returned index commits once a majority persists it.
     /// `Err(NotLeader)` if this node isn't the leader.
+    /// The first index the log still holds — `snapshot index + 1`, so it advances past 1 once
+    /// this replica has compacted.
+    pub fn first_index(&self) -> u64 {
+        self.node.first_index()
+    }
+
     pub fn propose(&mut self, cmd: &PdCmd) -> Result<u64, ProposeError> {
         self.node.propose(cmd.encode())
     }
@@ -237,20 +337,24 @@ impl PdReplica {
     /// [`propose`](Self::propose).
     pub fn ready(&mut self) -> Ready {
         // On winning an election, append a no-op so prior-term committed entries advance to the
-        // commit point (the Figure-8 current-term rule) and reset the volatile TSO cursor to the
-        // committed high-water — from here this leader hands out only timestamps strictly above
-        // everything any prior leader reserved.
+        // commit point (the Figure-8 current-term rule). The TSO cursor is reset to the committed
+        // high-water too, but *not here* — see `pending_reset` below.
         let leader_now = self.node.is_leader();
         if leader_now && !self.was_leader {
-            let _ = self.node.propose(Vec::new());
-            self.served = self.fsm.tso_upper();
+            self.pending_reset = self.node.propose(Vec::new()).ok();
+        }
+        if !leader_now {
+            self.pending_reset = None; // lost the election race; a later win re-arms it
         }
         self.was_leader = leader_now;
 
-        // Compaction is never requested by this driver yet, so `take_snapshot` cannot fire here
-        // (a snapshot only arrives after a peer compacts). Drained defensively to keep the
-        // "snapshot supersedes the log" invariant explicit for the transport slice.
-        debug_assert!(self.node.take_snapshot().is_none(), "no compaction in the core slice");
+        // A snapshot installed by the leader supersedes this replica's log, so adopt its state
+        // before applying anything above it (this fires when a follower fell far enough behind
+        // that the leader had already compacted the entries it needed).
+        if let Some((_index, data)) = self.node.take_snapshot() {
+            self.fsm.restore(&data);
+            self.served = self.served.max(self.fsm.tso_upper());
+        }
 
         let mut committed = Vec::new();
         for e in self.node.take_committed() {
@@ -261,6 +365,30 @@ impl PdReplica {
                 self.fsm.apply(&e.data);
             }
         }
+
+        // Now that this term's entries are applied, jump the TSO cursor to the committed
+        // high-water, so this leader hands out only timestamps strictly above everything any
+        // prior leader reserved (its unused tail is discarded).
+        //
+        // Deferred until the no-op commits rather than done on the win itself: with a durable
+        // log, a restarted node's replayed entries have not been applied at the moment it wins,
+        // so `tso_upper` still reads 0 there and the cursor would be reset *below* timestamps
+        // this node already served before the restart — reissuing them. Invisible on
+        // `MemStorage`, where a restart leaves nothing to replay.
+        if let Some(idx) = self.pending_reset {
+            if self.node.last_applied() >= idx {
+                self.served = self.fsm.tso_upper();
+                self.pending_reset = None;
+            }
+        }
+
+        // Bound the log: without this a durable log grows forever and a restart replays all of
+        // it. Same blunt length trigger the region groups use (`server/src/raft_group.rs`); a
+        // size-/time-based policy is a tracked deferral there and here.
+        if self.node.last_applied() + 1 >= self.node.first_index() + COMPACT_THRESHOLD {
+            self.node.compact(self.node.last_applied(), self.fsm.snapshot());
+        }
+
         Ready { messages: self.node.take_messages(), committed }
     }
 
@@ -294,19 +422,30 @@ impl PdReplica {
 
 // --- Region wire codec (length-prefixed, matching `region.rs`'s on-disk shape) ---
 
-fn put_region(out: &mut Vec<u8>, r: &Region) {
-    out.extend_from_slice(&r.id.to_be_bytes());
-    out.extend_from_slice(&r.epoch.to_be_bytes());
-    put_bytes(out, &r.start);
-    put_bytes(out, &r.end);
+fn put_replica_set(out: &mut Vec<u8>, rs: &ReplicaSet) {
+    out.extend_from_slice(&rs.region.id.to_be_bytes());
+    out.extend_from_slice(&rs.region.epoch.to_be_bytes());
+    put_bytes(out, &rs.region.start);
+    put_bytes(out, &rs.region.end);
+    out.push(regime_tag(rs.regime));
+    out.extend_from_slice(&(rs.voters.len() as u32).to_be_bytes());
+    for v in &rs.voters {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
 }
 
-fn get_region(buf: &[u8], pos: &mut usize) -> Option<Region> {
+fn get_replica_set(buf: &[u8], pos: &mut usize) -> Option<ReplicaSet> {
     let id = get_u64(buf, pos)?;
     let epoch = get_u64(buf, pos)?;
     let start = get_bytes(buf, pos)?.to_vec();
     let end = get_bytes(buf, pos)?.to_vec();
-    Some(Region { id, start, end, epoch })
+    let regime = regime_of(*buf.get(*pos)?)?;
+    *pos += 1;
+    let mut voters = Vec::new();
+    for _ in 0..get_u32(buf, pos)? {
+        voters.push(get_u64(buf, pos)?);
+    }
+    Some(ReplicaSet { region: Region { id, start, end, epoch }, regime, voters })
 }
 
 #[cfg(test)]
@@ -317,6 +456,139 @@ mod tests {
         Region { id, start: start.to_vec(), end: end.to_vec(), epoch }
     }
 
+    /// Drive a single-node replica until it wins its own election.
+    fn elect<S: Storage>(r: &mut PdReplica<S>) {
+        for _ in 0..40 {
+            r.tick();
+            let _ = r.ready();
+            if r.is_leader() {
+                return;
+            }
+        }
+        panic!("single-node replica never became leader");
+    }
+
+    #[test]
+    fn fsm_snapshot_round_trips_watermark_and_membership() {
+        let a = PdFsm::new();
+        a.apply(&PdCmd::ReserveTs { upper: 4242 }.encode());
+        a.apply(
+            &PdCmd::Heartbeat {
+                node_id: 7,
+                address: "http://n7".into(),
+                regions: vec![region(1, b"", b"m", 3), region(2, b"m", b"", 3)]
+                    .into_iter()
+                    .map(ReplicaSet::bare)
+                    .collect(),
+                tables: vec![],
+                now: 1_000,
+            }
+            .encode(),
+        );
+
+        let b = PdFsm::new();
+        assert!(b.restore(&a.snapshot()));
+        assert_eq!(b.tso_upper(), 4242);
+        assert_eq!(b.list().len(), 2, "placement survives the snapshot");
+        assert_eq!(b.route(b"z").map(|p| p.node_id), Some(7));
+    }
+
+    #[test]
+    fn restore_never_regresses_the_watermark() {
+        // An older snapshot arriving late must not walk the high-water backwards — that is what
+        // stops a leader reissuing a timestamp it already served.
+        let fsm = PdFsm::new();
+        fsm.apply(&PdCmd::ReserveTs { upper: 9_000 }.encode());
+
+        let older = PdFsm::new();
+        older.apply(&PdCmd::ReserveTs { upper: 100 }.encode());
+        assert!(fsm.restore(&older.snapshot()));
+        assert_eq!(fsm.tso_upper(), 9_000);
+    }
+
+    #[test]
+    fn a_truncated_snapshot_is_rejected_rather_than_half_applied() {
+        let fsm = PdFsm::new();
+        fsm.apply(&PdCmd::ReserveTs { upper: 500 }.encode());
+        assert!(!fsm.restore(&[]));
+        assert!(!fsm.restore(&[0u8; 4]));
+        assert_eq!(fsm.tso_upper(), 500, "a bad image leaves the state untouched");
+    }
+
+    #[test]
+    fn the_committed_watermark_survives_a_restart() {
+        // The reason PD needs a durable log: on MemStorage this replica came back at zero and a
+        // new leader could reissue a timestamp a previous one had already handed out.
+        let dir = tempfile::tempdir().unwrap();
+        let issued;
+        let reserved;
+        {
+            let storage = arcux_raft_wal::WalStorage::open(dir.path()).unwrap();
+            let mut r = PdReplica::with_storage(1, vec![1], storage);
+            elect(&mut r);
+            let cmd = r.reserve_ts_cmd(10);
+            r.propose(&cmd).unwrap();
+            let _ = r.ready();
+            reserved = r.fsm().tso_upper();
+            issued = r.hand_out(5).expect("window reserved");
+            assert!(reserved >= 10);
+        }
+
+        let storage = arcux_raft_wal::WalStorage::open(dir.path()).unwrap();
+        let mut r = PdReplica::with_storage(1, vec![1], storage);
+        elect(&mut r);
+        assert_eq!(r.fsm().tso_upper(), reserved, "the reserved high-water survived");
+        assert!(
+            r.hand_out(1).map(|ts| ts >= issued + 5).unwrap_or(true),
+            "a restarted leader never reissues a timestamp it already served"
+        );
+    }
+
+    #[test]
+    fn the_log_is_compacted_and_its_snapshot_carries_the_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let reserved;
+        {
+            let storage = arcux_raft_wal::WalStorage::open(dir.path()).unwrap();
+            let mut r = PdReplica::with_storage(1, vec![1], storage);
+            elect(&mut r);
+
+            let hb = PdCmd::Heartbeat {
+                node_id: 7,
+                address: "http://n7".into(),
+                regions: vec![region(1, b"", b"", 1)]
+                    .into_iter()
+                    .map(ReplicaSet::bare)
+                    .collect(),
+                tables: vec![],
+                now: 1_000,
+            };
+            r.propose(&hb).unwrap();
+            let _ = r.ready();
+
+            // Enough reservations to cross COMPACT_THRESHOLD.
+            for _ in 0..(COMPACT_THRESHOLD + 8) {
+                let cmd = r.reserve_ts_cmd(4);
+                r.propose(&cmd).unwrap();
+                let _ = r.ready();
+            }
+            reserved = r.fsm().tso_upper();
+            assert!(r.first_index() > 1, "the log was compacted, not grown without bound");
+        }
+
+        // Reopened: the entries below the compaction point are gone from the log, so whatever
+        // state is present before this replica applies anything came from the snapshot.
+        let storage = arcux_raft_wal::WalStorage::open(dir.path()).unwrap();
+        let mut r = PdReplica::with_storage(1, vec![1], storage);
+        let from_snapshot = r.fsm().tso_upper();
+        assert!(from_snapshot > 0, "the snapshot alone seeded the watermark");
+        assert_eq!(r.fsm().route(b"k").map(|p| p.node_id), Some(7), "and the placement view");
+
+        // The tail above the snapshot replays once the node re-learns its commit index.
+        elect(&mut r);
+        assert_eq!(r.fsm().tso_upper(), reserved, "snapshot plus tail restores the full state");
+    }
+
     #[test]
     fn cmd_round_trips() {
         let cmds = vec![
@@ -324,10 +596,35 @@ mod tests {
             PdCmd::Heartbeat {
                 node_id: 7,
                 address: "http://127.0.0.1:50051".into(),
-                regions: vec![region(1, b"", b"m", 2), region(9, b"m", b"", 2)],
+                regions: vec![region(1, b"", b"m", 2), region(9, b"m", b"", 2)]
+                    .into_iter()
+                    .map(ReplicaSet::bare)
+                    .collect(),
+                tables: vec![],
                 now: 123_456,
             },
-            PdCmd::Heartbeat { node_id: 3, address: String::new(), regions: vec![], now: 0 },
+            PdCmd::Heartbeat {
+                node_id: 3,
+                address: String::new(),
+                regions: vec![],
+                tables: vec![],
+                now: 0,
+            },
+            // The v14 shape: a regime, a replica set, and declared tables all on the wire.
+            PdCmd::Heartbeat {
+                node_id: 4,
+                address: "http://n4".into(),
+                regions: vec![ReplicaSet {
+                    region: region(2, b"a", b"z", 7),
+                    regime: Regime::Ap,
+                    voters: vec![4, 5, 6],
+                }],
+                tables: vec![
+                    ("events".to_string(), Regime::Ap),
+                    ("ledger".to_string(), Regime::Cp),
+                ],
+                now: 99,
+            },
         ];
         for c in cmds {
             assert_eq!(PdCmd::decode(&c.encode()), Some(c));
@@ -350,7 +647,11 @@ mod tests {
             &PdCmd::Heartbeat {
                 node_id: 7,
                 address: "http://a".into(),
-                regions: vec![region(1, b"", b"", 1)],
+                regions: vec![region(1, b"", b"", 1)]
+                    .into_iter()
+                    .map(ReplicaSet::bare)
+                    .collect(),
+                tables: vec![],
                 now: 100,
             }
             .encode(),

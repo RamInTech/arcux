@@ -21,7 +21,8 @@ use arcux_rpc::raft::raft_service_client::RaftServiceClient;
 use tonic::transport::Channel;
 
 use crate::raft_wire as xport;
-use crate::{PdCmd, PdFsm, PdReplica, Region};
+use crate::{PdCmd, PdFsm, PdReplica, Regime, ReplicaSet};
+use arcux_raft_wal::WalStorage;
 
 /// Logical tick period. Election timeout is ~10–20 ticks (see [`Config`]), so at 50 ms/tick a
 /// dead leader is replaced in well under a second.
@@ -39,9 +40,10 @@ enum Cmd {
     Heartbeat {
         node_id: u64,
         address: String,
-        regions: Vec<Region>,
+        regions: Vec<ReplicaSet>,
+        tables: Vec<(String, Regime)>,
         now: u64,
-        reply: tokio::sync::oneshot::Sender<Option<Vec<Region>>>,
+        reply: tokio::sync::oneshot::Sender<Option<Vec<ReplicaSet>>>,
     },
     /// Allocate `count` timestamps (`None` if not the leader). Served from the reserved window,
     /// reserving a fresh one through Raft first if exhausted.
@@ -51,7 +53,7 @@ enum Cmd {
 
 /// A parked heartbeat proposal: the node whose assignment to return, and where to send it once
 /// the entry commits.
-type PendingHeartbeat = (u64, tokio::sync::oneshot::Sender<Option<Vec<Region>>>);
+type PendingHeartbeat = (u64, tokio::sync::oneshot::Sender<Option<Vec<ReplicaSet>>>);
 /// A parked timestamp allocation: the count requested, and where to send `(first, count)` once
 /// the reservation commits.
 type PendingAllocTs = (u64, tokio::sync::oneshot::Sender<Option<(u64, u64)>>);
@@ -84,6 +86,9 @@ pub struct PdGroupOptions {
     /// Every voter's serving address (including this node's own), used for peer RPCs and the
     /// leader-redirect hint.
     pub addrs: HashMap<u64, String>,
+    /// This replica's durable Raft log. Opened by the caller (mirroring the region groups'
+    /// `GroupOptions`), so a failure to open surfaces at startup rather than inside the actor.
+    pub storage: WalStorage,
 }
 
 impl PdGroup {
@@ -112,11 +117,12 @@ impl PdGroup {
         &self,
         node_id: u64,
         address: String,
-        regions: Vec<Region>,
+        regions: Vec<ReplicaSet>,
+        tables: Vec<(String, Regime)>,
         now: u64,
-    ) -> Option<Vec<Region>> {
+    ) -> Option<Vec<ReplicaSet>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = Cmd::Heartbeat { node_id, address, regions, now, reply: tx };
+        let cmd = Cmd::Heartbeat { node_id, address, regions, tables, now, reply: tx };
         if self.cmd_tx.send(cmd).is_err() {
             return None;
         }
@@ -185,7 +191,7 @@ pub fn start(opts: PdGroupOptions) -> PdGroup {
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
     let obs = Arc::new(Mutex::new(Observable { role: Role::Follower, leader_id: None }));
 
-    let replica = PdReplica::new(opts.id, opts.voters.clone());
+    let replica = PdReplica::with_storage(opts.id, opts.voters.clone(), opts.storage);
     let fsm = replica.fsm().clone();
 
     // Lazy clients for each peer (connect_lazy does no I/O until first call).
@@ -232,7 +238,7 @@ pub fn start(opts: PdGroupOptions) -> PdGroup {
 /// The actor loop: own the replica, process one command at a time, drain its effects, resolve
 /// any proposals that just committed, and publish observable state.
 fn run_actor(
-    mut replica: PdReplica,
+    mut replica: PdReplica<WalStorage>,
     self_id: u64,
     cmd_rx: smpsc::Receiver<Cmd>,
     out_tx: tokio::sync::mpsc::UnboundedSender<Message>,
@@ -254,11 +260,11 @@ fn run_actor(
                 replica.step(m);
                 reply = Some((from, tx));
             }
-            Cmd::Heartbeat { node_id, address, regions, now, reply: tx } => {
+            Cmd::Heartbeat { node_id, address, regions, tables, now, reply: tx } => {
                 if !replica.is_leader() {
                     let _ = tx.send(None);
                 } else {
-                    let cmd = PdCmd::Heartbeat { node_id, address, regions, now };
+                    let cmd = PdCmd::Heartbeat { node_id, address, regions, tables, now };
                     match replica.propose(&cmd) {
                         Ok(index) => {
                             pending_hb.insert(index, (node_id, tx));
@@ -349,7 +355,7 @@ fn run_actor(
     }
 }
 
-fn role_of(replica: &PdReplica) -> Role {
+fn role_of(replica: &PdReplica<WalStorage>) -> Role {
     if replica.is_leader() {
         Role::Leader
     } else {

@@ -84,11 +84,13 @@ where
     let interval = pd.fd_interval_ms;
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(interval));
+        let mut logged_conflicts: Vec<String> = Vec::new();
         loop {
             tick.tick().await;
             for id in members.sweep(now_ms(), timeout) {
                 eprintln!("pd: node {id} marked down (no heartbeat within {timeout}ms)");
             }
+            warn_on_conflicts(&members, &mut logged_conflicts);
         }
     });
 
@@ -113,4 +115,39 @@ pub async fn serve(
     })
     .await?;
     Ok(())
+}
+
+/// Log table declarations the cluster disagrees about, once per change rather than every
+/// sweep. Without this the conflict is only visible to a caller who thinks to ask
+/// `ListTables`, and the whole point is that nobody knows to look — the nodes tile and route
+/// the same keys differently with no other symptom.
+pub(crate) fn warn_on_conflicts(members: &Membership, logged: &mut Vec<String>) {
+    let conflicts = members.table_conflicts();
+    let names: Vec<String> = conflicts.iter().map(|c| c.name.clone()).collect();
+    if names == *logged {
+        return;
+    }
+    for c in &conflicts {
+        // Regimes spelled as `--table` spells them, so the message names the fix directly.
+        eprintln!(
+            "pd: nodes disagree about table {:?} — node {} declared {}={}, node {} declared \
+             {}={}. They will tile and route its keys differently; fix the --table flags and \
+             restart them",
+            c.name,
+            c.node_id,
+            c.name,
+            regime_flag(c.regime),
+            c.other_node_id,
+            c.name,
+            regime_flag(c.other_regime)
+        );
+    }
+    *logged = names;
+}
+
+fn regime_flag(regime: crate::Regime) -> &'static str {
+    match regime {
+        crate::Regime::Ap => "ap",
+        crate::Regime::Cp => "cp",
+    }
 }

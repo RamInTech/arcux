@@ -9,10 +9,14 @@ use arcux_rpc::pd::pd_service_server::PdService;
 use arcux_rpc::pd::{
     GetRegionRequest, GetRegionResponse, GetTimestampRequest, GetTimestampResponse,
     HeartbeatRequest, HeartbeatResponse, ListRegionsRequest, ListRegionsResponse,
+    ListTablesRequest, ListTablesResponse,
 };
 
 use crate::cluster::now_ms;
-use crate::convert::{from_proto, placed_to_proto, to_proto};
+use crate::convert::{
+    list_tables_response, placed_to_proto, replica_set_from_proto, replica_set_to_proto,
+    table_decl_from_proto,
+};
 use crate::{Membership, Tso};
 
 /// The PD service handler. Cheap to clone (shares the oracle + membership).
@@ -70,12 +74,24 @@ impl PdService for PdApi {
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let req = request.into_inner();
-        let reported = req.regions.iter().map(from_proto).collect();
+        let reported = req.regions.iter().map(replica_set_from_proto).collect();
+        let tables = req.tables.iter().map(table_decl_from_proto).collect();
         let assigned =
-            self.members.heartbeat(req.node_id, req.address, reported, now_ms());
+            self.members.heartbeat(req.node_id, req.address, reported, tables, now_ms());
         Ok(Response::new(HeartbeatResponse {
-            regions: assigned.iter().map(to_proto).collect(),
+            regions: assigned.iter().map(replica_set_to_proto).collect(),
         }))
+    }
+
+    /// The cluster-wide catalog PD has heard, plus any table two nodes describe differently.
+    async fn list_tables(
+        &self,
+        _request: Request<ListTablesRequest>,
+    ) -> Result<Response<ListTablesResponse>, Status> {
+        Ok(Response::new(list_tables_response(
+            self.members.tables(),
+            self.members.table_conflicts(),
+        )))
     }
 
     /// The whole live region view, tagged with owners (for client routing caches/tooling).
