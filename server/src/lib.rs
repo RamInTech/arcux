@@ -30,6 +30,7 @@ use std::time::Duration;
 use arcux_engine::keys::{decode_data_key, encode_data_key, encode_write_value};
 use arcux_engine::{Cf, Engine, Error, Lock, Mutation, Options, Transaction, TxnStatus, Value, WriteBatch};
 use arcux_pd::{Region, RegionRegistry, Tso};
+use arcux_raft_wal::WalStorage;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Server};
@@ -54,7 +55,6 @@ pub mod raft_group;
 pub mod raft_transport;
 pub mod repair;
 pub mod table_store;
-pub mod wal_storage;
 
 use ap::ApReplication;
 use hlc::Hlc;
@@ -153,6 +153,13 @@ struct PdHandle {
     /// This node's advertised serving endpoint, handed to clients via PD for per-node
     /// routing (e.g. `"http://127.0.0.1:50051"`).
     address: String,
+    /// Whether to **adopt** PD's answer as this node's region table. True for the PD-placed
+    /// path ([`AppState::open_with_pd`]), where PD is the placement authority and a fresh node
+    /// starts empty. **False** for a catalog node: its regions were tiled from its own catalog
+    /// and each one already has a live Raft group or AP registration, so overwriting the
+    /// routing table with PD's view would leave keys routed to regions that were never founded.
+    /// Such a node reports to PD and ignores the reply.
+    adopt_assignment: bool,
 }
 
 /// Default period between liveness heartbeats to PD (PD-connected mode).
@@ -174,7 +181,9 @@ pub struct AppState {
     node_id: u64,
     clock: Arc<dyn TimestampSource>,
     regions: Arc<RegionRegistry>,
-    pd: Option<PdHandle>,
+    /// PD connection, set at most once — either at construction ([`open_with_pd`](Self::open_with_pd))
+    /// or later via [`attach_pd`](Self::attach_pd), which is how a catalog node joins PD.
+    pd: std::sync::OnceLock<PdHandle>,
     /// Period (ms) of the background liveness heartbeat [`serve_on`] runs when
     /// PD-connected. Settable so tests can heartbeat faster than PD's failure-detector
     /// timeout. Ignored in direct mode.
@@ -222,7 +231,7 @@ impl AppState {
             node_id: 1,
             clock: Arc::new(LocalClock::new()),
             regions,
-            pd: None,
+            pd: std::sync::OnceLock::new(),
             hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
             ae_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_ANTI_ENTROPY_MS),
             raft: None,
@@ -248,12 +257,16 @@ impl AppState {
         let engine = Arc::new(Engine::open(opts)?);
         let client = PdServiceClient::connect(pd_endpoint).await?;
         let clock: Arc<dyn TimestampSource> = Arc::new(PdClock::new(client.clone()));
+        // PD is the placement authority on this path: a fresh node starts with no regions and
+        // adopts the set PD assigns it (unlike a catalog node — see `attach_pd`).
+        let pd_handle = std::sync::OnceLock::new();
+        let _ = pd_handle.set(PdHandle { client, node_id, address, adopt_assignment: true });
         let state = Arc::new(AppState {
             engine,
             node_id,
             clock,
             regions,
-            pd: Some(PdHandle { client, node_id, address }),
+            pd: pd_handle,
             hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
             ae_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_ANTI_ENTROPY_MS),
             raft: None,
@@ -292,7 +305,7 @@ impl AppState {
     /// `placements`, each across that region's replica set, multiplexed over the one
     /// `RaftService` transport (an inbound RPC's `group_id` selects the group). All groups
     /// share the node's single engine — regions own disjoint key ranges — with a durable
-    /// [`WalStorage`](wal_storage::WalStorage) log per region under `data_dir/raft/<id>`.
+    /// [`WalStorage`](arcux_raft_wal::WalStorage) log per region under `data_dir/raft/<id>`.
     /// `clock` is shared so `commit_ts` is globally monotonic across leaders. A request
     /// routes by key to its region's group; a non-leader replies `NotLeader`.
     pub fn open_multiraft(
@@ -329,7 +342,7 @@ impl AppState {
         for p in placements {
             match p.regime {
                 Regime::Cp => {
-                    let storage = wal_storage::WalStorage::open(
+                    let storage = WalStorage::open(
                         data_dir.join("raft").join(p.region_id.to_string()),
                     )?;
                     let group = raft_group::start(GroupOptions {
@@ -354,7 +367,7 @@ impl AppState {
             node_id,
             clock,
             regions,
-            pd: None,
+            pd: std::sync::OnceLock::new(),
             hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
             ae_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_ANTI_ENTROPY_MS),
             raft: Some(MultiRaft::new(groups)),
@@ -442,7 +455,7 @@ impl AppState {
             return Ok(g);
         }
         let storage =
-            wal_storage::WalStorage::open(self.engine.options().data_dir.join("raft").join(region_id.to_string()))?;
+            WalStorage::open(self.engine.options().data_dir.join("raft").join(region_id.to_string()))?;
         let group = raft_group::start(GroupOptions {
             group_id: region_id,
             id: self.node_id,
@@ -815,21 +828,87 @@ impl AppState {
     /// node's region set and keeps PD's placement view authoritative. Public so the
     /// background heartbeat loop (and tests) can drive it.
     pub async fn heartbeat(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let Some(pd) = &self.pd else { return Ok(()) };
-        let regions: Vec<pd::Region> =
-            self.regions.list().iter().map(arcux_pd::convert::to_proto).collect();
+        let Some(pd) = self.pd.get() else { return Ok(()) };
+
+        // Report each region with how it is actually served here and the replica set holding
+        // it — PD's `node_id` names one holder, which can't describe a three-voter region.
+        let regions: Vec<pd::Region> = self
+            .regions
+            .list()
+            .iter()
+            .map(|r| {
+                let regime = if self.ap.as_ref().is_some_and(|ap| ap.hosts(r.id)) {
+                    arcux_pd::Regime::Ap
+                } else {
+                    arcux_pd::Regime::Cp
+                };
+                let rs = arcux_pd::ReplicaSet {
+                    region: r.clone(),
+                    regime,
+                    voters: self.voters.clone(),
+                };
+                arcux_pd::convert::replica_set_to_proto(&rs)
+            })
+            .collect();
+
+        let tables: Vec<pd::TableDecl> = self
+            .declared_tables()
+            .iter()
+            .map(|(name, regime)| {
+                let regime = match regime {
+                    Regime::Ap => arcux_pd::Regime::Ap,
+                    Regime::Cp => arcux_pd::Regime::Cp,
+                };
+                arcux_pd::convert::table_decl_to_proto(name, regime)
+            })
+            .collect();
+
         let mut client = pd.client.clone();
         let resp = client
             .heartbeat(pd::HeartbeatRequest {
                 node_id: pd.node_id,
                 regions,
                 address: pd.address.clone(),
+                tables,
             })
             .await?
             .into_inner();
-        let assigned: Vec<Region> = resp.regions.iter().map(arcux_pd::convert::from_proto).collect();
-        self.regions.adopt(assigned)?;
+
+        if pd.adopt_assignment {
+            let assigned: Vec<Region> =
+                resp.regions.iter().map(arcux_pd::convert::from_proto).collect();
+            self.regions.adopt(assigned)?;
+        }
         Ok(())
+    }
+
+    /// Connect a already-open node to PD for **placement reporting only**: it registers, then
+    /// heartbeats its regions and declared tables so PD holds a cluster-wide view and can
+    /// report nodes that disagree about a table's regime.
+    ///
+    /// Deliberately does **not** adopt PD's answer (see [`PdHandle::adopt_assignment`]) and
+    /// deliberately does not change the timestamp source — this node keeps its local clock.
+    /// Both are what make a catalog node safe to attach today; PD driving placement and serving
+    /// timestamps here are separate changes.
+    ///
+    /// Call this **before** [`serve_on`], which decides then whether to run the periodic
+    /// heartbeat task.
+    pub async fn attach_pd(
+        &self,
+        pd_endpoint: String,
+        address: String,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = PdServiceClient::connect(pd_endpoint).await?;
+        let handle = PdHandle {
+            client,
+            node_id: self.node_id,
+            address,
+            adopt_assignment: false,
+        };
+        if self.pd.set(handle).is_err() {
+            return Err("attach_pd: this node is already connected to PD".into());
+        }
+        self.heartbeat().await
     }
 
     /// Validate a request's routing context against this node's authoritative regions.
@@ -1898,7 +1977,7 @@ where
     // also re-adopt our placement). Splits/merges heartbeat inline; this is just liveness.
     // The task is tied to serve_on's lifetime — stopping the node stops its heartbeats, so
     // PD's failure detector can notice.
-    let hb_handle = state.pd.as_ref().map(|_| {
+    let hb_handle = state.pd.get().map(|_| {
         let hb = state.clone();
         tokio::spawn(async move {
             let ms = hb.hb_interval_ms.load(std::sync::atomic::Ordering::Relaxed).max(1);
@@ -2020,6 +2099,11 @@ pub async fn serve_replicated(
 /// (replicated across `voters`), an **AP** table as a leaderless HLC/LWW replica set (fanning
 /// out to `peers`). `node_id` is this node (must be one of `voters`); undeclared key ranges
 /// default to CP (strong-by-default). Bind `addr` and serve until Ctrl-C.
+///
+/// `pd` is an optional `(endpoint, this node's advertised address)` to report to. Reporting
+/// **only** — see [`AppState::attach_pd`]: PD records the cluster-wide catalog and can flag
+/// nodes that disagree about a table's regime, but it neither places this node's regions nor
+/// serves its timestamps.
 pub async fn serve_catalog(
     opts: Options,
     addr: SocketAddr,
@@ -2027,9 +2111,16 @@ pub async fn serve_catalog(
     voters: Vec<u64>,
     peers: HashMap<u64, String>,
     tables: Vec<(String, Regime)>,
+    pd: Option<(String, String)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = open_catalog_node(opts, node_id, voters.clone(), peers, tables)?;
     let listener = TcpListener::bind(addr).await?;
+
+    if let Some((endpoint, address)) = pd {
+        // Before serve_on, which decides then whether to run the periodic heartbeat.
+        state.attach_pd(endpoint.clone(), address).await?;
+        eprintln!("  PD {endpoint}: reporting tables and placement only (timestamps stay node-local)");
+    }
 
     let map = state
         .declared_tables()

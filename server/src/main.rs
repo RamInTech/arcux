@@ -193,9 +193,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // --dynamic-tables enters the same mode with zero initial declarations, so a live
     // `CreateTable` call has a multiraft node to attach new regions to from the very first call.
     if !tables.is_empty() || dynamic_tables || !persisted_tables.is_empty() {
-        if pd.is_some() {
-            return Err("--table/--dynamic-tables (catalog mode) and --pd are mutually exclusive".into());
-        }
         let voters = if voters.is_empty() { vec![node_id] } else { voters };
         if !voters.contains(&node_id) {
             return Err(format!("--node-id {node_id} must be one of the voters {voters:?}").into());
@@ -205,7 +202,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 return Err(format!("missing --peer {v}=<addr> for voter {v}").into());
             }
         }
-        return arcux_server::serve_catalog(opts, addr, node_id, voters, peers, tables).await;
+        // A catalog node may also report to PD. Reporting only: PD records the cluster-wide
+        // catalog and can flag nodes that disagree about a table's regime, but it does not place
+        // this node's regions or serve its timestamps.
+        let pd_report = pd.map(|endpoint| {
+            let advertised = address.clone().unwrap_or_else(|| as_uri(&format!("{addr}")));
+            (endpoint, advertised)
+        });
+        return arcux_server::serve_catalog(opts, addr, node_id, voters, peers, tables, pd_report)
+            .await;
     }
 
     // Mode selection: replicated CP (voters set) ⇒ Raft, else --pd ⇒ PD, else direct.
