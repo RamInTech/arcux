@@ -74,7 +74,12 @@ async fn heartbeat_populates_routing() {
         to_proto(&Region { id: 1, start: vec![], end: b"m".to_vec(), epoch: 2 }),
         to_proto(&Region { id: 2, start: b"m".to_vec(), end: vec![], epoch: 2 }),
     ];
-    c.heartbeat(pd::HeartbeatRequest { node_id: 1, regions, address: "http://node1".into() })
+    c.heartbeat(pd::HeartbeatRequest {
+        node_id: 1,
+        regions,
+        address: "http://node1".into(),
+        tables: vec![],
+    })
         .await
         .unwrap();
 

@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use arcux_pd::{PdCmd, PdReplica, Region};
+use arcux_pd::{PdCmd, PdReplica, Region, ReplicaSet};
 
 /// An in-process bus of PD replicas. Messages are delivered synchronously; a "down" node
 /// receives nothing and its outbound messages are dropped, modelling a crash/partition.
@@ -122,7 +122,8 @@ fn pd_survives_leader_failover_without_losing_placement_or_regressing_tso() {
         &PdCmd::Heartbeat {
             node_id: 7,
             address: "http://node7".into(),
-            regions: vec![region(1, b"", b"m", 1)],
+            regions: vec![ReplicaSet::bare(region(1, b"", b"m", 1))],
+            tables: vec![],
             now: 1_000,
         },
     );
@@ -178,7 +179,8 @@ fn pd_survives_leader_failover_without_losing_placement_or_regressing_tso() {
         &PdCmd::Heartbeat {
             node_id: 8,
             address: "http://node8".into(),
-            regions: vec![region(2, b"m", b"", 1)],
+            regions: vec![ReplicaSet::bare(region(2, b"m", b"", 1))],
+            tables: vec![],
             now: 2_000,
         },
     );

@@ -141,7 +141,7 @@ impl Cluster {
                 let mut tick = tokio::time::interval(Duration::from_millis(HB_MS));
                 loop {
                     tick.tick().await;
-                    hb_detector.heartbeat(id, hb_addr.clone(), vec![], now_ms());
+                    hb_detector.heartbeat(id, hb_addr.clone(), vec![], vec![], now_ms());
                 }
             });
 
