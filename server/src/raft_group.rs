@@ -251,6 +251,23 @@ impl RaftGroup {
         xport::install_snapshot_response(self.step_reply(msg).await.as_ref())
     }
 
+    /// Campaign **now**, skipping the randomized election timeout.
+    ///
+    /// For a freshly founded region that wait buys nothing — there is no prior term, no data, and
+    /// no competing candidate — but it costs 300–600ms before the region can serve its first
+    /// write. Reuses the `TimeoutNow` path built for leadership transfer by stepping one at
+    /// ourselves; the core ignores it if this replica is a learner or the term is stale, so it is
+    /// safe to call unconditionally.
+    pub async fn campaign(&self) {
+        let msg = Message {
+            from: self.id,
+            to: self.id,
+            term: 0,
+            body: arcux_raft::MessageBody::TimeoutNow,
+        };
+        let _ = self.step_reply(msg).await;
+    }
+
     /// Serve an inbound `TimeoutNow` RPC (leadership transfer): step it in — this node
     /// campaigns immediately. Fire-and-forget; the RequestVotes flow through the sender.
     pub async fn handle_timeout_now(&self, req: raft::TimeoutNowRequest) {

@@ -212,11 +212,19 @@ pub struct AppState {
     /// single-node deployment, which is the only shape [`CreateTable`](KvService::create_table)
     /// supports — see the guard there.
     voters: Vec<u64>,
+    /// The other voters' serving addresses, so a region founded at runtime can replicate to them.
+    /// Without these a newly founded CP group has a voter set it cannot reach, and never reaches
+    /// quorum.
+    peers: HashMap<u64, String>,
     /// Serializes [`CreateTable`](KvService::create_table). Its duplicate-name check and its
     /// record of the new table straddle several `.await` points, so without this two concurrent
     /// calls for the same name could both pass the check. Async-aware because it is held across
     /// those awaits.
     create_table_lock: tokio::sync::Mutex<()>,
+    /// The highest PD catalog version this node has applied. An assignment carrying a version at
+    /// or below this is ignored, so a reordered or replayed response can never walk the node back
+    /// to older state.
+    applied_catalog_version: std::sync::atomic::AtomicU64,
 }
 
 impl AppState {
@@ -239,7 +247,9 @@ impl AppState {
             hlc: Arc::new(Hlc::new()),
             declared: std::sync::Mutex::new(Vec::new()),
             voters: vec![1],
+            peers: HashMap::new(),
             create_table_lock: tokio::sync::Mutex::new(()),
+            applied_catalog_version: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 
@@ -274,7 +284,9 @@ impl AppState {
             hlc: Arc::new(Hlc::new()),
             declared: std::sync::Mutex::new(Vec::new()),
             voters: vec![node_id],
+            peers: HashMap::new(),
             create_table_lock: tokio::sync::Mutex::new(()),
+            applied_catalog_version: std::sync::atomic::AtomicU64::new(0),
         });
         state.heartbeat().await?; // register, adopt our assignment, become routable
         Ok(state)
@@ -334,6 +346,7 @@ impl AppState {
         // Every region in a catalog tiling shares one replica set, so any placement names it.
         let voters =
             placements.first().map(|p| p.voters.clone()).unwrap_or_else(|| vec![node_id]);
+        let peers = placements.first().map(|p| p.peers.clone()).unwrap_or_default();
 
         // Per region: a CP region gets a Raft group (durable log, applies into the shared
         // engine); an AP region gets a leaderless replica set (just its peers to forward to).
@@ -375,7 +388,9 @@ impl AppState {
             hlc: Arc::new(Hlc::new()),
             declared: std::sync::Mutex::new(Vec::new()),
             voters,
+            peers,
             create_table_lock: tokio::sync::Mutex::new(()),
+            applied_catalog_version: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 
@@ -522,6 +537,14 @@ impl AppState {
     /// regions, not table names) uses it to say which names those regions came from.
     pub fn declare_tables(&self, tables: Vec<(String, Regime)>) {
         *self.declared.lock().unwrap() = tables;
+    }
+
+    /// The region ids this node currently hosts, sorted. Introspection for tests and tooling —
+    /// the routing table is otherwise private.
+    pub fn hosted_region_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.regions.list().iter().map(|r| r.id).collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// The tables declared on this node, as [`ListTables`](KvService::list_tables) reports them.
@@ -830,10 +853,135 @@ impl AppState {
     pub async fn heartbeat(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let Some(pd) = self.pd.get() else { return Ok(()) };
 
-        // Report each region with how it is actually served here and the replica set holding
-        // it — PD's `node_id` names one holder, which can't describe a three-voter region.
-        let regions: Vec<pd::Region> = self
-            .regions
+        // A catalog node adopts PD's assignment through `reconcile`, which founds groups before
+        // installing routes. The PD-placed path (D34's `adopt_assignment`) keeps the older
+        // routing-only adopt, where regions carry no groups to found.
+        if !pd.adopt_assignment {
+            self.reconcile().await?;
+            return Ok(());
+        }
+
+        let resp = pd
+            .client
+            .clone()
+            .heartbeat(pd::HeartbeatRequest {
+                node_id: pd.node_id,
+                regions: self.reported_regions(),
+                address: pd.address.clone(),
+                tables: self.reported_tables(),
+            })
+            .await?
+            .into_inner();
+        let assigned: Vec<Region> =
+            resp.regions.iter().map(arcux_pd::convert::from_proto).collect();
+        self.regions.adopt(assigned)?;
+        Ok(())
+    }
+
+    /// Adopt PD's region assignment: found what this node should host and is missing, install the
+    /// new routing table, then drop what PD says it no longer votes for. Returns the catalog
+    /// version now applied.
+    ///
+    /// Ordering is deliberate and is the correctness property here. **Found before installing**,
+    /// so a key never routes to a region with no group behind it; **drop after installing**, so it
+    /// never routes to one already gone. Group construction opens a WAL and spawns an actor
+    /// thread, so it happens entirely outside the routing lock — `route()` takes that lock on
+    /// every request.
+    ///
+    /// Only ever *drops* a region PD explicitly excludes this node from. Mere absence from the
+    /// assignment is not removal: PD may simply have restarted and not yet heard from anyone.
+    pub async fn reconcile(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let applied = self.applied_catalog_version.load(std::sync::atomic::Ordering::SeqCst);
+        let Some(pd) = self.pd.get() else { return Ok(applied) };
+
+        let (assigned, version) = self.fetch_assignment(pd).await?;
+        // Version 0 means PD holds no catalog (a plain PD cluster), and a version we have already
+        // applied means this is a replay. Either way there is nothing to adopt.
+        if version == 0 || version <= applied {
+            return Ok(applied);
+        }
+
+        // Found everything missing, outside the lock. `MultiRaft::insert` is idempotent in the
+        // map, but building a group first opens a WAL and spawns a thread — so check membership
+        // *before* constructing, or every pass would leak one of each.
+        let mut wanted: Vec<Region> = Vec::with_capacity(assigned.len());
+        let mut founded_cp: Vec<u64> = Vec::new();
+        for rs in &assigned {
+            let id = rs.region.id;
+            wanted.push(rs.region.clone());
+            match rs.regime {
+                arcux_pd::Regime::Ap => {
+                    if let Some(ap) = self.ap.as_ref() {
+                        if !ap.hosts(id) {
+                            ap.insert(id, &self.peers);
+                        }
+                    }
+                }
+                arcux_pd::Regime::Cp => {
+                    let already = self.raft.as_ref().and_then(|mr| mr.group(id)).is_some();
+                    if !already {
+                        self.found_region(
+                            id,
+                            rs.region.start.clone(),
+                            rs.region.end.clone(),
+                            rs.voters.clone(),
+                            self.peers.clone(),
+                        )?;
+                        // Exactly one voter campaigns, chosen deterministically, so a brand-new
+                        // region does not idle out a randomized election timeout before it can
+                        // serve. Safe because it has no prior term, no data, and no competing
+                        // candidate; every other voter simply votes.
+                        founded_cp.push(id);
+                    }
+                }
+            }
+        }
+
+        // Install: the only time the routing lock is held, and it is a swap.
+        self.regions.adopt(wanted)?;
+        self.applied_catalog_version.store(version, std::sync::atomic::Ordering::SeqCst);
+
+        // After the routes are in place, so the winner can serve the moment it wins.
+        for id in founded_cp {
+            let is_first_voter = assigned
+                .iter()
+                .find(|rs| rs.region.id == id)
+                .map(|rs| rs.voters.iter().min() == Some(&self.node_id))
+                .unwrap_or(false);
+            if is_first_voter {
+                if let Some(group) = self.raft.as_ref().and_then(|mr| mr.group(id)) {
+                    group.campaign().await;
+                }
+            }
+        }
+        Ok(version)
+    }
+
+    /// One round-trip to PD for this node's assignment plus the catalog version behind it.
+    async fn fetch_assignment(
+        &self,
+        pd: &PdHandle,
+    ) -> Result<(Vec<arcux_pd::ReplicaSet>, u64), Box<dyn std::error::Error + Send + Sync>> {
+        let resp = pd
+            .client
+            .clone()
+            .heartbeat(pd::HeartbeatRequest {
+                node_id: pd.node_id,
+                regions: self.reported_regions(),
+                address: pd.address.clone(),
+                tables: self.reported_tables(),
+            })
+            .await?
+            .into_inner();
+        let assigned =
+            resp.regions.iter().map(arcux_pd::convert::replica_set_from_proto).collect();
+        Ok((assigned, resp.catalog_version))
+    }
+
+    /// The regions this node hosts, each tagged with how it is actually served here and the
+    /// replica set holding it.
+    fn reported_regions(&self) -> Vec<pd::Region> {
+        self.regions
             .list()
             .iter()
             .map(|r| {
@@ -849,10 +997,11 @@ impl AppState {
                 };
                 arcux_pd::convert::replica_set_to_proto(&rs)
             })
-            .collect();
+            .collect()
+    }
 
-        let tables: Vec<pd::TableDecl> = self
-            .declared_tables()
+    fn reported_tables(&self) -> Vec<pd::TableDecl> {
+        self.declared_tables()
             .iter()
             .map(|(name, regime)| {
                 let regime = match regime {
@@ -861,25 +1010,7 @@ impl AppState {
                 };
                 arcux_pd::convert::table_decl_to_proto(name, regime)
             })
-            .collect();
-
-        let mut client = pd.client.clone();
-        let resp = client
-            .heartbeat(pd::HeartbeatRequest {
-                node_id: pd.node_id,
-                regions,
-                address: pd.address.clone(),
-                tables,
-            })
-            .await?
-            .into_inner();
-
-        if pd.adopt_assignment {
-            let assigned: Vec<Region> =
-                resp.regions.iter().map(arcux_pd::convert::from_proto).collect();
-            self.regions.adopt(assigned)?;
-        }
-        Ok(())
+            .collect()
     }
 
     /// Connect a already-open node to PD for **placement reporting only**: it registers, then
@@ -1246,6 +1377,65 @@ pub struct KvApi {
     state: Arc<AppState>,
 }
 
+impl KvApi {
+    /// Declare the table through PD, which carves it out of the **cluster's** region table with a
+    /// stable id and pushes the result to every voter. PD's reply already reflects a quorum
+    /// hosting it, so by the time this returns the table is usable.
+    async fn create_table_via_pd(
+        &self,
+        name: String,
+        regime: Regime,
+    ) -> Result<Response<kv::CreateTableResponse>, Status> {
+        let Some(pd) = self.state.pd.get() else {
+            return Err(Status::internal("create_table: PD handle vanished"));
+        };
+        let resp = pd
+            .client
+            .clone()
+            .create_table(pd::CreateTableRequest {
+                name: name.clone(),
+                regime: match regime {
+                    Regime::Ap => pd::Regime::Ap as i32,
+                    Regime::Cp => pd::Regime::Cp as i32,
+                },
+            })
+            .await
+            .map_err(|e| Status::failed_precondition(format!("create_table via PD: {e}")))?
+            .into_inner();
+
+        // Adopt immediately rather than waiting for PD's push to land on *this* node — the caller
+        // is about to write to the table through this connection.
+        let _ = self.state.reconcile().await;
+        self.state.declared.lock().unwrap().push((name, regime));
+
+        let region = resp
+            .region
+            .ok_or_else(|| Status::internal("create_table: PD returned no region"))?;
+        Ok(Response::new(kv::CreateTableResponse {
+            region: Some(kv::RegionInfo {
+                id: region.id,
+                start_key: region.start_key,
+                end_key: region.end_key,
+                epoch: region.epoch,
+            }),
+        }))
+    }
+
+    /// PD owns the region table on a PD-connected catalog node, so a node-initiated split or merge
+    /// would give the same table two authorities — the fastest route to a divergent cluster.
+    /// Rejected rather than raced; reconciling node-initiated splits with PD-initiated carves is
+    /// real work of its own.
+    fn reject_if_pd_owns_the_region_table(&self, op: &str) -> Result<(), Status> {
+        if self.state.pd.get().is_some() && self.state.raft.is_some() {
+            return Err(Status::failed_precondition(format!(
+                "{op}: PD owns the region table on a PD-connected catalog node, so this would \
+                 create a second authority for it. Not supported yet."
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[tonic::async_trait]
 impl KvService for KvApi {
     async fn begin(
@@ -1594,6 +1784,7 @@ impl KvService for KvApi {
         &self,
         request: Request<kv::SplitRegionRequest>,
     ) -> Result<Response<kv::SplitRegionResponse>, Status> {
+        self.reject_if_pd_owns_the_region_table("split")?;
         let split_key = request.into_inner().split_key;
         let regions = self.state.regions.clone();
         // The split is authoritative here (the node owns its epochs); persisting it is
@@ -1615,6 +1806,7 @@ impl KvService for KvApi {
         &self,
         request: Request<kv::MergeRegionRequest>,
     ) -> Result<Response<kv::MergeRegionResponse>, Status> {
+        self.reject_if_pd_owns_the_region_table("merge")?;
         let boundary = request.into_inner().boundary_key;
         let regions = self.state.regions.clone();
         // Authoritative here (the node owns both halves' epochs); persist off the reactor.
@@ -1648,15 +1840,19 @@ impl KvService for KvApi {
             Err(_) => return Err(Status::invalid_argument("create_table: invalid regime")),
         };
 
-        // Single-node only. A live create carves this node's routing table and founds the region
-        // with only this node as a voter; nothing pushes that to the other replicas. They would
-        // keep the old, wider region and — because a catalog tiling numbers regions by position —
-        // the same region id would name a different key range on different nodes.
+        // PD-connected: PD owns the region table, so it carves and pushes the result to every
+        // node. That is what makes this work on a cluster at all — carving locally would leave the
+        // other nodes with the old, wider region and, because a catalog tiling numbers regions by
+        // position, the same id naming a different key range on each of them.
+        if self.state.pd.get().is_some() {
+            return self.create_table_via_pd(req.name, regime).await;
+        }
+
+        // No PD: carve locally. Single-node only, and the voter check still guards that.
         if self.state.voters.len() > 1 {
             return Err(Status::failed_precondition(
-                "create_table: not supported on a multi-node cluster yet — the other nodes would \
-                 not learn about the table and would disagree about region routing. Declare it \
-                 with --table <name>=cp|ap on every node instead.",
+                "create_table: a multi-node cluster needs PD to carve the table cluster-wide — \
+                 start the nodes with --pd, or declare it with --table <name>=cp|ap on each.",
             ));
         }
 
@@ -1770,6 +1966,24 @@ impl KvService for KvApi {
         // Sorted, so the listing doesn't leak startup-flag/creation ordering.
         tables.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(Response::new(kv::ListTablesResponse { tables }))
+    }
+
+    /// PD nudging this node to re-read its assignment now instead of waiting out the heartbeat.
+    /// Answers with the version applied and the regions now hosted, so PD can tell when a quorum
+    /// of a new region's voters is ready.
+    async fn reconcile(
+        &self,
+        _request: Request<kv::ReconcileRequest>,
+    ) -> Result<Response<kv::ReconcileResponse>, Status> {
+        let version = self
+            .state
+            .reconcile()
+            .await
+            .map_err(|e| Status::internal(format!("reconcile: {e}")))?;
+        Ok(Response::new(kv::ReconcileResponse {
+            catalog_version: version,
+            region_ids: self.state.regions.list().iter().map(|r| r.id).collect(),
+        }))
     }
 
     async fn replicate_ap(
