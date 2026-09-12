@@ -151,10 +151,11 @@ impl Membership {
         }
     }
 
-    /// Replace the per-node view from `bytes` (the inverse of [`encode_into`](Self::encode_into)).
-    /// `None` on a truncated or malformed image, leaving the current view untouched — a bad
-    /// snapshot must not half-apply.
-    pub(crate) fn decode_from(&self, bytes: &[u8]) -> Option<()> {
+    /// Replace the per-node view from `bytes` (the inverse of [`encode_into`](Self::encode_into)),
+    /// returning how many bytes it consumed so a caller decoding a larger image can continue
+    /// after it. `None` on a truncated or malformed image, leaving the current view untouched —
+    /// a bad snapshot must not half-apply.
+    pub(crate) fn decode_from(&self, bytes: &[u8]) -> Option<usize> {
         let mut pos = 0usize;
         let mut nodes = BTreeMap::new();
         for _ in 0..get_u32(bytes, &mut pos)? {
@@ -188,7 +189,7 @@ impl Membership {
         }
         let mut g = self.state.lock().expect("membership poisoned");
         g.nodes = nodes;
-        Some(())
+        Some(pos)
     }
 
     /// An empty cluster (no nodes, no seed). The first node to heartbeat with no regions
@@ -493,7 +494,7 @@ mod tests {
         let mut bytes = Vec::new();
         a.encode_into(&mut bytes);
         let b = Membership::new();
-        assert_eq!(b.decode_from(&bytes), Some(()));
+        assert!(b.decode_from(&bytes).is_some());
 
         assert_eq!(b.list().len(), a.list().len());
         let placed = b.route(b"a").expect("address and regions survive");
@@ -514,7 +515,7 @@ mod tests {
 
         let victim = Membership::new();
         hb(&victim, 9, "http://n9", vec![region(1, b"", b"", 1)], 1_000);
-        assert_eq!(victim.decode_from(&bytes[..bytes.len() - 3]), None);
+        assert!(victim.decode_from(&bytes[..bytes.len() - 3]).is_none());
         assert_eq!(victim.route(b"k").map(|p| p.node_id), Some(9), "state untouched");
     }
 

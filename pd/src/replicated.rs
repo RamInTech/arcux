@@ -28,7 +28,11 @@ use std::sync::Arc;
 use arcux_raft::{Config, EntryType, MemStorage, Message, ProposeError, RaftNode, Storage};
 
 use crate::persist::{get_bytes, get_u32, get_u64, put_bytes};
+use std::sync::Mutex;
+
 use crate::cluster::{regime_of, regime_tag};
+use crate::region::RegionRegistry;
+use crate::{prefix_successor, table_prefix};
 use crate::{Membership, PlacedRegion, Regime, Region, ReplicaSet, TableConflict};
 
 /// How far ahead of the current need a `ReserveTs` raises the high-water. Larger ⇒ fewer Raft
@@ -45,6 +49,12 @@ pub enum PdCmd {
     /// serving any timestamp `< upper`, so the committed watermark is always an upper bound on
     /// every timestamp handed out — and a new leader resuming from it never regresses.
     ReserveTs { upper: u64 },
+    /// Declare a table cluster-wide. Applying it carves the table's range out of PD's region
+    /// table (two `RegionRegistry::split`s, so ids stay stable and only genuinely new pieces get
+    /// fresh ones), records the declaration, and bumps the catalog version. Idempotent: a name
+    /// already declared is a no-op, which matters because an entry can be re-applied after a
+    /// restart.
+    DeclareTable { name: String, regime: Regime },
     /// Record a data node's heartbeat: its serving `address`, the `regions` it owns, and the
     /// wall-clock `now` (ms, for liveness). Applied via [`Membership::heartbeat`] on every
     /// replica, giving one shared placement + liveness view.
@@ -68,6 +78,11 @@ impl PdCmd {
             PdCmd::ReserveTs { upper } => {
                 out.push(1);
                 out.extend_from_slice(&upper.to_be_bytes());
+            }
+            PdCmd::DeclareTable { name, regime } => {
+                out.push(3);
+                put_bytes(&mut out, name.as_bytes());
+                out.push(regime_tag(*regime));
             }
             PdCmd::Heartbeat { node_id, address, regions, tables, now } => {
                 out.push(2);
@@ -95,6 +110,11 @@ impl PdCmd {
         pos += 1;
         match tag {
             1 => Some(PdCmd::ReserveTs { upper: get_u64(bytes, &mut pos)? }),
+            3 => {
+                let name = String::from_utf8(get_bytes(bytes, &mut pos)?.to_vec()).ok()?;
+                let regime = regime_of(*bytes.get(pos)?)?;
+                Some(PdCmd::DeclareTable { name, regime })
+            }
             2 => {
                 let node_id = get_u64(bytes, &mut pos)?;
                 let now = get_u64(bytes, &mut pos)?;
@@ -127,11 +147,36 @@ pub struct PdFsm {
     /// The committed TSO high-water — the max timestamp any leader has reserved. Monotonic:
     /// applying a stale/duplicate `ReserveTs` can only ever be a no-op.
     tso_upper: AtomicU64,
+    /// The **authoritative** region table for a catalog cluster. In-memory and path-free, so it
+    /// is a pure deterministic state machine: every replica applying the same log carves
+    /// identically, and `split`'s monotonic `next_id` gives ids that stay stable across a
+    /// declaration instead of renumbering the way a positional tiling would.
+    regions: RegionRegistry,
+    /// Declared tables, in declaration order. A region's regime is *derived* from this by
+    /// longest-prefix match rather than stored per region, so there is one source of truth.
+    catalog: Mutex<Vec<(String, Regime)>>,
+    /// Bumped on every accepted declaration. Nodes ignore an assignment carrying a version they
+    /// have already applied, so a reordered or replayed response cannot walk them back.
+    version: AtomicU64,
+    /// The cluster's replica set, learned from heartbeats. Catalog mode gives every region the
+    /// same voters, so one set is the honest model here; per-region placement is Phase-6
+    /// rebalancing.
+    voters: Mutex<Vec<u64>>,
 }
 
 impl PdFsm {
     pub fn new() -> PdFsm {
-        PdFsm { members: Membership::new(), tso_upper: AtomicU64::new(0) }
+        PdFsm {
+            members: Membership::new(),
+            tso_upper: AtomicU64::new(0),
+            // Seeded with one whole-keyspace region, which is exactly what a catalog node with no
+            // tables tiles to — so PD and a fresh node agree before anything is declared, and
+            // `split` has a region to carve from.
+            regions: RegionRegistry::in_memory(),
+            catalog: Mutex::new(Vec::new()),
+            version: AtomicU64::new(0),
+            voters: Mutex::new(Vec::new()),
+        }
     }
 
     /// Apply one committed command. Deterministic given the state + bytes, so replicas that
@@ -146,9 +191,80 @@ impl PdFsm {
                 self.tso_upper.fetch_max(upper, Ordering::SeqCst);
             }
             PdCmd::Heartbeat { node_id, address, regions, tables, now } => {
+                // Learn the cluster's replica set from what nodes report; a new region inherits it.
+                if let Some(rs) = regions.iter().find(|rs| !rs.voters.is_empty()) {
+                    *self.voters.lock().expect("voters poisoned") = rs.voters.clone();
+                }
                 self.members.heartbeat(node_id, address, regions, tables, now);
             }
+            PdCmd::DeclareTable { name, regime } => self.declare_table(name, regime),
         }
+    }
+
+    /// Carve a declared table's range out of the region table. Deterministic and idempotent, as
+    /// every `PdFsm::apply` must be.
+    fn declare_table(&self, name: String, regime: Regime) {
+        if name.is_empty() {
+            return; // "" is the reserved untabled namespace, never a declarable table
+        }
+        {
+            let mut catalog = self.catalog.lock().expect("catalog poisoned");
+            if catalog.iter().any(|(n, _)| n == &name) {
+                return; // already declared — re-applying a committed entry must not re-carve
+            }
+            catalog.push((name.clone(), regime));
+        }
+
+        // Two splits, exactly as the single-node carve does: at the table's start, then at its
+        // end unless that is already a boundary. Existing regions keep their ids.
+        let start = table_prefix(&name);
+        let end = prefix_successor(&start).unwrap_or_default();
+        if self.regions.route(&start).map(|r| r.start != start).unwrap_or(false) {
+            let _ = self.regions.split(&start);
+        }
+        if !end.is_empty() && self.regions.route(&start).map(|r| r.end != end).unwrap_or(false) {
+            let _ = self.regions.split(&end);
+        }
+        self.version.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// PD's catalog version — monotonic, bumped per accepted declaration.
+    pub fn catalog_version(&self) -> u64 {
+        self.version.load(Ordering::SeqCst)
+    }
+
+    /// The authoritative region table, each region tagged with its derived regime and the
+    /// cluster's voter set. This is what a node reconciles against.
+    pub fn assignment(&self) -> Vec<ReplicaSet> {
+        let voters = self.voters.lock().expect("voters poisoned").clone();
+        self.regions
+            .list()
+            .into_iter()
+            .map(|region| {
+                let regime = self.regime_for(&region.start);
+                ReplicaSet { region, regime, voters: voters.clone() }
+            })
+            .collect()
+    }
+
+    /// A key's regime: the **longest** declared table prefix it falls under, else `Cp`
+    /// (strong-by-default) — the same rule the server's catalog applies.
+    pub fn regime_for(&self, key: &[u8]) -> Regime {
+        self.catalog
+            .lock()
+            .expect("catalog poisoned")
+            .iter()
+            .filter(|(name, _)| key.starts_with(&table_prefix(name)))
+            .max_by_key(|(name, _)| name.len())
+            .map(|(_, regime)| *regime)
+            .unwrap_or(Regime::Cp)
+    }
+
+    /// The declared tables PD holds, name-sorted.
+    pub fn catalog(&self) -> Vec<(String, Regime)> {
+        let mut out = self.catalog.lock().expect("catalog poisoned").clone();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// The committed TSO high-water — an upper bound on every timestamp handed out so far.
@@ -176,6 +292,23 @@ impl PdFsm {
         let mut out = Vec::new();
         out.extend_from_slice(&self.tso_upper().to_be_bytes());
         self.members.encode_into(&mut out);
+
+        // The region table, catalog, version and voter set are *not* self-healing the way
+        // placement is — no heartbeat rebuilds them — so a snapshot that omitted them would lose
+        // the cluster's tables the moment the log was compacted.
+        out.extend_from_slice(&self.catalog_version().to_be_bytes());
+        let catalog = self.catalog.lock().expect("catalog poisoned").clone();
+        out.extend_from_slice(&(catalog.len() as u32).to_be_bytes());
+        for (name, regime) in &catalog {
+            put_bytes(&mut out, name.as_bytes());
+            out.push(regime_tag(*regime));
+        }
+        let voters = self.voters.lock().expect("voters poisoned").clone();
+        out.extend_from_slice(&(voters.len() as u32).to_be_bytes());
+        for v in &voters {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        self.regions.encode_into(&mut out);
         out
     }
 
@@ -187,7 +320,34 @@ impl PdFsm {
             return false;
         }
         let upper = u64::from_be_bytes(bytes[..8].try_into().expect("8 bytes"));
-        let Some(()) = self.members.decode_from(&bytes[8..]) else { return false };
+        let Some(mut pos) = self.members.decode_from(&bytes[8..]) else { return false };
+        pos += 8; // members' slice started at 8
+
+        let Some(version) = get_u64(bytes, &mut pos) else { return false };
+        let Some(n) = get_u32(bytes, &mut pos) else { return false };
+        let mut catalog = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let Some(name) = get_bytes(bytes, &mut pos).and_then(|b| String::from_utf8(b.to_vec()).ok())
+            else {
+                return false;
+            };
+            let Some(regime) = bytes.get(pos).copied().and_then(regime_of) else { return false };
+            pos += 1;
+            catalog.push((name, regime));
+        }
+        let Some(n) = get_u32(bytes, &mut pos) else { return false };
+        let mut voters = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let Some(v) = get_u64(bytes, &mut pos) else { return false };
+            voters.push(v);
+        }
+        if !self.regions.decode_from(&bytes[pos..]) {
+            return false;
+        }
+
+        *self.catalog.lock().expect("catalog poisoned") = catalog;
+        *self.voters.lock().expect("voters poisoned") = voters;
+        self.version.fetch_max(version, Ordering::SeqCst);
         self.tso_upper.fetch_max(upper, Ordering::SeqCst);
         true
     }
@@ -204,6 +364,20 @@ impl PdFsm {
 
     /// The regions currently assigned to `node_id` — what the leader echoes back in a
     /// heartbeat response once the heartbeat has committed.
+    /// What `node_id` should be hosting. Once anything has been declared, this is PD's
+    /// **authoritative** region table filtered to the regions this node votes for. Before that
+    /// (version 0 — a plain PD cluster with no catalog) it falls back to echoing the node's own
+    /// report, which is the Phase-3b behaviour and must not change.
+    pub fn assignment_for(&self, node_id: u64) -> Vec<ReplicaSet> {
+        if self.catalog_version() == 0 {
+            return self.regions_of(node_id);
+        }
+        self.assignment()
+            .into_iter()
+            .filter(|rs| rs.voters.is_empty() || rs.voters.contains(&node_id))
+            .collect()
+    }
+
     pub fn regions_of(&self, node_id: u64) -> Vec<ReplicaSet> {
         self.members
             .list()

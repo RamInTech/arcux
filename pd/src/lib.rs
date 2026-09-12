@@ -35,6 +35,7 @@ pub mod service;
 pub mod tso;
 
 pub use cluster::{Membership, PlacedRegion, Regime, ReplicaSet, TableConflict};
+pub use region::{prefix_successor, table_prefix};
 pub use raft_group::{PdGroup, PdGroupOptions};
 pub use region::{region_id, Region, RegionRegistry};
 pub use replicated::{PdCmd, PdFsm, PdReplica, Ready};

@@ -8,8 +8,8 @@ use tonic::{Request, Response, Status};
 use arcux_rpc::pd::pd_service_server::PdService;
 use arcux_rpc::pd::{
     GetRegionRequest, GetRegionResponse, GetTimestampRequest, GetTimestampResponse,
-    HeartbeatRequest, HeartbeatResponse, ListRegionsRequest, ListRegionsResponse,
-    ListTablesRequest, ListTablesResponse,
+    CreateTableRequest, CreateTableResponse, HeartbeatRequest, HeartbeatResponse,
+    ListRegionsRequest, ListRegionsResponse, ListTablesRequest, ListTablesResponse,
 };
 
 use crate::cluster::now_ms;
@@ -80,7 +80,25 @@ impl PdService for PdApi {
             self.members.heartbeat(req.node_id, req.address, reported, tables, now_ms());
         Ok(Response::new(HeartbeatResponse {
             regions: assigned.iter().map(replica_set_to_proto).collect(),
+            // Single-process PD holds no authoritative region table, so it never carves and its
+            // assignment is simply the node's own report echoed back. Version 0 means "nothing to
+            // adopt", which is exactly what a node should conclude.
+            catalog_version: 0,
+            tables: Vec::new(),
         }))
+    }
+
+    /// Not served here. Carving a table cluster-wide needs the replicated region table, which
+    /// only the PD-on-Raft path has — duplicating it into the single-process path would mean two
+    /// authorities for the same state.
+    async fn create_table(
+        &self,
+        _request: Request<CreateTableRequest>,
+    ) -> Result<Response<CreateTableResponse>, Status> {
+        Err(Status::unimplemented(
+            "create_table needs a replicated PD (start it with `arcux-pd -n 1 -c 1` or a 3-node \
+             group); the single-process PD keeps no region table to carve",
+        ))
     }
 
     /// The cluster-wide catalog PD has heard, plus any table two nodes describe differently.

@@ -48,6 +48,13 @@ enum Cmd {
     /// Allocate `count` timestamps (`None` if not the leader). Served from the reserved window,
     /// reserving a fresh one through Raft first if exhausted.
     AllocTs { count: u64, reply: tokio::sync::oneshot::Sender<Option<(u64, u64)>> },
+    /// Declare a table through Raft; reply with the carved region + the new catalog version once
+    /// the entry commits (`None` if this node isn't the leader).
+    DeclareTable {
+        name: String,
+        regime: Regime,
+        reply: tokio::sync::oneshot::Sender<Option<(ReplicaSet, u64)>>,
+    },
     Stop,
 }
 
@@ -57,6 +64,9 @@ type PendingHeartbeat = (u64, tokio::sync::oneshot::Sender<Option<Vec<ReplicaSet
 /// A parked timestamp allocation: the count requested, and where to send `(first, count)` once
 /// the reservation commits.
 type PendingAllocTs = (u64, tokio::sync::oneshot::Sender<Option<(u64, u64)>>);
+/// A parked declaration: the table's start key (to look its region up once carved) and where to
+/// send the result.
+type PendingDeclare = (Vec<u8>, tokio::sync::oneshot::Sender<Option<(ReplicaSet, u64)>>);
 
 /// Observable role/leader, read without messaging the actor (the hot path for redirect).
 #[derive(Clone)]
@@ -124,6 +134,16 @@ impl PdGroup {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = Cmd::Heartbeat { node_id, address, regions, tables, now, reply: tx };
         if self.cmd_tx.send(cmd).is_err() {
+            return None;
+        }
+        rx.await.ok().flatten()
+    }
+
+    /// Declare a table cluster-wide through Raft. Returns the carved region and the catalog
+    /// version it produced, or `None` if this node isn't the leader.
+    pub async fn declare_table(&self, name: String, regime: Regime) -> Option<(ReplicaSet, u64)> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.cmd_tx.send(Cmd::DeclareTable { name, regime, reply: tx }).is_err() {
             return None;
         }
         rx.await.ok().flatten()
@@ -246,6 +266,7 @@ fn run_actor(
 ) {
     // Proposals parked on the log index that will resolve them.
     let mut pending_hb: BTreeMap<u64, PendingHeartbeat> = BTreeMap::new();
+    let mut pending_decl: BTreeMap<u64, PendingDeclare> = BTreeMap::new();
     let mut pending_ts: BTreeMap<u64, PendingAllocTs> = BTreeMap::new();
     let (mut last_leader, mut last_term) = (replica.leader_id(), replica.current_term());
 
@@ -268,6 +289,21 @@ fn run_actor(
                     match replica.propose(&cmd) {
                         Ok(index) => {
                             pending_hb.insert(index, (node_id, tx));
+                        }
+                        Err(_) => {
+                            let _ = tx.send(None);
+                        }
+                    }
+                }
+            }
+            Cmd::DeclareTable { name, regime, reply: tx } => {
+                if !replica.is_leader() {
+                    let _ = tx.send(None);
+                } else {
+                    let start = crate::table_prefix(&name);
+                    match replica.propose(&PdCmd::DeclareTable { name, regime }) {
+                        Ok(index) => {
+                            pending_decl.insert(index, (start, tx));
                         }
                         Err(_) => {
                             let _ = tx.send(None);
@@ -319,7 +355,13 @@ fn run_actor(
         // Resolve proposals whose entries just committed.
         for index in ready.committed {
             if let Some((node_id, tx)) = pending_hb.remove(&index) {
-                let _ = tx.send(Some(replica.fsm().regions_of(node_id)));
+                let _ = tx.send(Some(replica.fsm().assignment_for(node_id)));
+            }
+            if let Some((start, tx)) = pending_decl.remove(&index) {
+                // The carve has been applied by now — look the table's region up by its start key.
+                let fsm = replica.fsm();
+                let carved = fsm.assignment().into_iter().find(|rs| rs.region.start == start);
+                let _ = tx.send(carved.map(|rs| (rs, fsm.catalog_version())));
             }
             if let Some((count, tx)) = pending_ts.remove(&index) {
                 // The reservation raised the high-water enough that this now succeeds.
@@ -328,11 +370,16 @@ fn run_actor(
         }
 
         // If we've lost leadership, fail every still-parked proposal.
-        if !replica.is_leader() && (!pending_hb.is_empty() || !pending_ts.is_empty()) {
+        if !replica.is_leader()
+            && (!pending_hb.is_empty() || !pending_ts.is_empty() || !pending_decl.is_empty())
+        {
             for (_, (_, tx)) in std::mem::take(&mut pending_hb) {
                 let _ = tx.send(None);
             }
             for (_, (_, tx)) in std::mem::take(&mut pending_ts) {
+                let _ = tx.send(None);
+            }
+            for (_, (_, tx)) in std::mem::take(&mut pending_decl) {
                 let _ = tx.send(None);
             }
         }

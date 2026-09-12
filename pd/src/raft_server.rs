@@ -20,8 +20,8 @@ use tonic::{Request, Response, Status};
 use arcux_rpc::pd::pd_service_server::{PdService, PdServiceServer};
 use arcux_rpc::pd::{
     GetRegionRequest, GetRegionResponse, GetTimestampRequest, GetTimestampResponse,
-    HeartbeatRequest, HeartbeatResponse, ListRegionsRequest, ListRegionsResponse,
-    ListTablesRequest, ListTablesResponse,
+    CreateTableRequest, CreateTableResponse, HeartbeatRequest, HeartbeatResponse,
+    ListRegionsRequest, ListRegionsResponse, ListTablesRequest, ListTablesResponse,
 };
 use arcux_rpc::raft::raft_service_server::{RaftService, RaftServiceServer};
 use arcux_rpc::raft::{
@@ -30,9 +30,11 @@ use arcux_rpc::raft::{
 };
 
 use crate::cluster::now_ms;
+use arcux_rpc::kv::kv_service_client::KvServiceClient;
+
 use crate::convert::{
-    list_tables_response, placed_to_proto, replica_set_from_proto, replica_set_to_proto,
-    table_decl_from_proto,
+    list_tables_response, placed_to_proto, regime_from_proto, replica_set_from_proto,
+    replica_set_to_proto, table_decl_from_proto, table_decl_to_proto,
 };
 use crate::raft_group::{self, PdGroup, PdGroupOptions};
 
@@ -100,9 +102,18 @@ impl PdService for ReplicatedPdApi {
         let reported = req.regions.iter().map(replica_set_from_proto).collect();
         let tables = req.tables.iter().map(table_decl_from_proto).collect();
         match self.group.heartbeat(req.node_id, req.address, reported, tables, now_ms()).await {
-            Some(assigned) => Ok(Response::new(HeartbeatResponse {
-                regions: assigned.iter().map(replica_set_to_proto).collect(),
-            })),
+            Some(assigned) => {
+                let fsm = self.group.fsm();
+                Ok(Response::new(HeartbeatResponse {
+                    regions: assigned.iter().map(replica_set_to_proto).collect(),
+                    catalog_version: fsm.catalog_version(),
+                    tables: fsm
+                        .catalog()
+                        .iter()
+                        .map(|(n, r)| table_decl_to_proto(n, *r))
+                        .collect(),
+                }))
+            }
             None => Err(self.redirect()),
         }
     }
@@ -129,6 +140,82 @@ impl PdService for ReplicatedPdApi {
         }
         let regions = self.group.fsm().list().iter().map(placed_to_proto).collect();
         Ok(Response::new(ListRegionsResponse { regions }))
+    }
+
+    /// Declare a table cluster-wide: carve it out of the region table through Raft, then **push**
+    /// the new assignment to every node rather than letting them wait out a heartbeat tick.
+    ///
+    /// The push is an optimization, not a correctness requirement — the periodic heartbeat is the
+    /// safety net, so a nudge that fails to land costs latency and nothing else. What it does buy
+    /// is the ack: a CP region cannot serve until a majority of its voters host it, so waiting for
+    /// that majority to confirm is both faster than a tick and the honest point at which the table
+    /// is actually usable.
+    async fn create_table(
+        &self,
+        request: Request<CreateTableRequest>,
+    ) -> Result<Response<CreateTableResponse>, Status> {
+        if !self.group.is_leader() {
+            return Err(self.redirect());
+        }
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument(
+                "create_table: name must not be empty; \"\" is the reserved default namespace",
+            ));
+        }
+        let regime = regime_from_proto(req.regime);
+
+        let Some((carved, version)) = self.group.declare_table(req.name.clone(), regime).await
+        else {
+            return Err(self.redirect());
+        };
+
+        let confirmed = self.push_reconcile(version).await;
+        if regime == crate::Regime::Cp && !carved.voters.is_empty() {
+            let needed = carved.voters.len() / 2 + 1;
+            let ready = carved.voters.iter().filter(|v| confirmed.contains(v)).count();
+            if ready < needed {
+                return Err(Status::unavailable(format!(
+                    "create_table: only {ready} of {} voters hosted {:?} within the push, and a CP \
+                     region needs {needed}. It is declared and will converge on the next \
+                     heartbeat — retry the write shortly",
+                    carved.voters.len(),
+                    req.name
+                )));
+            }
+        }
+
+        Ok(Response::new(CreateTableResponse {
+            region: Some(replica_set_to_proto(&carved)),
+            catalog_version: version,
+        }))
+    }
+}
+
+impl ReplicatedPdApi {
+    /// Tell every known node to re-read its assignment now, concurrently. Returns the ids that
+    /// confirmed applying at least `version`. Best-effort — an unreachable node simply misses the
+    /// shortcut and converges on its next heartbeat.
+    async fn push_reconcile(&self, version: u64) -> Vec<u64> {
+        let nodes: std::collections::BTreeMap<u64, String> =
+            self.group.fsm().list().into_iter().map(|p| (p.node_id, p.address)).collect();
+
+        let mut tasks = Vec::new();
+        for (id, addr) in nodes {
+            tasks.push(tokio::spawn(async move {
+                let mut client = KvServiceClient::connect(addr).await.ok()?;
+                let resp =
+                    client.reconcile(arcux_rpc::kv::ReconcileRequest {}).await.ok()?.into_inner();
+                (resp.catalog_version >= version).then_some(id)
+            }));
+        }
+        let mut confirmed = Vec::new();
+        for t in tasks {
+            if let Ok(Some(id)) = t.await {
+                confirmed.push(id);
+            }
+        }
+        confirmed
     }
 }
 
