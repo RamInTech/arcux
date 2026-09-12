@@ -43,6 +43,11 @@ service KvService {
   // each with its regime. Node-local, like CreateTable — there is no PD-served catalog yet, so
   // this reports what *this* node knows, not a cluster-wide view.
   rpc ListTables(ListTablesRequest) returns (ListTablesResponse);
+  // Internal (PD→node): re-read your region assignment from PD now, rather than waiting out the
+  // periodic heartbeat. Purely an optimization — the heartbeat is the safety net, so a lost
+  // nudge costs latency and never correctness. Answers with what the node ended up hosting, so
+  // PD can tell when a quorum of a new region's voters is ready.
+  rpc Reconcile(ReconcileRequest) returns (ReconcileResponse);
   // Internal (node→node): replicate an AP write to a peer replica (Phase 5). Leaderless +
   // HLC-stamped + Last-Writer-Wins; the coordinator that took the client write fans it out.
   rpc ReplicateAp(ReplicateApRequest) returns (ReplicateApResponse);
@@ -264,6 +269,15 @@ message TableInfo {
   Regime regime = 2;
   reserved 50 to 99;
 }
+message ReconcileRequest {
+  reserved 50 to 99;
+}
+message ReconcileResponse {
+  uint64 catalog_version = 1;      // the version this node has applied after reconciling
+  repeated uint64 region_ids = 2;  // the regions it now hosts
+  reserved 50 to 99;
+}
+
 message ListTablesResponse {
   // Declared tables, sorted by name. The untabled "" default namespace is never an entry —
   // it is reserved rather than declarable, and is always CP.

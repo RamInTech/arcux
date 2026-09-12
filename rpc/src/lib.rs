@@ -35,7 +35,12 @@
 /// `pd.Region` (a single `node_id` cannot describe a three-voter region), `tables` on
 /// `pd.HeartbeatRequest`, and the `pd.ListTables` RPC — so PD holds the cluster-wide catalog
 /// view and can report nodes that disagree about a table's regime.
-pub const VERSION: u32 = 14;
+/// v15 (cluster table creation): added `pd.CreateTable` and `catalog_version`/`tables` on
+/// `pd.HeartbeatResponse` — PD now owns the region table, carves a declared table's range out of
+/// it with a stable id, and versions the assignment so a node can ignore a stale one. Added the
+/// internal `kv.Reconcile` RPC so PD can push a new assignment instead of waiting out the
+/// heartbeat.
+pub const VERSION: u32 = 15;
 
 /// KV API v1 — the transactional + autocommit surface (fully implemented in Phase 2).
 pub mod kv {

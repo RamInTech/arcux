@@ -108,6 +108,19 @@ fn pd_messages_roundtrip() {
         address: "http://n7".into(),
         tables: vec![],
     });
+    roundtrip(&pd::CreateTableResponse {
+        region: Some(pd::Region {
+            id: 9,
+            start_key: b"orders/".to_vec(),
+            end_key: b"orders0".to_vec(),
+            epoch: 3,
+            node_id: 0,
+            address: String::new(),
+            regime: pd::Regime::Cp as i32,
+            voters: vec![1, 2, 3],
+        }),
+        catalog_version: 4,
+    });
     roundtrip(&pd::HeartbeatResponse {
         regions: vec![pd::Region {
             id: 1,
@@ -119,6 +132,8 @@ fn pd_messages_roundtrip() {
             regime: pd::Regime::Cp as i32,
             voters: vec![1, 2, 3],
         }],
+        catalog_version: 2,
+        tables: vec![pd::TableDecl { name: "orders".into(), regime: pd::Regime::Cp as i32 }],
     });
     roundtrip(&pd::HeartbeatRequest {
         node_id: 1,
@@ -152,5 +167,5 @@ fn pd_messages_roundtrip() {
 
 #[test]
 fn version_is_pinned() {
-    assert_eq!(arcux_rpc::VERSION, 14);
+    assert_eq!(arcux_rpc::VERSION, 15);
 }

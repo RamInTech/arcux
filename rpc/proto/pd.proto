@@ -26,6 +26,10 @@ service PdService {
   // cluster was started with matching --table flags, and a mismatch silently tiles and routes
   // the same keys differently on different nodes; this is how that becomes visible.
   rpc ListTables(ListTablesRequest) returns (ListTablesResponse);
+  // Declare a table cluster-wide: PD carves its range out of the region table, mints a stable
+  // region id, and pushes the new assignment to every affected node. The single-node path
+  // carves locally instead; this is what makes `create table` work on a cluster.
+  rpc CreateTable(CreateTableRequest) returns (CreateTableResponse);
 }
 
 // How a range is served. Mirrors kv.Regime, which is a different proto package — PD's copy is
@@ -94,6 +98,23 @@ message HeartbeatResponse {
   // heartbeat of a fresh cluster this seeds the node's region set; thereafter it
   // reflects PD's placement view, making Heartbeat a two-way sync.
   repeated Region regions = 1;
+  // PD's catalog version at the time this assignment was computed. Monotonic. A node ignores
+  // any assignment carrying a version it has already applied, so a reordered or replayed
+  // response can never walk it back to older state.
+  uint64 catalog_version = 2;
+  // The tables PD's catalog holds, so a node adopting an assignment also learns their regimes.
+  repeated TableDecl tables = 3;
+  reserved 50 to 99;
+}
+
+message CreateTableRequest {
+  string name = 1;
+  Regime regime = 2;
+  reserved 50 to 99;
+}
+message CreateTableResponse {
+  Region region = 1;          // the newly carved region, with its stable id and voter set
+  uint64 catalog_version = 2; // the version this declaration produced
   reserved 50 to 99;
 }
 
