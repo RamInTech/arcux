@@ -13,6 +13,10 @@
 
 use std::collections::HashMap;
 
+// Region-boundary helpers live in `pd` — both the tiling here and PD's carve of a declared
+// table need them, so there is one copy. Re-exported so `catalog::table_prefix` still resolves.
+pub(crate) use arcux_pd::{prefix_successor, table_prefix};
+
 use crate::multiraft::{Regime, RegionPlacement};
 
 /// A table → regime map. Tables own key-prefixes (`name/`); lookups are longest-prefix.
@@ -101,20 +105,6 @@ impl Catalog {
     }
 }
 
-/// The smallest key strictly greater than every key having `prefix` — i.e. the exclusive end
-/// of the prefix range (`b"a/"` → `b"a0"`). `None` when `prefix` is all `0xff` (no upper bound).
-pub(crate) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut end = prefix.to_vec();
-    while let Some(last) = end.last_mut() {
-        if *last < 0xff {
-            *last += 1;
-            return Some(end);
-        }
-        end.pop();
-    }
-    None
-}
-
 impl Default for Catalog {
     fn default() -> Self {
         Catalog::new()
@@ -166,18 +156,6 @@ fn regime_name(regime: Regime) -> &'static str {
     } else {
         "cp"
     }
-}
-
-/// A table `t` owns keys under `t/`. The empty name is the untabled default — no prefix — so
-/// requests that don't name a table (raw single-node/test usage) route on the bare key exactly
-/// as before tables carried their own request field.
-pub(crate) fn table_prefix(name: &str) -> Vec<u8> {
-    if name.is_empty() {
-        return Vec::new();
-    }
-    let mut p = name.as_bytes().to_vec();
-    p.push(b'/');
-    p
 }
 
 #[cfg(test)]

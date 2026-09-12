@@ -211,6 +211,25 @@ impl RegionRegistry {
         self.persist()
     }
 
+    /// Append the region table to `out`, for PD's Raft snapshot. Same encoding as the on-disk
+    /// table, so there is one format.
+    pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
+        let g = self.state.lock().expect("registry poisoned");
+        out.extend_from_slice(&encode_state(&g));
+    }
+
+    /// Replace the region table from a snapshot image. `false` on a malformed one, leaving the
+    /// current table untouched — a bad snapshot must not half-apply.
+    pub(crate) fn decode_from(&self, bytes: &[u8]) -> bool {
+        match decode_state(bytes) {
+            Some(state) => {
+                *self.state.lock().expect("registry poisoned") = state;
+                true
+            }
+            None => false,
+        }
+    }
+
     fn persist(&self) -> std::io::Result<()> {
         let Some(path) = &self.path else { return Ok(()) };
         let g = self.state.lock().expect("registry poisoned");
@@ -224,6 +243,35 @@ impl RegionRegistry {
 /// nodes ever collide.
 pub fn region_id(node_id: u64, local: u64) -> u64 {
     (node_id << 32) | (local & 0xFFFF_FFFF)
+}
+
+/// A table `t` owns keys under `t/`. The empty name is the untabled default — no prefix — so
+/// requests that don't name a table route on the bare key.
+///
+/// Lives here rather than in the server's catalog because these two functions define **region
+/// boundaries**, and both the server (tiling at startup) and PD (carving a declared table out of
+/// the region table) need them. One copy, no drift.
+pub fn table_prefix(name: &str) -> Vec<u8> {
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let mut p = name.as_bytes().to_vec();
+    p.push(b'/');
+    p
+}
+
+/// The smallest key strictly greater than every key having `prefix` — i.e. the exclusive end of
+/// the prefix range (`b"a/"` → `b"a0"`). `None` when `prefix` is all `0xff` (no upper bound).
+pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.last_mut() {
+        if *last < 0xff {
+            *last += 1;
+            return Some(end);
+        }
+        end.pop();
+    }
+    None
 }
 
 fn whole_keyspace(id: u64) -> Region {
