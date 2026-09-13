@@ -539,6 +539,52 @@ impl AppState {
         *self.declared.lock().unwrap() = tables;
     }
 
+    /// Found a group for every region in the routing table that lacks one.
+    ///
+    /// Carving a range out of the keyspace produces more regions than the one being carved: a
+    /// split leaves a **right-hand piece** with a fresh id and nothing behind it. Its keys then
+    /// route to a region with no Raft group, and `group_for` returning `None` reads as
+    /// `NotLeader` — so a client waits forever for a leader that can never be elected. That is
+    /// silent: the node keeps serving every other key.
+    ///
+    /// An undeclared range is CP (strong-by-default), and an AP region is already registered by
+    /// whoever declared it, so anything still missing a group is CP by definition.
+    ///
+    /// Idempotent: checks `mr.group(id)` before building anything, because constructing a group
+    /// opens a WAL and spawns an actor thread.
+    async fn found_missing_regions(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(mr) = self.raft.as_ref() else { return Ok(()) };
+        let mut founded = Vec::new();
+        for region in self.regions.list() {
+            if mr.group(region.id).is_some() {
+                continue;
+            }
+            if self.ap.as_ref().is_some_and(|ap| ap.hosts(region.id)) {
+                continue;
+            }
+            self.found_region(
+                region.id,
+                region.start.clone(),
+                region.end.clone(),
+                self.voters.clone(),
+                self.peers.clone(),
+            )?;
+            founded.push(region.id);
+        }
+
+        // Campaign at once rather than idling out a randomized election timeout, for the same
+        // reason the PD path does: a brand-new region has no prior term, no data, and no competing
+        // candidate, so the wait buys nothing and delays the first write by 300-600ms.
+        for id in founded {
+            if self.voters.iter().min().is_none_or(|lowest| *lowest == self.node_id) {
+                if let Some(group) = mr.group(id) {
+                    group.campaign().await;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The region ids this node currently hosts, sorted. Introspection for tests and tooling —
     /// the routing table is otherwise private.
     pub fn hosted_region_ids(&self) -> Vec<u64> {
@@ -1792,6 +1838,12 @@ impl KvService for KvApi {
         let (left, right) = run_blocking(move || regions.split(&split_key))
             .await?
             .map_err(|e| Status::invalid_argument(format!("split: {e}")))?;
+        // The right half is a brand-new region; on a replicated node it needs its own group or
+        // its keys route nowhere.
+        self.state
+            .found_missing_regions()
+            .await
+            .map_err(|e| Status::internal(format!("split: {e}")))?;
         // Tell PD about the new topology so clients re-routing after a RegionStale see it.
         if let Err(e) = self.state.heartbeat().await {
             return Err(Status::internal(format!("split applied but PD heartbeat failed: {e}")));
@@ -1923,6 +1975,13 @@ impl KvService for KvApi {
                 ap.insert(region.id, &HashMap::new());
             }
         }
+
+        // The carve also produced gap regions either side of the table. Without groups behind
+        // them, every untabled key sorting after this table would route into a dead region.
+        self.state
+            .found_missing_regions()
+            .await
+            .map_err(|e| Status::internal(format!("create_table: {e}")))?;
 
         self.state.declared.lock().unwrap().push((req.name.clone(), regime));
 
