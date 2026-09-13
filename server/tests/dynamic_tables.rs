@@ -15,6 +15,8 @@ use tokio::net::TcpListener;
 
 struct TestServer {
     addr: SocketAddr,
+    /// Kept so a test can assert on node-internal invariants the wire doesn't expose.
+    state: std::sync::Arc<arcux_server::AppState>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     handle: tokio::task::JoinHandle<()>,
     /// `None` when the caller owns the data directory, which is how a restart test keeps the
@@ -50,6 +52,7 @@ impl TestServer {
     ) -> Result<TestServer, Box<dyn std::error::Error + Send + Sync>> {
         let state =
             arcux_server::open_catalog_node(Options::new(data_dir), 1, voters, Default::default(), tables)?;
+        let observed = state.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -59,7 +62,7 @@ impl TestServer {
             })
             .await;
         });
-        Ok(TestServer { addr, shutdown: Some(tx), handle, _dir: None })
+        Ok(TestServer { addr, state: observed, shutdown: Some(tx), handle, _dir: None })
     }
 
     fn client(&self) -> Client {
@@ -288,6 +291,87 @@ async fn create_table_is_rejected_on_a_multi_node_cluster() {
         ),
         other => panic!("expected an Rpc error, got {other:?}"),
     }
+
+    srv.stop().await;
+}
+
+/// Carving a table splits the enclosing range into three — the table, and a gap either side. Each
+/// piece is a region, and a region with no Raft group behind it routes keys nowhere: `group_for`
+/// returns `None`, the handler reports `NotLeader`, and the client waits forever for a leader that
+/// can never be elected.
+///
+/// Before this was fixed, creating a table silently broke every untabled key sorting *after* its
+/// prefix. Silently — the node kept serving everything else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn untabled_keys_around_a_declared_table_still_work() {
+    let srv = TestServer::start().await;
+    let mut c = srv.client();
+
+    // "aaa" sorts before "m/", so it lives in the original region either way.
+    put_until_ready(&mut c, "", b"aaa", b"1").await;
+    c.create_table("m", Regime::Cp).await.unwrap();
+
+    // "zzz" sorts after "m0" — the gap the carve leaves on the right, which used to have no group.
+    put_until_ready(&mut c, "", b"zzz", b"9").await;
+    assert_eq!(c.get("", b"zzz".to_vec()).await.unwrap(), Some(b"9".to_vec()));
+    assert_eq!(c.get("", b"aaa".to_vec()).await.unwrap(), Some(b"1".to_vec()));
+
+    srv.stop().await;
+}
+
+/// The same hole between two tables, not just after the last one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_untabled_key_between_two_tables_still_works() {
+    let srv = TestServer::start().await;
+    let mut c = srv.client();
+
+    c.create_table("a", Regime::Cp).await.unwrap();
+    c.create_table("c", Regime::Cp).await.unwrap();
+
+    // "b" sorts between "a0" and "c/" — a gap region created by the second carve.
+    put_until_ready(&mut c, "", b"b", b"mid").await;
+    assert_eq!(c.get("", b"b".to_vec()).await.unwrap(), Some(b"mid".to_vec()));
+
+    srv.stop().await;
+}
+
+/// The invariant behind both tests above: a carve produces more regions than the one being carved,
+/// and every one of them needs a group. Asserted directly so a regression names the cause rather
+/// than surfacing as a mysterious hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_region_has_a_group_after_a_carve() {
+    let srv = TestServer::start().await;
+    let mut c = srv.client();
+    c.create_table("a", Regime::Cp).await.unwrap();
+    c.create_table("c", Regime::Cp).await.unwrap();
+
+    let ids = srv.state.hosted_region_ids();
+    assert!(ids.len() >= 5, "two tables carve at least five regions, got {ids:?}");
+    for id in ids {
+        assert!(
+            srv.state.raft_group(id).is_some(),
+            "region {id} has a routing entry but no Raft group — its keys route nowhere"
+        );
+    }
+
+    srv.stop().await;
+}
+
+/// `SplitRegion` has the same shape as a carve — the right half is a brand-new region — so it had
+/// the same hole. Both pre-existing split tests run unreplicated (`open_with_pd`, no Raft groups),
+/// which is why nothing caught it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_split_on_a_replicated_node_serves_both_halves() {
+    let srv = TestServer::start().await;
+    let mut c = srv.client();
+
+    put_until_ready(&mut c, "", b"a", b"left").await;
+    c.split_region(b"m".to_vec()).await.unwrap();
+
+    // "z" is in the right half, which before the fix had a routing entry and no group.
+    put_until_ready(&mut c, "", b"z", b"right").await;
+    assert_eq!(c.get("", b"z".to_vec()).await.unwrap(), Some(b"right".to_vec()));
+    assert_eq!(c.get("", b"a".to_vec()).await.unwrap(), Some(b"left".to_vec()));
 
     srv.stop().await;
 }
