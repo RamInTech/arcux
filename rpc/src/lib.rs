@@ -40,7 +40,18 @@
 /// it with a stable id, and versions the assignment so a node can ignore a stale one. Added the
 /// internal `kv.Reconcile` RPC so PD can push a new assignment instead of waiting out the
 /// heartbeat.
-pub const VERSION: u32 = 15;
+/// v16 (numeric table ids): added `id` to `kv.TableInfo` and `pd.TableDecl`, `table_id` to both
+/// `CreateTableResponse`s, and `pd.NodeAddr` + `nodes` on `pd.HeartbeatResponse`. A table is now
+/// identified by a PD-allocated `u32` rather than by its name: every key is stored under a 4-byte
+/// big-endian id prefix, so a table owns exactly `[be32(id), be32(id+1))` and the untabled gap
+/// regions that name prefixes left between tables no longer exist. Requests still name the table
+/// as a string; the server resolves it to an id. `nodes` carries the voter addresses a node used
+/// to get from `--peer` flags, which PD now serves instead.
+/// v17 (up-replication): added `desired` to `pd.Region` — the voter set PD wants a region to grow
+/// to, alongside the `voters` it actually has. Regions are founded by the nodes registered when they
+/// are created and grow by membership change as more register, up to a replication target, rather
+/// than every node guessing the voter set at founding from one global list.
+pub const VERSION: u32 = 17;
 
 /// KV API v1 — the transactional + autocommit surface (fully implemented in Phase 2).
 pub mod kv {

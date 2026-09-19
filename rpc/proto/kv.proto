@@ -164,7 +164,8 @@ message GetRequest {
   bytes key = 1;
   uint64 read_ts = 2;  // 0 => server allocates "now"
   Context context = 3;
-  string table = 4;  // table name; server/client prepend "<table>/" before routing/storage
+  string table = 4;  // table name; the server maps it to the table's id and stores/routes the
+                     // key as be32(id) ++ key. Empty means the `default` table (id 0).
   reserved 50 to 99;
 }
 message GetResponse {
@@ -179,7 +180,8 @@ message PutRequest {
   bytes key = 1;
   bytes value = 2;
   Context context = 3;
-  string table = 4;  // table name; server/client prepend "<table>/" before routing/storage
+  string table = 4;  // table name; the server maps it to the table's id and stores/routes the
+                     // key as be32(id) ++ key. Empty means the `default` table (id 0).
   reserved 50 to 99;
 }
 message PutResponse {
@@ -191,7 +193,8 @@ message PutResponse {
 message DeleteRequest {
   bytes key = 1;
   Context context = 2;
-  string table = 3;  // table name; server/client prepend "<table>/" before routing/storage
+  string table = 3;  // table name; the server maps it to the table's id and stores/routes the
+                     // key as be32(id) ++ key. Empty means the `default` table (id 0).
   reserved 50 to 99;
 }
 message DeleteResponse {
@@ -210,7 +213,9 @@ message ScanRequest {
   uint32 limit = 3;
   uint64 read_ts = 4;
   Context context = 5;
-  string table = 6;  // table name; empty start_key+end_key => "scan the whole table"
+  string table = 6;  // table name; empty start_key+end_key => "scan the whole table". Bounds are
+                     // bare user keys — the server prefixes them with the table's id, and strips
+                     // that prefix from every key it returns. Empty means `default` (id 0).
   reserved 50 to 99;
 }
 message ScanResponse {
@@ -258,6 +263,7 @@ message CreateTableRequest {
 }
 message CreateTableResponse {
   RegionInfo region = 1;  // the newly carved region hosting the table
+  uint32 table_id = 2;    // the id PD allocated; every key in this table is stored under be32(id)
   reserved 50 to 99;
 }
 
@@ -267,6 +273,7 @@ message ListTablesRequest {
 message TableInfo {
   string name = 1;
   Regime regime = 2;
+  uint32 id = 3;  // the table's id — the be32 prefix every one of its keys is stored under
   reserved 50 to 99;
 }
 message ReconcileRequest {
@@ -279,8 +286,8 @@ message ReconcileResponse {
 }
 
 message ListTablesResponse {
-  // Declared tables, sorted by name. The untabled "" default namespace is never an entry —
-  // it is reserved rather than declarable, and is always CP.
+  // Every table, sorted by name, including the built-in `default` (id 0, always CP) that an
+  // empty table name resolves to. `default` is reserved: it always exists and is never declarable.
   repeated TableInfo tables = 1;
   reserved 50 to 99;
 }

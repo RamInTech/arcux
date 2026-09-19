@@ -39,10 +39,19 @@ enum Regime {
   AP = 1;
 }
 
-// One table's declaration, as a node reports it.
+// One table in PD's catalog: its name, how it is served, and the id PD allocated for it.
 message TableDecl {
   string name = 1;
   Regime regime = 2;
+  uint32 id = 3;  // PD-allocated; the table owns [be32(id), be32(id+1)). 0 is `default`.
+  reserved 50 to 99;
+}
+
+// A node and the endpoint its peers reach it at. PD hands these out so a node can talk to the
+// other voters of a region it was assigned without having been told about them at startup.
+message NodeAddr {
+  uint64 node_id = 1;
+  string address = 2;
   reserved 50 to 99;
 }
 
@@ -58,6 +67,10 @@ message Region {
   repeated uint64 voters = 8;   // the region's replica set; empty => unreplicated/legacy.
                                 // node_id above names one holder, which cannot describe a
                                 // three-voter region on its own.
+  repeated uint64 desired = 9;  // the voter set PD wants: `voters` plus the live nodes it should
+                                // grow to, capped at the replication target. A node listed here
+                                // but not in `voters` joins as a learner; the region's leader
+                                // adds it by membership change. Empty on a node's own report.
   reserved 50 to 99;
 }
 
@@ -102,8 +115,12 @@ message HeartbeatResponse {
   // any assignment carrying a version it has already applied, so a reordered or replayed
   // response can never walk it back to older state.
   uint64 catalog_version = 2;
-  // The tables PD's catalog holds, so a node adopting an assignment also learns their regimes.
+  // The tables PD's catalog holds, so a node adopting an assignment also learns their ids and
+  // regimes — which is how it resolves a request's table name to the id its keys are stored under.
   repeated TableDecl tables = 3;
+  // Where to reach every node PD knows about. A region's `voters` are ids; these are the
+  // addresses for them, so a node can found a group with peers it was never given at startup.
+  repeated NodeAddr nodes = 4;
   reserved 50 to 99;
 }
 
@@ -115,6 +132,7 @@ message CreateTableRequest {
 message CreateTableResponse {
   Region region = 1;          // the newly carved region, with its stable id and voter set
   uint64 catalog_version = 2; // the version this declaration produced
+  uint32 table_id = 3;        // the id PD allocated for the table
   reserved 50 to 99;
 }
 
