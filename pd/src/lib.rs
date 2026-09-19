@@ -24,6 +24,7 @@
 
 pub mod cluster;
 pub mod convert;
+pub mod format;
 mod persist;
 pub mod raft_group;
 pub mod raft_server;
@@ -35,7 +36,11 @@ pub mod service;
 pub mod tso;
 
 pub use cluster::{Membership, PlacedRegion, Regime, ReplicaSet, TableConflict};
-pub use region::{prefix_successor, table_prefix};
+pub use region::{name_prefix, prefix_successor};
+pub use region::{
+    strip_table_prefix, table_id_of, table_key, table_prefix, table_range, TableId,
+    DEFAULT_TABLE_ID, DEFAULT_TABLE_NAME, TABLE_PREFIX_LEN,
+};
 pub use raft_group::{PdGroup, PdGroupOptions};
 pub use region::{region_id, Region, RegionRegistry};
 pub use replicated::{PdCmd, PdFsm, PdReplica, Ready};

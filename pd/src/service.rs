@@ -15,7 +15,6 @@ use arcux_rpc::pd::{
 use crate::cluster::now_ms;
 use crate::convert::{
     list_tables_response, placed_to_proto, replica_set_from_proto, replica_set_to_proto,
-    table_decl_from_proto,
 };
 use crate::{Membership, Tso};
 
@@ -75,9 +74,7 @@ impl PdService for PdApi {
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let req = request.into_inner();
         let reported = req.regions.iter().map(replica_set_from_proto).collect();
-        let tables = req.tables.iter().map(table_decl_from_proto).collect();
-        let assigned =
-            self.members.heartbeat(req.node_id, req.address, reported, tables, now_ms());
+        let assigned = self.members.heartbeat(req.node_id, req.address, reported, now_ms());
         Ok(Response::new(HeartbeatResponse {
             regions: assigned.iter().map(replica_set_to_proto).collect(),
             // Single-process PD holds no authoritative region table, so it never carves and its
@@ -85,6 +82,7 @@ impl PdService for PdApi {
             // adopt", which is exactly what a node should conclude.
             catalog_version: 0,
             tables: Vec::new(),
+            nodes: Vec::new(),
         }))
     }
 
@@ -101,15 +99,13 @@ impl PdService for PdApi {
         ))
     }
 
-    /// The cluster-wide catalog PD has heard, plus any table two nodes describe differently.
+    /// Empty here. The catalog lives in the replicated PD's state machine, which is the only
+    /// place a table can be declared — see [`create_table`](Self::create_table).
     async fn list_tables(
         &self,
         _request: Request<ListTablesRequest>,
     ) -> Result<Response<ListTablesResponse>, Status> {
-        Ok(Response::new(list_tables_response(
-            self.members.tables(),
-            self.members.table_conflicts(),
-        )))
+        Ok(Response::new(list_tables_response(Vec::new(), Vec::new())))
     }
 
     /// The whole live region view, tagged with owners (for client routing caches/tooling).

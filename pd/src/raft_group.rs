@@ -21,6 +21,7 @@ use arcux_rpc::raft::raft_service_client::RaftServiceClient;
 use tonic::transport::Channel;
 
 use crate::raft_wire as xport;
+use crate::region::{table_prefix, TableId};
 use crate::{PdCmd, PdFsm, PdReplica, Regime, ReplicaSet};
 use arcux_raft_wal::WalStorage;
 
@@ -41,7 +42,6 @@ enum Cmd {
         node_id: u64,
         address: String,
         regions: Vec<ReplicaSet>,
-        tables: Vec<(String, Regime)>,
         now: u64,
         reply: tokio::sync::oneshot::Sender<Option<Vec<ReplicaSet>>>,
     },
@@ -53,7 +53,7 @@ enum Cmd {
     DeclareTable {
         name: String,
         regime: Regime,
-        reply: tokio::sync::oneshot::Sender<Option<(ReplicaSet, u64)>>,
+        reply: tokio::sync::oneshot::Sender<Option<(TableId, ReplicaSet, u64)>>,
     },
     Stop,
 }
@@ -64,9 +64,10 @@ type PendingHeartbeat = (u64, tokio::sync::oneshot::Sender<Option<Vec<ReplicaSet
 /// A parked timestamp allocation: the count requested, and where to send `(first, count)` once
 /// the reservation commits.
 type PendingAllocTs = (u64, tokio::sync::oneshot::Sender<Option<(u64, u64)>>);
-/// A parked declaration: the table's start key (to look its region up once carved) and where to
-/// send the result.
-type PendingDeclare = (Vec<u8>, tokio::sync::oneshot::Sender<Option<(ReplicaSet, u64)>>);
+/// A parked declaration: the table's **name** and where to send the result. The name, not a start
+/// key, because the id — and so the key range — is allocated when the entry applies, which has not
+/// happened yet at propose time.
+type PendingDeclare = (String, tokio::sync::oneshot::Sender<Option<(TableId, ReplicaSet, u64)>>);
 
 /// Observable role/leader, read without messaging the actor (the hot path for redirect).
 #[derive(Clone)]
@@ -128,20 +129,23 @@ impl PdGroup {
         node_id: u64,
         address: String,
         regions: Vec<ReplicaSet>,
-        tables: Vec<(String, Regime)>,
         now: u64,
     ) -> Option<Vec<ReplicaSet>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = Cmd::Heartbeat { node_id, address, regions, tables, now, reply: tx };
+        let cmd = Cmd::Heartbeat { node_id, address, regions, now, reply: tx };
         if self.cmd_tx.send(cmd).is_err() {
             return None;
         }
         rx.await.ok().flatten()
     }
 
-    /// Declare a table cluster-wide through Raft. Returns the carved region and the catalog
-    /// version it produced, or `None` if this node isn't the leader.
-    pub async fn declare_table(&self, name: String, regime: Regime) -> Option<(ReplicaSet, u64)> {
+    /// Declare a table cluster-wide through Raft. Returns the id PD allocated, the carved region,
+    /// and the catalog version it produced, or `None` if this node isn't the leader.
+    pub async fn declare_table(
+        &self,
+        name: String,
+        regime: Regime,
+    ) -> Option<(TableId, ReplicaSet, u64)> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self.cmd_tx.send(Cmd::DeclareTable { name, regime, reply: tx }).is_err() {
             return None;
@@ -281,11 +285,11 @@ fn run_actor(
                 replica.step(m);
                 reply = Some((from, tx));
             }
-            Cmd::Heartbeat { node_id, address, regions, tables, now, reply: tx } => {
+            Cmd::Heartbeat { node_id, address, regions, now, reply: tx } => {
                 if !replica.is_leader() {
                     let _ = tx.send(None);
                 } else {
-                    let cmd = PdCmd::Heartbeat { node_id, address, regions, tables, now };
+                    let cmd = PdCmd::Heartbeat { node_id, address, regions, now };
                     match replica.propose(&cmd) {
                         Ok(index) => {
                             pending_hb.insert(index, (node_id, tx));
@@ -300,10 +304,10 @@ fn run_actor(
                 if !replica.is_leader() {
                     let _ = tx.send(None);
                 } else {
-                    let start = crate::table_prefix(&name);
+                    let parked = name.clone();
                     match replica.propose(&PdCmd::DeclareTable { name, regime }) {
                         Ok(index) => {
-                            pending_decl.insert(index, (start, tx));
+                            pending_decl.insert(index, (parked, tx));
                         }
                         Err(_) => {
                             let _ = tx.send(None);
@@ -357,11 +361,19 @@ fn run_actor(
             if let Some((node_id, tx)) = pending_hb.remove(&index) {
                 let _ = tx.send(Some(replica.fsm().assignment_for(node_id)));
             }
-            if let Some((start, tx)) = pending_decl.remove(&index) {
-                // The carve has been applied by now — look the table's region up by its start key.
+            if let Some((name, tx)) = pending_decl.remove(&index) {
+                // The carve has been applied by now, so the id exists: resolve the name to it,
+                // then find the region that id owns. A declaration that lost a race to an
+                // identical name resolves to the existing table, which is the idempotent answer.
                 let fsm = replica.fsm();
-                let carved = fsm.assignment().into_iter().find(|rs| rs.region.start == start);
-                let _ = tx.send(carved.map(|rs| (rs, fsm.catalog_version())));
+                let resolved = fsm.table_id(&name).and_then(|id| {
+                    let start = table_prefix(id).to_vec();
+                    fsm.assignment()
+                        .into_iter()
+                        .find(|rs| rs.region.start == start)
+                        .map(|rs| (id, rs, fsm.catalog_version()))
+                });
+                let _ = tx.send(resolved);
             }
             if let Some((count, tx)) = pending_ts.remove(&index) {
                 // The reservation raised the high-water enough that this now succeeds.

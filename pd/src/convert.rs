@@ -8,6 +8,7 @@
 
 use arcux_rpc::pd;
 
+use crate::cluster::Table;
 use crate::{PlacedRegion, Regime, Region, ReplicaSet};
 
 /// In-memory region → wire region, ownership left unset (the node→PD direction; PD
@@ -22,6 +23,7 @@ pub fn to_proto(r: &Region) -> pd::Region {
         address: String::new(),
         regime: pd::Regime::Cp as i32,
         voters: Vec::new(),
+        desired: Vec::new(),
     }
 }
 
@@ -37,13 +39,19 @@ pub fn replica_set_to_proto(rs: &ReplicaSet) -> pd::Region {
         address: String::new(),
         regime: regime_to_proto(rs.regime) as i32,
         voters: rs.voters.clone(),
+        desired: rs.desired.clone(),
     }
 }
 
 /// Wire region → replica set. An older peer sends neither field, which decodes to the
 /// strong-by-default `Cp` and an empty voter set — the same shape as an unreplicated node.
 pub fn replica_set_from_proto(r: &pd::Region) -> ReplicaSet {
-    ReplicaSet { region: from_proto(r), regime: regime_from_proto(r.regime), voters: r.voters.clone() }
+    ReplicaSet {
+        region: from_proto(r),
+        regime: regime_from_proto(r.regime),
+        voters: r.voters.clone(),
+        desired: r.desired.clone(),
+    }
 }
 
 pub fn regime_to_proto(regime: Regime) -> pd::Regime {
@@ -62,13 +70,18 @@ pub fn regime_from_proto(regime: i32) -> Regime {
     }
 }
 
-/// One table's declaration, both directions.
-pub fn table_decl_to_proto(name: &str, regime: Regime) -> pd::TableDecl {
-    pd::TableDecl { name: name.to_string(), regime: regime_to_proto(regime) as i32 }
+/// One table, both directions.
+pub fn table_to_proto(t: &Table) -> pd::TableDecl {
+    pd::TableDecl { name: t.name.clone(), regime: regime_to_proto(t.regime) as i32, id: t.id }
 }
 
-pub fn table_decl_from_proto(t: &pd::TableDecl) -> (String, Regime) {
-    (t.name.clone(), regime_from_proto(t.regime))
+pub fn table_from_proto(t: &pd::TableDecl) -> Table {
+    Table { id: t.id, name: t.name.clone(), regime: regime_from_proto(t.regime) }
+}
+
+/// Where a node can be reached, for the voter addresses PD hands out with an assignment.
+pub fn node_addr_to_proto(node_id: u64, address: &str) -> pd::NodeAddr {
+    pd::NodeAddr { node_id, address: address.to_string() }
 }
 
 /// Placed region → wire region, carrying its owning node id + address (the PD→client
@@ -83,6 +96,7 @@ pub fn placed_to_proto(p: &PlacedRegion) -> pd::Region {
         address: p.address.clone(),
         regime: regime_to_proto(p.regime) as i32,
         voters: p.voters.clone(),
+        desired: Vec::new(),
     }
 }
 
@@ -95,11 +109,11 @@ pub fn from_proto(r: &pd::Region) -> Region {
 /// Build a `ListTables` reply from PD's in-memory view — shared by the single-process and
 /// replicated services so both answer identically.
 pub fn list_tables_response(
-    tables: Vec<(String, Regime)>,
+    tables: Vec<Table>,
     conflicts: Vec<crate::TableConflict>,
 ) -> pd::ListTablesResponse {
     pd::ListTablesResponse {
-        tables: tables.iter().map(|(n, r)| table_decl_to_proto(n, *r)).collect(),
+        tables: tables.iter().map(table_to_proto).collect(),
         conflicts: conflicts
             .iter()
             .map(|c| pd::TableConflict {

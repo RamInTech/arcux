@@ -22,7 +22,8 @@
 //! the mechanical next step; it reuses the same `raft.proto` the data-node groups already
 //! speak.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use arcux_raft::{Config, EntryType, MemStorage, Message, ProposeError, RaftNode, Storage};
@@ -30,16 +31,20 @@ use arcux_raft::{Config, EntryType, MemStorage, Message, ProposeError, RaftNode,
 use crate::persist::{get_bytes, get_u32, get_u64, put_bytes};
 use std::sync::Mutex;
 
-use crate::cluster::{regime_of, regime_tag};
-use crate::region::RegionRegistry;
-use crate::{prefix_successor, table_prefix};
-use crate::{Membership, PlacedRegion, Regime, Region, ReplicaSet, TableConflict};
+use crate::cluster::{regime_of, regime_tag, Table};
+use crate::region::{
+    table_id_of, table_prefix, RegionRegistry, TableId, DEFAULT_TABLE_ID, DEFAULT_TABLE_NAME,
+};
+use crate::{Membership, PlacedRegion, Regime, Region, ReplicaSet};
 
 /// How far ahead of the current need a `ReserveTs` raises the high-water. Larger ⇒ fewer Raft
 /// round-trips on the timestamp path, at the cost of more timestamps skipped on a failover
 /// (the new leader resumes at the committed `upper`, discarding the leader's unused tail).
 /// Mirrors the single-process oracle's window ([`crate::Tso`]).
 const RESERVE_WINDOW: u64 = 1 << 16;
+
+/// How many voters PD grows each region to, unless `--replicas` says otherwise. TiKV's default.
+pub const DEFAULT_REPLICAS: usize = 3;
 
 /// A command in PD's replicated log. Encoded into a Raft entry's opaque `data`; every replica
 /// decodes and applies the identical sequence, so their [`PdFsm`]s stay bit-for-bit in sync.
@@ -49,11 +54,11 @@ pub enum PdCmd {
     /// serving any timestamp `< upper`, so the committed watermark is always an upper bound on
     /// every timestamp handed out — and a new leader resuming from it never regresses.
     ReserveTs { upper: u64 },
-    /// Declare a table cluster-wide. Applying it carves the table's range out of PD's region
-    /// table (two `RegionRegistry::split`s, so ids stay stable and only genuinely new pieces get
-    /// fresh ones), records the declaration, and bumps the catalog version. Idempotent: a name
-    /// already declared is a no-op, which matters because an entry can be re-applied after a
-    /// restart.
+    /// Declare a table cluster-wide. Applying it allocates the table's id, carves its range out
+    /// of PD's region table (one `RegionRegistry::split` of the tail, which is empty by
+    /// construction), and bumps the catalog version. Idempotent: a name already declared is a
+    /// no-op, which matters because an entry can be re-applied after a restart — and is why the
+    /// name check comes before the allocation, so a replay cannot burn an id.
     DeclareTable { name: String, regime: Regime },
     /// Record a data node's heartbeat: its serving `address`, the `regions` it owns, and the
     /// wall-clock `now` (ms, for liveness). Applied via [`Membership::heartbeat`] on every
@@ -62,8 +67,6 @@ pub enum PdCmd {
         node_id: u64,
         address: String,
         regions: Vec<ReplicaSet>,
-        /// The tables this node has declared, so PD holds the cluster-wide catalog view.
-        tables: Vec<(String, Regime)>,
         now: u64,
     },
 }
@@ -84,7 +87,7 @@ impl PdCmd {
                 put_bytes(&mut out, name.as_bytes());
                 out.push(regime_tag(*regime));
             }
-            PdCmd::Heartbeat { node_id, address, regions, tables, now } => {
+            PdCmd::Heartbeat { node_id, address, regions, now } => {
                 out.push(2);
                 out.extend_from_slice(&node_id.to_be_bytes());
                 out.extend_from_slice(&now.to_be_bytes());
@@ -92,11 +95,6 @@ impl PdCmd {
                 out.extend_from_slice(&(regions.len() as u32).to_be_bytes());
                 for rs in regions {
                     put_replica_set(&mut out, rs);
-                }
-                out.extend_from_slice(&(tables.len() as u32).to_be_bytes());
-                for (name, regime) in tables {
-                    put_bytes(&mut out, name.as_bytes());
-                    out.push(regime_tag(*regime));
                 }
             }
         }
@@ -124,15 +122,7 @@ impl PdCmd {
                 for _ in 0..n {
                     regions.push(get_replica_set(bytes, &mut pos)?);
                 }
-                let t = get_u32(bytes, &mut pos)? as usize;
-                let mut tables = Vec::with_capacity(t);
-                for _ in 0..t {
-                    let name = String::from_utf8(get_bytes(bytes, &mut pos)?.to_vec()).ok()?;
-                    let regime = regime_of(*bytes.get(pos)?)?;
-                    pos += 1;
-                    tables.push((name, regime));
-                }
-                Some(PdCmd::Heartbeat { node_id, address, regions, tables, now })
+                Some(PdCmd::Heartbeat { node_id, address, regions, now })
             }
             _ => None,
         }
@@ -152,16 +142,31 @@ pub struct PdFsm {
     /// identically, and `split`'s monotonic `next_id` gives ids that stay stable across a
     /// declaration instead of renumbering the way a positional tiling would.
     regions: RegionRegistry,
-    /// Declared tables, in declaration order. A region's regime is *derived* from this by
-    /// longest-prefix match rather than stored per region, so there is one source of truth.
-    catalog: Mutex<Vec<(String, Regime)>>,
+    /// Declared tables, in declaration order. A region's regime is *derived* from this by the
+    /// table id its start key carries, rather than stored per region, so there is one source of
+    /// truth.
+    catalog: Mutex<Vec<Table>>,
+    /// The next table id to hand out. Bumped inside [`PdFsm::apply`], never by the proposing
+    /// leader: the log order is what makes every replica allocate identically, and it is what
+    /// stops a re-proposal after a lost election from issuing one id twice. Same discipline as
+    /// [`RegionRegistry`]'s `next_id`.
+    next_table_id: AtomicU32,
     /// Bumped on every accepted declaration. Nodes ignore an assignment carrying a version they
     /// have already applied, so a reordered or replayed response cannot walk them back.
     version: AtomicU64,
-    /// The cluster's replica set, learned from heartbeats. Catalog mode gives every region the
-    /// same voters, so one set is the honest model here; per-region placement is Phase-6
-    /// rebalancing.
-    voters: Mutex<Vec<u64>>,
+    /// Each region's **actual** Raft voters, by region id.
+    ///
+    /// Per region, because a Raft group's membership is fixed when it is founded and changes only
+    /// by membership change. One global list recomputed on every heartbeat — what this replaced —
+    /// let the same region be founded with different voters depending on when each node happened
+    /// to reconcile, and three nodes could each found region 1 alone.
+    ///
+    /// Set once, inside `apply`, when a region is first founded; after that it only **grows**, when
+    /// the region's leader reports a larger voter set it has reached by membership change.
+    region_members: Mutex<BTreeMap<u64, Vec<u64>>>,
+    /// The voter count each region is grown toward. Configuration, not replicated state — every
+    /// PD replica must be started with the same value, as with its topology.
+    replicas: AtomicUsize,
 }
 
 impl PdFsm {
@@ -173,10 +178,31 @@ impl PdFsm {
             // tables tiles to — so PD and a fresh node agree before anything is declared, and
             // `split` has a region to carve from.
             regions: RegionRegistry::in_memory(),
-            catalog: Mutex::new(Vec::new()),
-            version: AtomicU64::new(0),
-            voters: Mutex::new(Vec::new()),
+            // `default` exists from the first instant: its id is fixed, so it needs no allocation,
+            // and the seeded whole-keyspace region above *is* its region until a table is carved
+            // off the tail. That makes an omitted table name resolve on a cluster that has never
+            // had a declaration.
+            catalog: Mutex::new(vec![Table {
+                id: DEFAULT_TABLE_ID,
+                name: DEFAULT_TABLE_NAME.to_string(),
+                regime: Regime::Cp,
+            }]),
+            next_table_id: AtomicU32::new(DEFAULT_TABLE_ID + 1),
+            // 1, not 0: a node treats version 0 as "PD holds no catalog, nothing to adopt", which
+            // is true only of the single-process PD. This PD has `default` from the start.
+            version: AtomicU64::new(1),
+            region_members: Mutex::new(BTreeMap::new()),
+            replicas: AtomicUsize::new(DEFAULT_REPLICAS),
         }
+    }
+
+    /// Set the replication target (`arcux-pd --replicas N`). At least 1.
+    pub fn set_replicas(&self, n: usize) {
+        self.replicas.store(n.max(1), Ordering::SeqCst);
+    }
+
+    fn replicas(&self) -> usize {
+        self.replicas.load(Ordering::SeqCst)
     }
 
     /// Apply one committed command. Deterministic given the state + bytes, so replicas that
@@ -190,41 +216,127 @@ impl PdFsm {
             PdCmd::ReserveTs { upper } => {
                 self.tso_upper.fetch_max(upper, Ordering::SeqCst);
             }
-            PdCmd::Heartbeat { node_id, address, regions, tables, now } => {
-                // Learn the cluster's replica set from what nodes report; a new region inherits it.
-                if let Some(rs) = regions.iter().find(|rs| !rs.voters.is_empty()) {
-                    *self.voters.lock().expect("voters poisoned") = rs.voters.clone();
+            PdCmd::Heartbeat { node_id, address, regions, now } => {
+                let is_new = !self.members.node_addrs().iter().any(|(id, _)| *id == node_id);
+                let grown = self.adopt_grown_voters(node_id, &regions);
+                self.members.heartbeat(node_id, address, regions, now);
+                let founded = self.found_unfounded_regions();
+                // A new node changes every region's desired set; a grown or founded region changes
+                // its members. Any of them is a new assignment, and bumping the version is what
+                // makes each node's version-gated reconcile pick it up.
+                if is_new || grown || founded {
+                    self.version.fetch_add(1, Ordering::SeqCst);
                 }
-                self.members.heartbeat(node_id, address, regions, tables, now);
             }
-            PdCmd::DeclareTable { name, regime } => self.declare_table(name, regime),
+            PdCmd::DeclareTable { name, regime } => {
+                self.declare_table(name, regime);
+                // The carved region has no members yet: found it with the live nodes, so a table
+                // created on a formed cluster starts fully replicated instead of growing into it.
+                self.found_unfounded_regions();
+            }
         }
     }
 
-    /// Carve a declared table's range out of the region table. Deterministic and idempotent, as
-    /// every `PdFsm::apply` must be.
-    fn declare_table(&self, name: String, regime: Regime) {
-        if name.is_empty() {
-            return; // "" is the reserved untabled namespace, never a declarable table
+    /// Give every region with no members its founding set: the first `replicas` live nodes, in
+    /// node-id order. Run inside `apply`, so every PD replica picks the same set.
+    ///
+    /// On a fresh cluster the first node to register is the only live one, so it founds `default`
+    /// **alone** — the bootstrap TiKV and CockroachDB use too — and the region grows as more
+    /// nodes register. Returns whether anything was founded.
+    fn found_unfounded_regions(&self) -> bool {
+        let live = self.members.live_nodes();
+        if live.is_empty() {
+            return false;
         }
-        {
-            let mut catalog = self.catalog.lock().expect("catalog poisoned");
-            if catalog.iter().any(|(n, _)| n == &name) {
-                return; // already declared — re-applying a committed entry must not re-carve
+        let founding: Vec<u64> = live.into_iter().take(self.replicas()).collect();
+        let mut members = self.region_members.lock().expect("members poisoned");
+        let mut founded = false;
+        for region in self.regions.list() {
+            let entry = members.entry(region.id).or_default();
+            if entry.is_empty() {
+                *entry = founding.clone();
+                founded = true;
             }
-            catalog.push((name.clone(), regime));
         }
+        founded
+    }
 
-        // Two splits, exactly as the single-node carve does: at the table's start, then at its
-        // end unless that is already a boundary. Existing regions keep their ids.
-        let start = table_prefix(&name);
-        let end = prefix_successor(&start).unwrap_or_default();
-        if self.regions.route(&start).map(|r| r.start != start).unwrap_or(false) {
-            let _ = self.regions.split(&start);
+    /// Adopt a larger voter set a node reports for a region it leads (a node reports voters only
+    /// for regions it leads, so this is the group's own committed view).
+    ///
+    /// Only **growth** is taken: the report must contain every current member plus at least one
+    /// more. Removing a voter is not something this path does, so a report that drops one is a
+    /// stale view and is ignored rather than trusted. Returns whether anything grew.
+    fn adopt_grown_voters(&self, node_id: u64, reported: &[ReplicaSet]) -> bool {
+        let known: Vec<u64> = self.regions.list().iter().map(|r| r.id).collect();
+        let mut members = self.region_members.lock().expect("members poisoned");
+        let mut grown = false;
+        for rs in reported {
+            if !rs.voters.contains(&node_id) || !known.contains(&rs.region.id) {
+                continue;
+            }
+            let current = members.entry(rs.region.id).or_default();
+            if rs.voters.len() > current.len() && current.iter().all(|v| rs.voters.contains(v)) {
+                let mut voters = rs.voters.clone();
+                voters.sort_unstable();
+                *current = voters;
+                grown = true;
+            }
         }
-        if !end.is_empty() && self.regions.route(&start).map(|r| r.end != end).unwrap_or(false) {
-            let _ = self.regions.split(&end);
+        grown
+    }
+
+    /// The voter set PD wants for a region: its members, plus live nodes not yet among them, in
+    /// node-id order, until there are `replicas` of them. Never smaller than the members —
+    /// removing a voter is out of this path's scope.
+    fn desired(&self, members: &[u64], live: &[u64]) -> Vec<u64> {
+        let mut desired = members.to_vec();
+        for id in live {
+            if desired.len() >= self.replicas() {
+                break;
+            }
+            if !desired.contains(id) {
+                desired.push(*id);
+            }
         }
+        desired
+    }
+
+    /// Allocate the table an id and carve its range out of the region table. Deterministic and
+    /// idempotent, as every `PdFsm::apply` must be.
+    ///
+    /// **One split, and the carved range is empty by construction.** Ids are handed out in
+    /// order, so the new table's range sits above every id ever issued — inside the region that
+    /// runs to `+inf`, which holds no key that could belong to it. Splitting the tail at
+    /// `be32(id)` therefore needs no emptiness check, and leaves:
+    ///
+    /// ```text
+    /// ["", be32(1))  [be32(1), be32(2))  …  [be32(n), be32(n+1))  [be32(n+1), +inf)
+    ///  default        table 1                table n               the new table
+    /// ```
+    ///
+    /// Every region is a table and every table is a region: no untabled gap can exist.
+    fn declare_table(&self, name: String, regime: Regime) {
+        if name.is_empty() || name == DEFAULT_TABLE_NAME {
+            return; // both name the built-in default table, which is never re-declarable
+        }
+        let id = {
+            let mut catalog = self.catalog.lock().expect("catalog poisoned");
+            // Before the allocation, not after: a committed entry re-applied on restart must not
+            // burn an id, or replicas that did not replay would disagree about every later table.
+            if catalog.iter().any(|t| t.name == name) {
+                return;
+            }
+            let id = self.next_table_id.load(Ordering::SeqCst);
+            if id == TableId::MAX {
+                return; // exhausted — refuse rather than wrap onto `default`
+            }
+            self.next_table_id.store(id + 1, Ordering::SeqCst);
+            catalog.push(Table { id, name, regime });
+            id
+        };
+
+        let _ = self.regions.split(&table_prefix(id));
         self.version.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -233,38 +345,54 @@ impl PdFsm {
         self.version.load(Ordering::SeqCst)
     }
 
-    /// The authoritative region table, each region tagged with its derived regime and the
-    /// cluster's voter set. This is what a node reconciles against.
+    /// The authoritative region table, each region tagged with its derived regime, its actual
+    /// voters, and the voters PD wants it to grow to. This is what a node reconciles against.
     pub fn assignment(&self) -> Vec<ReplicaSet> {
-        let voters = self.voters.lock().expect("voters poisoned").clone();
+        let live = self.members.live_nodes();
+        let members = self.region_members.lock().expect("members poisoned").clone();
         self.regions
             .list()
             .into_iter()
             .map(|region| {
                 let regime = self.regime_for(&region.start);
-                ReplicaSet { region, regime, voters: voters.clone() }
+                let voters = members.get(&region.id).cloned().unwrap_or_default();
+                let desired = self.desired(&voters, &live);
+                ReplicaSet { region, regime, voters, desired }
             })
             .collect()
     }
 
-    /// A key's regime: the **longest** declared table prefix it falls under, else `Cp`
-    /// (strong-by-default) — the same rule the server's catalog applies.
+    /// A key's regime, read off the table id its prefix carries. A key shorter than the prefix
+    /// belongs to `default` (see [`table_id_of`]), and an id with no catalog entry is `Cp` —
+    /// strong by default, the same answer an undeclared range has always given.
     pub fn regime_for(&self, key: &[u8]) -> Regime {
+        let id = table_id_of(key);
         self.catalog
             .lock()
             .expect("catalog poisoned")
             .iter()
-            .filter(|(name, _)| key.starts_with(&table_prefix(name)))
-            .max_by_key(|(name, _)| name.len())
-            .map(|(_, regime)| *regime)
+            .find(|t| t.id == id)
+            .map(|t| t.regime)
             .unwrap_or(Regime::Cp)
     }
 
-    /// The declared tables PD holds, name-sorted.
-    pub fn catalog(&self) -> Vec<(String, Regime)> {
+    /// The tables PD holds, name-sorted. Always includes `default`.
+    pub fn catalog(&self) -> Vec<Table> {
         let mut out = self.catalog.lock().expect("catalog poisoned").clone();
-        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    /// The id allocated to `name`, if it is declared. How a parked declaration finds the region
+    /// it carved, once the entry that allocated the id has been applied.
+    pub fn table_id(&self, name: &str) -> Option<TableId> {
+        let name = if name.is_empty() { DEFAULT_TABLE_NAME } else { name };
+        self.catalog.lock().expect("catalog poisoned").iter().find(|t| t.name == name).map(|t| t.id)
+    }
+
+    /// The next id this PD would hand out — the allocator's high-water, for tests and snapshots.
+    pub fn next_table_id(&self) -> TableId {
+        self.next_table_id.load(Ordering::SeqCst)
     }
 
     /// The committed TSO high-water — an upper bound on every timestamp handed out so far.
@@ -272,14 +400,10 @@ impl PdFsm {
         self.tso_upper.load(Ordering::SeqCst)
     }
 
-    /// The cluster-wide catalog — every table any node has declared, name-sorted.
-    pub fn tables(&self) -> Vec<(String, Regime)> {
-        self.members.tables()
-    }
-
-    /// Tables two nodes describe with different regimes: a misconfigured cluster.
-    pub fn table_conflicts(&self) -> Vec<TableConflict> {
-        self.members.table_conflicts()
+    /// Every node PD knows about and where to reach it — the voter addresses it hands out with
+    /// an assignment, so a node can found a region with peers it was never given at startup.
+    pub fn node_addrs(&self) -> Vec<(u64, String)> {
+        self.members.node_addrs()
     }
 
     /// Serialize the whole applied state, for a Raft snapshot at the compaction point.
@@ -297,16 +421,27 @@ impl PdFsm {
         // placement is — no heartbeat rebuilds them — so a snapshot that omitted them would lose
         // the cluster's tables the moment the log was compacted.
         out.extend_from_slice(&self.catalog_version().to_be_bytes());
+        // The allocator's high-water rides with the catalog it hands ids to. It goes *here*, not
+        // at the end: `restore` finishes by handing the rest of the buffer to the region table,
+        // so anything appended after that would be read as region bytes.
+        out.extend_from_slice(&self.next_table_id().to_be_bytes());
         let catalog = self.catalog.lock().expect("catalog poisoned").clone();
         out.extend_from_slice(&(catalog.len() as u32).to_be_bytes());
-        for (name, regime) in &catalog {
-            put_bytes(&mut out, name.as_bytes());
-            out.push(regime_tag(*regime));
+        for t in &catalog {
+            put_bytes(&mut out, t.name.as_bytes());
+            out.push(regime_tag(t.regime));
+            out.extend_from_slice(&t.id.to_be_bytes());
         }
-        let voters = self.voters.lock().expect("voters poisoned").clone();
-        out.extend_from_slice(&(voters.len() as u32).to_be_bytes());
-        for v in &voters {
-            out.extend_from_slice(&v.to_be_bytes());
+        // Each region's members, in the slot the old single voter list used: `restore` hands the
+        // rest of the buffer to the region table, so nothing can go after it.
+        let members = self.region_members.lock().expect("members poisoned").clone();
+        out.extend_from_slice(&(members.len() as u32).to_be_bytes());
+        for (region, voters) in &members {
+            out.extend_from_slice(&region.to_be_bytes());
+            out.extend_from_slice(&(voters.len() as u32).to_be_bytes());
+            for v in voters {
+                out.extend_from_slice(&v.to_be_bytes());
+            }
         }
         self.regions.encode_into(&mut out);
         out
@@ -324,6 +459,7 @@ impl PdFsm {
         pos += 8; // members' slice started at 8
 
         let Some(version) = get_u64(bytes, &mut pos) else { return false };
+        let Some(next_table_id) = get_u32(bytes, &mut pos) else { return false };
         let Some(n) = get_u32(bytes, &mut pos) else { return false };
         let mut catalog = Vec::with_capacity(n as usize);
         for _ in 0..n {
@@ -333,21 +469,31 @@ impl PdFsm {
             };
             let Some(regime) = bytes.get(pos).copied().and_then(regime_of) else { return false };
             pos += 1;
-            catalog.push((name, regime));
+            let Some(id) = get_u32(bytes, &mut pos) else { return false };
+            catalog.push(Table { id, name, regime });
         }
         let Some(n) = get_u32(bytes, &mut pos) else { return false };
-        let mut voters = Vec::with_capacity(n as usize);
+        let mut members = BTreeMap::new();
         for _ in 0..n {
-            let Some(v) = get_u64(bytes, &mut pos) else { return false };
-            voters.push(v);
+            let Some(region) = get_u64(bytes, &mut pos) else { return false };
+            let Some(len) = get_u32(bytes, &mut pos) else { return false };
+            let mut voters = Vec::with_capacity(len as usize);
+            for _ in 0..len {
+                let Some(v) = get_u64(bytes, &mut pos) else { return false };
+                voters.push(v);
+            }
+            members.insert(region, voters);
         }
         if !self.regions.decode_from(&bytes[pos..]) {
             return false;
         }
 
         *self.catalog.lock().expect("catalog poisoned") = catalog;
-        *self.voters.lock().expect("voters poisoned") = voters;
+        *self.region_members.lock().expect("members poisoned") = members;
         self.version.fetch_max(version, Ordering::SeqCst);
+        // `fetch_max`, like the watermark above: an older snapshot arriving late may leak ids,
+        // but the allocator must never regress and reissue one already in use.
+        self.next_table_id.fetch_max(next_table_id, Ordering::SeqCst);
         self.tso_upper.fetch_max(upper, Ordering::SeqCst);
         true
     }
@@ -372,9 +518,10 @@ impl PdFsm {
         if self.catalog_version() == 0 {
             return self.regions_of(node_id);
         }
+        // A node is sent every region it is a voter of, or one PD wants it to join.
         self.assignment()
             .into_iter()
-            .filter(|rs| rs.voters.is_empty() || rs.voters.contains(&node_id))
+            .filter(|rs| rs.voters.contains(&node_id) || rs.desired.contains(&node_id))
             .collect()
     }
 
@@ -383,7 +530,12 @@ impl PdFsm {
             .list()
             .into_iter()
             .filter(|p| p.node_id == node_id)
-            .map(|p| ReplicaSet { region: p.region, regime: p.regime, voters: p.voters })
+            .map(|p| ReplicaSet {
+                region: p.region,
+                regime: p.regime,
+                voters: p.voters,
+                desired: Vec::new(),
+            })
             .collect()
     }
 
@@ -619,12 +771,13 @@ fn get_replica_set(buf: &[u8], pos: &mut usize) -> Option<ReplicaSet> {
     for _ in 0..get_u32(buf, pos)? {
         voters.push(get_u64(buf, pos)?);
     }
-    Some(ReplicaSet { region: Region { id, start, end, epoch }, regime, voters })
+    Some(ReplicaSet { region: Region { id, start, end, epoch }, regime, voters, desired: Vec::new() })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::region::table_key;
 
     fn region(id: u64, start: &[u8], end: &[u8], epoch: u64) -> Region {
         Region { id, start: start.to_vec(), end: end.to_vec(), epoch }
@@ -654,7 +807,6 @@ mod tests {
                     .into_iter()
                     .map(ReplicaSet::bare)
                     .collect(),
-                tables: vec![],
                 now: 1_000,
             }
             .encode(),
@@ -734,7 +886,6 @@ mod tests {
                     .into_iter()
                     .map(ReplicaSet::bare)
                     .collect(),
-                tables: vec![],
                 now: 1_000,
             };
             r.propose(&hb).unwrap();
@@ -774,17 +925,15 @@ mod tests {
                     .into_iter()
                     .map(ReplicaSet::bare)
                     .collect(),
-                tables: vec![],
                 now: 123_456,
             },
             PdCmd::Heartbeat {
                 node_id: 3,
                 address: String::new(),
                 regions: vec![],
-                tables: vec![],
                 now: 0,
             },
-            // The v14 shape: a regime, a replica set, and declared tables all on the wire.
+            // A regime and a replica set on the wire — what a node reports about its regions.
             PdCmd::Heartbeat {
                 node_id: 4,
                 address: "http://n4".into(),
@@ -792,11 +941,8 @@ mod tests {
                     region: region(2, b"a", b"z", 7),
                     regime: Regime::Ap,
                     voters: vec![4, 5, 6],
+                    desired: Vec::new(),
                 }],
-                tables: vec![
-                    ("events".to_string(), Regime::Ap),
-                    ("ledger".to_string(), Regime::Cp),
-                ],
                 now: 99,
             },
         ];
@@ -825,13 +971,112 @@ mod tests {
                     .into_iter()
                     .map(ReplicaSet::bare)
                     .collect(),
-                tables: vec![],
                 now: 100,
             }
             .encode(),
         );
         let p = fsm.route(b"anything").unwrap();
         assert_eq!((p.node_id, p.address.as_str()), (7, "http://a"));
+    }
+
+    /// Declare `name`, as a committed entry would.
+    fn declare(fsm: &PdFsm, name: &str, regime: Regime) {
+        fsm.apply(&PdCmd::DeclareTable { name: name.to_string(), regime }.encode());
+    }
+
+    #[test]
+    fn the_default_table_exists_before_anything_is_declared() {
+        let fsm = PdFsm::new();
+        assert_eq!(fsm.table_id(DEFAULT_TABLE_NAME), Some(DEFAULT_TABLE_ID));
+        // An omitted table name resolves to it, which is what makes zero-config use work.
+        assert_eq!(fsm.table_id(""), Some(DEFAULT_TABLE_ID));
+        assert_eq!(fsm.catalog().len(), 1);
+        // Version 1, not 0: a node reads 0 as "PD holds no catalog, nothing to adopt".
+        assert_eq!(fsm.catalog_version(), 1);
+    }
+
+    #[test]
+    fn ids_are_allocated_in_order_and_never_reuse_the_default() {
+        let fsm = PdFsm::new();
+        declare(&fsm, "orders", Regime::Cp);
+        declare(&fsm, "clicks", Regime::Ap);
+        assert_eq!(fsm.table_id("orders"), Some(1));
+        assert_eq!(fsm.table_id("clicks"), Some(2));
+        assert_eq!(fsm.next_table_id(), 3);
+        // The regime travels with the id, and is read back off a key's prefix.
+        assert_eq!(fsm.regime_for(&table_key(2, b"post7")), Regime::Ap);
+        assert_eq!(fsm.regime_for(&table_key(1, b"o1")), Regime::Cp);
+        // An undeclared id is strong by default, as an undeclared range always was.
+        assert_eq!(fsm.regime_for(&table_key(9, b"k")), Regime::Cp);
+    }
+
+    #[test]
+    fn declaring_a_table_splits_exactly_one_region_and_leaves_no_gap() {
+        let fsm = PdFsm::new();
+        declare(&fsm, "orders", Regime::Cp);
+        declare(&fsm, "clicks", Regime::Ap);
+
+        // The headline invariant: one region per table, nothing in between.
+        let regions = fsm.regions.list();
+        assert_eq!(regions.len(), 3, "default + 2 tables, and no untabled gap regions");
+        assert!(regions[0].start.is_empty(), "the default region starts at the keyspace start");
+        assert!(regions[2].end.is_empty(), "the newest table runs to +inf");
+        for w in regions.windows(2) {
+            assert_eq!(w[0].end, w[1].start, "contiguous: a gap could only appear here");
+        }
+        assert_eq!(regions[1].start, table_prefix(1).to_vec());
+        assert_eq!(regions[2].start, table_prefix(2).to_vec());
+    }
+
+    #[test]
+    fn re_applying_a_declaration_does_not_burn_an_id() {
+        // A restart replays the log. If the allocation ran before the name check, every later
+        // table would shift and replicas that did not replay would disagree about every id.
+        let fsm = PdFsm::new();
+        let entry = PdCmd::DeclareTable { name: "orders".into(), regime: Regime::Cp }.encode();
+        fsm.apply(&entry);
+        fsm.apply(&entry);
+        fsm.apply(&entry);
+
+        assert_eq!(fsm.table_id("orders"), Some(1));
+        assert_eq!(fsm.next_table_id(), 2, "the replays allocated nothing");
+        assert_eq!(fsm.regions.list().len(), 2, "and carved nothing");
+    }
+
+    #[test]
+    fn the_default_table_is_never_re_declarable() {
+        let fsm = PdFsm::new();
+        declare(&fsm, DEFAULT_TABLE_NAME, Regime::Ap);
+        declare(&fsm, "", Regime::Ap);
+        assert_eq!(fsm.catalog().len(), 1);
+        assert_eq!(fsm.regime_for(&table_key(DEFAULT_TABLE_ID, b"k")), Regime::Cp);
+        assert_eq!(fsm.next_table_id(), 1, "neither burned an id");
+    }
+
+    #[test]
+    fn restore_never_regresses_the_allocator() {
+        let a = PdFsm::new();
+        declare(&a, "orders", Regime::Cp);
+        declare(&a, "clicks", Regime::Ap);
+        let image = a.snapshot();
+
+        // A follower that is ahead must not adopt an older allocator: reissuing an id would give
+        // two tables the same key range.
+        let b = PdFsm::new();
+        for name in ["a", "b", "c", "d"] {
+            declare(&b, name, Regime::Cp);
+        }
+        assert_eq!(b.next_table_id(), 5);
+        assert!(b.restore(&image));
+        assert_eq!(b.next_table_id(), 5, "fetch_max, like the TSO watermark");
+
+        // A fresh replica adopts the whole catalog, ids included.
+        let c = PdFsm::new();
+        assert!(c.restore(&image));
+        assert_eq!(c.table_id("orders"), Some(1));
+        assert_eq!(c.table_id("clicks"), Some(2));
+        assert_eq!(c.next_table_id(), 3);
+        assert_eq!(c.regime_for(&table_key(2, b"k")), Regime::Ap, "regimes survive the snapshot");
     }
 
     #[test]
@@ -858,5 +1103,126 @@ mod tests {
         let next = r.hand_out(5).unwrap();
         assert_eq!(next, first + 5, "contiguous, strictly increasing");
         assert!(next + 5 <= r.fsm().tso_upper());
+    }
+
+    /// A node's heartbeat, as a committed entry. `led` are regions it reports leading, with the
+    /// voters its group has; everything else a real node reports carries no voters.
+    fn heartbeat(fsm: &PdFsm, node: u64, led: Vec<(u64, Vec<u64>)>) {
+        let regions = led
+            .into_iter()
+            .map(|(id, voters)| {
+                let region = fsm.regions.list().into_iter().find(|r| r.id == id).expect("region");
+                ReplicaSet { region, regime: Regime::Cp, voters, desired: Vec::new() }
+            })
+            .collect();
+        fsm.apply(
+            &PdCmd::Heartbeat { node_id: node, address: format!("http://n{node}"), regions, now: 1 }
+                .encode(),
+        );
+    }
+
+    fn default_region(fsm: &PdFsm) -> ReplicaSet {
+        fsm.assignment().into_iter().next().expect("the default region")
+    }
+
+    #[test]
+    fn the_first_node_founds_a_region_alone() {
+        let fsm = PdFsm::new();
+        heartbeat(&fsm, 1, vec![]);
+        let r = default_region(&fsm);
+        assert_eq!(r.voters, vec![1], "the bootstrap: founded by the only live node");
+        assert_eq!(r.desired, vec![1]);
+    }
+
+    #[test]
+    fn later_nodes_are_desired_not_members() {
+        // The split-brain fix: a node registering later must not be handed the region as a
+        // founding voter — it has to be added to the running group by membership change.
+        let fsm = PdFsm::new();
+        heartbeat(&fsm, 1, vec![]);
+        heartbeat(&fsm, 2, vec![]);
+        heartbeat(&fsm, 3, vec![]);
+        let r = default_region(&fsm);
+        assert_eq!(r.voters, vec![1], "members are fixed at founding");
+        assert_eq!(r.desired, vec![1, 2, 3], "and grown toward the live nodes");
+        // Node 3 is sent the region (to join it), though it is not a member.
+        assert_eq!(fsm.assignment_for(3).len(), 1);
+    }
+
+    #[test]
+    fn desired_is_capped_at_the_replication_target() {
+        let fsm = PdFsm::new();
+        fsm.set_replicas(2);
+        for node in 1..=4 {
+            heartbeat(&fsm, node, vec![]);
+        }
+        assert_eq!(default_region(&fsm).desired, vec![1, 2]);
+        assert!(fsm.assignment_for(4).is_empty(), "a node beyond the target is given nothing");
+    }
+
+    #[test]
+    fn a_leader_report_that_grows_the_group_is_adopted_and_bumps_the_version() {
+        let fsm = PdFsm::new();
+        heartbeat(&fsm, 1, vec![]);
+        heartbeat(&fsm, 2, vec![]);
+        let before = fsm.catalog_version();
+        let id = default_region(&fsm).region.id;
+
+        heartbeat(&fsm, 1, vec![(id, vec![1, 2])]);
+        assert_eq!(default_region(&fsm).voters, vec![1, 2]);
+        assert!(fsm.catalog_version() > before, "nodes re-reconcile on a membership change");
+    }
+
+    #[test]
+    fn a_report_that_drops_a_voter_or_comes_from_outside_is_ignored() {
+        let fsm = PdFsm::new();
+        heartbeat(&fsm, 1, vec![]);
+        heartbeat(&fsm, 2, vec![]);
+        let id = default_region(&fsm).region.id;
+        heartbeat(&fsm, 1, vec![(id, vec![1, 2])]);
+
+        // Shrinking is not this path's to do: a report without node 1 is a stale view.
+        heartbeat(&fsm, 2, vec![(id, vec![2, 3])]);
+        assert_eq!(default_region(&fsm).voters, vec![1, 2]);
+        // A node reporting a group it is not in says nothing about it.
+        heartbeat(&fsm, 3, vec![(id, vec![1, 2, 4])]);
+        assert_eq!(default_region(&fsm).voters, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_table_created_on_a_formed_cluster_starts_fully_replicated() {
+        let fsm = PdFsm::new();
+        for node in 1..=3 {
+            heartbeat(&fsm, node, vec![]);
+        }
+        declare(&fsm, "orders", Regime::Cp);
+        let orders = fsm
+            .assignment()
+            .into_iter()
+            .find(|rs| rs.region.start == table_prefix(1).to_vec())
+            .expect("orders region");
+        assert_eq!(orders.voters, vec![1, 2, 3], "founded by every live node, no growing needed");
+    }
+
+    #[test]
+    fn a_table_declared_before_any_node_is_founded_when_one_registers() {
+        let fsm = PdFsm::new();
+        declare(&fsm, "orders", Regime::Cp);
+        assert!(fsm.assignment().iter().all(|rs| rs.voters.is_empty()), "no node to found it yet");
+        heartbeat(&fsm, 1, vec![]);
+        assert!(fsm.assignment().iter().all(|rs| rs.voters == vec![1]));
+    }
+
+    #[test]
+    fn region_members_survive_a_snapshot() {
+        let a = PdFsm::new();
+        heartbeat(&a, 1, vec![]);
+        heartbeat(&a, 2, vec![]);
+        let id = default_region(&a).region.id;
+        heartbeat(&a, 1, vec![(id, vec![1, 2])]);
+
+        let b = PdFsm::new();
+        assert!(b.restore(&a.snapshot()));
+        assert_eq!(default_region(&b).voters, vec![1, 2], "members are not rebuilt by heartbeats");
     }
 }

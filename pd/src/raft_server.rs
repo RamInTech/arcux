@@ -34,7 +34,7 @@ use arcux_rpc::kv::kv_service_client::KvServiceClient;
 
 use crate::convert::{
     list_tables_response, placed_to_proto, regime_from_proto, replica_set_from_proto,
-    replica_set_to_proto, table_decl_from_proto, table_decl_to_proto,
+    node_addr_to_proto, replica_set_to_proto, table_to_proto,
 };
 use crate::raft_group::{self, PdGroup, PdGroupOptions};
 
@@ -100,17 +100,20 @@ impl PdService for ReplicatedPdApi {
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let req = request.into_inner();
         let reported = req.regions.iter().map(replica_set_from_proto).collect();
-        let tables = req.tables.iter().map(table_decl_from_proto).collect();
-        match self.group.heartbeat(req.node_id, req.address, reported, tables, now_ms()).await {
+        match self.group.heartbeat(req.node_id, req.address, reported, now_ms()).await {
             Some(assigned) => {
                 let fsm = self.group.fsm();
                 Ok(Response::new(HeartbeatResponse {
                     regions: assigned.iter().map(replica_set_to_proto).collect(),
                     catalog_version: fsm.catalog_version(),
-                    tables: fsm
-                        .catalog()
+                    // The catalog and the voter addresses ride with the assignment: between them
+                    // a node can resolve a table name to the id its keys are stored under, and
+                    // reach the other voters of a region it has just been handed.
+                    tables: fsm.catalog().iter().map(table_to_proto).collect(),
+                    nodes: fsm
+                        .node_addrs()
                         .iter()
-                        .map(|(n, r)| table_decl_to_proto(n, *r))
+                        .map(|(id, addr)| node_addr_to_proto(*id, addr))
                         .collect(),
                 }))
             }
@@ -118,8 +121,12 @@ impl PdService for ReplicatedPdApi {
         }
     }
 
-    /// The cluster-wide catalog PD has heard, plus any table two nodes describe differently.
+    /// PD's catalog — the authoritative one it allocated ids for and carved regions from.
     /// Leader-served like the other reads, so the view reflects the committed log.
+    ///
+    /// The conflict list is always empty now: a table exists because PD declared it, so two nodes
+    /// cannot describe one differently. The field stays on the wire (append-only) and its
+    /// detection is gone with the per-node declarations it used to compare.
     async fn list_tables(
         &self,
         _request: Request<ListTablesRequest>,
@@ -128,7 +135,7 @@ impl PdService for ReplicatedPdApi {
             return Err(self.redirect());
         }
         let fsm = self.group.fsm();
-        Ok(Response::new(list_tables_response(fsm.tables(), fsm.table_conflicts())))
+        Ok(Response::new(list_tables_response(fsm.catalog(), Vec::new())))
     }
 
     async fn list_regions(
@@ -165,7 +172,7 @@ impl PdService for ReplicatedPdApi {
         }
         let regime = regime_from_proto(req.regime);
 
-        let Some((carved, version)) = self.group.declare_table(req.name.clone(), regime).await
+        let Some((table_id, carved, version)) = self.group.declare_table(req.name.clone(), regime).await
         else {
             return Err(self.redirect());
         };
@@ -188,6 +195,7 @@ impl PdService for ReplicatedPdApi {
         Ok(Response::new(CreateTableResponse {
             region: Some(replica_set_to_proto(&carved)),
             catalog_version: version,
+            table_id,
         }))
     }
 }
@@ -291,14 +299,12 @@ where
     let interval = fd_interval_ms.max(1);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(interval));
-        let mut logged_conflicts: Vec<String> = Vec::new();
         loop {
             tick.tick().await;
             if sweeper.is_leader() {
                 for id in sweeper.fsm().members().sweep(now_ms(), fd_timeout_ms) {
                     eprintln!("[pd raft] leader: node {id} marked down (no heartbeat in {fd_timeout_ms}ms)");
                 }
-                crate::server::warn_on_conflicts(sweeper.fsm().members(), &mut logged_conflicts);
             }
         }
     });
@@ -335,17 +341,20 @@ pub const DEFAULT_FD_INTERVAL_MS: u64 = 1_000;
 
 /// Open a replicated PD node and serve until Ctrl-C. `addrs` maps every voter id to its PD
 /// serving address (including this node's own `listen`).
+/// `replicas` is how many voters each data region is grown toward.
 pub async fn serve(
     node_id: u64,
     addrs: std::collections::HashMap<u64, String>,
     listen: std::net::SocketAddr,
     data_dir: impl AsRef<std::path::Path>,
+    replicas: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let data_dir = data_dir.as_ref();
     let group = start_group(node_id, addrs, data_dir)?;
+    group.fsm().set_replicas(replicas);
     let listener = TcpListener::bind(listen).await?;
     eprintln!(
-        "arcux-pd (replicated) node {node_id} listening on {} (data {})",
+        "arcux-pd (replicated) node {node_id} listening on {} (data {}, {replicas} replicas per region)",
         listener.local_addr()?,
         data_dir.display()
     );

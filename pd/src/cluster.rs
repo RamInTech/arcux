@@ -34,6 +34,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::persist::{get_bytes, get_u32, get_u64, put_bytes};
+use crate::region::TableId;
 use crate::Region;
 
 /// Wall-clock milliseconds since the Unix epoch — the time base for `last_seen` and the
@@ -54,6 +55,18 @@ pub enum Regime {
     Ap,
 }
 
+/// One table in PD's catalog: the id PD allocated for it, its name, and how it is served.
+///
+/// The id is the table's identity everywhere below this line — it prefixes every key the table
+/// holds, and it fixes the table's region as `[be32(id), be32(id + 1))`. The name is a label PD
+/// resolves for clients; nothing on disk depends on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Table {
+    pub id: TableId,
+    pub name: String,
+    pub regime: Regime,
+}
+
 /// A region as a node reports it: the range, how it is served, and the replica set holding it.
 /// `voters` is why this type exists — [`PlacedRegion::node_id`] names a single holder, which
 /// cannot describe the three-voter regions a real CP cluster is made of.
@@ -61,14 +74,18 @@ pub enum Regime {
 pub struct ReplicaSet {
     pub region: Region,
     pub regime: Regime,
+    /// The region's actual Raft voters, fixed at founding and grown only by membership change.
     pub voters: Vec<u64>,
+    /// What PD wants the voter set to be: `voters` plus the live nodes it should grow to, capped at
+    /// the replication target. Set only on PD's assignment; empty on a node's own report.
+    pub desired: Vec<u64>,
 }
 
 impl ReplicaSet {
     /// A region with no regime or replica-set information — what a pre-v14 peer effectively
     /// reports, and the shape the unreplicated single-node paths still use.
     pub fn bare(region: Region) -> ReplicaSet {
-        ReplicaSet { region, regime: Regime::Cp, voters: Vec::new() }
+        ReplicaSet { region, regime: Regime::Cp, voters: Vec::new(), desired: Vec::new() }
     }
 }
 
@@ -101,9 +118,6 @@ struct NodeState {
     last_seen: u64,
     down: bool,
     regions: Vec<ReplicaSet>,
-    /// The tables this node has declared (`--table` flags plus any live `CreateTable`). Empty
-    /// for a node with no catalog.
-    tables: Vec<(String, Regime)>,
 }
 
 struct State {
@@ -143,11 +157,6 @@ impl Membership {
                     out.extend_from_slice(&v.to_be_bytes());
                 }
             }
-            out.extend_from_slice(&(n.tables.len() as u32).to_be_bytes());
-            for (name, regime) in &n.tables {
-                put_bytes(out, name.as_bytes());
-                out.push(regime_tag(*regime));
-            }
         }
     }
 
@@ -176,16 +185,14 @@ impl Membership {
                 for _ in 0..get_u32(bytes, &mut pos)? {
                     voters.push(get_u64(bytes, &mut pos)?);
                 }
-                regions.push(ReplicaSet { region: Region { id, start, end, epoch }, regime, voters });
+                regions.push(ReplicaSet {
+                    region: Region { id, start, end, epoch },
+                    regime,
+                    voters,
+                    desired: Vec::new(),
+                });
             }
-            let mut tables = Vec::new();
-            for _ in 0..get_u32(bytes, &mut pos)? {
-                let name = String::from_utf8(get_bytes(bytes, &mut pos)?.to_vec()).ok()?;
-                let regime = regime_of(*bytes.get(pos)?)?;
-                pos += 1;
-                tables.push((name, regime));
-            }
-            nodes.insert(id, NodeState { address, last_seen, down, regions, tables });
+            nodes.insert(id, NodeState { address, last_seen, down, regions });
         }
         let mut g = self.state.lock().expect("membership poisoned");
         g.nodes = nodes;
@@ -215,7 +222,6 @@ impl Membership {
         node_id: u64,
         address: String,
         reported: Vec<ReplicaSet>,
-        tables: Vec<(String, Regime)>,
         now: u64,
     ) -> Vec<ReplicaSet> {
         let mut g = self.state.lock().expect("membership poisoned");
@@ -237,65 +243,34 @@ impl Membership {
             last_seen: now,
             down: false,
             regions: Vec::new(),
-            tables: Vec::new(),
         });
         entry.address = address;
         entry.last_seen = now;
         entry.down = false;
         entry.regions = assigned.clone();
-        entry.tables = tables;
         assigned
     }
 
-    /// The cluster-wide catalog: every table any node has declared, name-sorted. Where nodes
-    /// disagree about a regime this reports the lowest-numbered node's view — the disagreement
-    /// itself is [`table_conflicts`](Self::table_conflicts)'s job to surface.
-    pub fn tables(&self) -> Vec<(String, Regime)> {
+    /// Every node PD knows about and where to reach it, node-id order.
+    ///
+    /// This is what a data node used to get from `--peer` flags. PD already learns each address
+    /// from the heartbeat that registers the node, so handing it back with the assignment is what
+    /// lets a node found a region with voters it was never told about at startup.
+    pub fn node_addrs(&self) -> Vec<(u64, String)> {
         let g = self.state.lock().expect("membership poisoned");
-        let mut out: Vec<(String, Regime)> = Vec::new();
-        for n in g.nodes.values() {
-            for (name, regime) in &n.tables {
-                if !out.iter().any(|(existing, _)| existing == name) {
-                    out.push((name.clone(), *regime));
-                }
-            }
-        }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
+        g.nodes.iter().map(|(id, n)| (*id, n.address.clone())).collect()
     }
 
-    /// Tables two nodes describe with different regimes. Nothing else in the system checks that
-    /// a cluster was started with matching `--table` flags, and a mismatch is silent: the nodes
-    /// tile the keyspace differently and route the same keys to different regimes.
+    /// The nodes eligible to vote on a region: every registered node that is not marked down,
+    /// in id order.
     ///
-    /// One entry per conflicting table, naming the two lowest-numbered nodes that disagree.
-    pub fn table_conflicts(&self) -> Vec<TableConflict> {
+    /// **Scoped deliberately.** Every region gets every live node, which is what a catalog
+    /// cluster did when the voter set came from matching `--table`/`--voters` flags on each node.
+    /// Choosing a subset per region is placement policy — it needs a replication factor and a
+    /// balancing rule, which is Phase-6 rebalancing, not this.
+    pub fn live_nodes(&self) -> Vec<u64> {
         let g = self.state.lock().expect("membership poisoned");
-        let mut first: Vec<(String, Regime, u64)> = Vec::new();
-        let mut out: Vec<TableConflict> = Vec::new();
-        // `nodes` is a BTreeMap, so this walks node ids in order and the first sighting of a
-        // table is the lowest-numbered node's.
-        for (id, n) in g.nodes.iter() {
-            for (name, regime) in &n.tables {
-                match first.iter().find(|(existing, _, _)| existing == name) {
-                    None => first.push((name.clone(), *regime, *id)),
-                    Some((_, seen_regime, seen_id)) if seen_regime != regime => {
-                        if !out.iter().any(|c| &c.name == name) {
-                            out.push(TableConflict {
-                                name: name.clone(),
-                                regime: *seen_regime,
-                                node_id: *seen_id,
-                                other_regime: *regime,
-                                other_node_id: *id,
-                            });
-                        }
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        out
+        g.nodes.iter().filter(|(_, n)| !n.down).map(|(id, _)| *id).collect()
     }
 
     /// Mark every node whose last heartbeat is older than `timeout_ms` (relative to `now`)
@@ -411,19 +386,13 @@ mod tests {
         Region { id, start: start.to_vec(), end: end.to_vec(), epoch }
     }
 
-    /// Report bare regions — no regime, no voters, no declared tables. The shape a pre-v14
-    /// node effectively sends, and what most of these placement tests care about.
+    /// Report bare regions — no regime, no voters. The shape a pre-v14 node effectively sends,
+    /// and what most of these placement tests care about.
     fn hb(m: &Membership, id: u64, addr: &str, regions: Vec<Region>, now: u64) -> Vec<Region> {
-        m.heartbeat(id, addr.into(), regions.into_iter().map(ReplicaSet::bare).collect(), vec![], now)
+        m.heartbeat(id, addr.into(), regions.into_iter().map(ReplicaSet::bare).collect(), now)
             .into_iter()
             .map(|rs| rs.region)
             .collect()
-    }
-
-    /// Report declared tables only, with no regions.
-    fn hb_tables(m: &Membership, id: u64, addr: &str, tables: Vec<(&str, Regime)>, now: u64) {
-        let tables = tables.into_iter().map(|(n, r)| (n.to_string(), r)).collect();
-        m.heartbeat(id, addr.into(), vec![], tables, now);
     }
 
     #[test]
@@ -434,8 +403,9 @@ mod tests {
             region: region(1, b"", b"", 1),
             regime: Regime::Ap,
             voters: vec![1, 2, 3],
+            desired: Vec::new(),
         };
-        m.heartbeat(1, "http://a".into(), vec![rs], vec![], 100);
+        m.heartbeat(1, "http://a".into(), vec![rs], 100);
 
         let placed = m.route(b"k").unwrap();
         assert_eq!(placed.regime, Regime::Ap);
@@ -443,39 +413,36 @@ mod tests {
     }
 
     #[test]
-    fn tables_union_across_nodes() {
+    fn pd_hands_out_every_node_address() {
+        // What replaced the `--peer` flags: a node founds a region with voters it was never told
+        // about, so PD has to be able to say where each one is.
         let m = Membership::new();
-        hb_tables(&m, 1, "http://a", vec![("ledger", Regime::Cp)], 100);
-        hb_tables(&m, 2, "http://b", vec![("events", Regime::Ap), ("ledger", Regime::Cp)], 100);
-
+        hb(&m, 2, "http://b", vec![], 100);
+        hb(&m, 1, "http://a", vec![], 100);
         assert_eq!(
-            m.tables(),
-            vec![("events".to_string(), Regime::Ap), ("ledger".to_string(), Regime::Cp)]
+            m.node_addrs(),
+            vec![(1, "http://a".to_string()), (2, "http://b".to_string())],
+            "node-id order, so every replica computes the same assignment"
         );
-        assert!(m.table_conflicts().is_empty(), "agreeing nodes are not a conflict");
     }
 
     #[test]
-    fn a_table_two_nodes_declare_differently_is_a_conflict() {
-        // The silent misconfiguration this exists to catch: the nodes tile the keyspace
-        // differently and route the same keys to different regimes, with nothing to notice.
+    fn only_live_nodes_are_voters() {
         let m = Membership::new();
-        hb_tables(&m, 1, "http://a", vec![("events", Regime::Ap)], 100);
-        hb_tables(&m, 2, "http://b", vec![("events", Regime::Cp)], 100);
+        hb(&m, 1, "http://a", vec![], 1_000);
+        hb(&m, 2, "http://b", vec![], 100);
+        assert_eq!(m.live_nodes(), vec![1, 2]);
 
-        let conflicts = m.table_conflicts();
-        assert_eq!(conflicts.len(), 1);
-        let c = &conflicts[0];
-        assert_eq!(c.name, "events");
-        assert_eq!((c.node_id, c.regime), (1, Regime::Ap));
-        assert_eq!((c.other_node_id, c.other_regime), (2, Regime::Cp));
+        // Node 2 stops heartbeating: it must not be handed new regions to vote on.
+        assert_eq!(m.sweep(2_000, 1_000), vec![2]);
+        assert_eq!(m.live_nodes(), vec![1]);
     }
 
     #[test]
     fn encode_decode_round_trips_every_node_field() {
         let a = Membership::new();
-        // Node 1 carries the interesting shape: a regime, a replica set, and a declared table.
-        // If any of these were dropped here, PD's log compaction would silently lose them.
+        // Node 1 carries the interesting shape: a regime and a replica set. If either were
+        // dropped here, PD's log compaction would silently lose it.
         a.heartbeat(
             1,
             "http://n1".into(),
@@ -483,8 +450,8 @@ mod tests {
                 region: region(1, b"", b"m", 2),
                 regime: Regime::Ap,
                 voters: vec![1, 2, 3],
+                desired: Vec::new(),
             }],
-            vec![("events".to_string(), Regime::Ap)],
             8_900,
         );
         hb(&a, 2, "http://n2", vec![region(2, b"m", b"", 2)], 1_000);
@@ -501,7 +468,6 @@ mod tests {
         assert_eq!(placed.node_id, 1);
         assert_eq!(placed.regime, Regime::Ap, "the regime survives");
         assert_eq!(placed.voters, vec![1, 2, 3], "the replica set survives");
-        assert_eq!(b.tables(), vec![("events".to_string(), Regime::Ap)], "declarations survive");
         assert!(!b.is_down(1));
         assert!(b.is_down(2), "the down flag survives");
     }
