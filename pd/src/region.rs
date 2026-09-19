@@ -245,13 +245,71 @@ pub fn region_id(node_id: u64, local: u64) -> u64 {
     (node_id << 32) | (local & 0xFFFF_FFFF)
 }
 
+/// A table's id: a PD-allocated `u32` that prefixes every one of its keys.
+pub type TableId = u32;
+
+/// The built-in table an omitted table name resolves to. Its id is fixed, so it needs no
+/// allocator and exists on every node from the moment it opens — including one with no PD.
+pub const DEFAULT_TABLE_ID: TableId = 0;
+/// The reserved name of [`DEFAULT_TABLE_ID`]. Never declarable.
+pub const DEFAULT_TABLE_NAME: &str = "default";
+
+/// The width of the id prefix every stored key carries.
+pub const TABLE_PREFIX_LEN: usize = 4;
+
+/// The byte prefix table `id` owns: its id, big-endian, so byte order matches numeric order.
+///
+/// Lives here rather than in the server's catalog because these functions define **region
+/// boundaries**, and both the server (key rewriting) and PD (carving a declared table out of the
+/// region table) need them. One copy, no drift.
+pub fn table_prefix(id: TableId) -> [u8; TABLE_PREFIX_LEN] {
+    id.to_be_bytes()
+}
+
+/// The stored form of `user_key` in table `id`: `be32(id) ++ user_key`.
+pub fn table_key(id: TableId, user_key: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(TABLE_PREFIX_LEN + user_key.len());
+    k.extend_from_slice(&table_prefix(id));
+    k.extend_from_slice(user_key);
+    k
+}
+
+/// Table `id`'s half-open key range, `[be32(id), be32(id+1))`. The last possible table runs to
+/// `+inf` (an empty end), like any region at the end of the keyspace.
+pub fn table_range(id: TableId) -> (Vec<u8>, Vec<u8>) {
+    let start = table_prefix(id).to_vec();
+    let end = match id.checked_add(1) {
+        Some(next) => table_prefix(next).to_vec(),
+        None => Vec::new(),
+    };
+    (start, end)
+}
+
+/// The table a stored key — or a region's start key — belongs to.
+///
+/// A key shorter than the prefix is [`DEFAULT_TABLE_ID`]: the default *region* starts at the
+/// keyspace start (`""`) so that routing an empty key lands somewhere, while the default
+/// *table's* data occupies `[be32(0), be32(1))`. That asymmetry is the one place the two differ.
+pub fn table_id_of(stored: &[u8]) -> TableId {
+    if stored.len() < TABLE_PREFIX_LEN {
+        return DEFAULT_TABLE_ID;
+    }
+    let mut buf = [0u8; TABLE_PREFIX_LEN];
+    buf.copy_from_slice(&stored[..TABLE_PREFIX_LEN]);
+    TableId::from_be_bytes(buf)
+}
+
+/// A stored key without its table prefix — what a client asked for, and what reads return.
+pub fn strip_table_prefix(stored: &[u8]) -> &[u8] {
+    stored.get(TABLE_PREFIX_LEN..).unwrap_or(&[])
+}
+
 /// A table `t` owns keys under `t/`. The empty name is the untabled default — no prefix — so
 /// requests that don't name a table route on the bare key.
 ///
-/// Lives here rather than in the server's catalog because these two functions define **region
-/// boundaries**, and both the server (tiling at startup) and PD (carving a declared table out of
-/// the region table) need them. One copy, no drift.
-pub fn table_prefix(name: &str) -> Vec<u8> {
+/// **Superseded by [`table_prefix`]** and kept only until the server's key rewriting moves to
+/// numeric ids; nothing new should use it.
+pub fn name_prefix(name: &str) -> Vec<u8> {
     if name.is_empty() {
         return Vec::new();
     }
@@ -385,6 +443,40 @@ mod tests {
         assert!(reg.merge(b"a").is_err());
         // The left-most region (start "") has no left neighbour.
         assert!(reg.merge(b"").is_err());
+    }
+
+    #[test]
+    fn a_table_owns_its_id_range_and_nothing_else() {
+        let (start, end) = table_range(1);
+        assert_eq!(start, vec![0, 0, 0, 1]);
+        assert_eq!(end, vec![0, 0, 0, 2]);
+        // Adjacent by construction: table i ends exactly where i+1 begins, so no gap can exist.
+        assert_eq!(table_range(1).1, table_range(2).0);
+        // The default table sits at the front of the keyspace.
+        assert_eq!(table_range(DEFAULT_TABLE_ID).0, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn the_last_possible_table_runs_to_infinity() {
+        let (start, end) = table_range(TableId::MAX);
+        assert_eq!(start, vec![0xff; 4]);
+        assert!(end.is_empty(), "no successor exists, so the range is unbounded");
+    }
+
+    #[test]
+    fn a_stored_key_round_trips_through_its_table_id() {
+        let stored = table_key(7, b"acct1");
+        assert_eq!(stored, vec![0, 0, 0, 7, b'a', b'c', b'c', b't', b'1']);
+        assert_eq!(table_id_of(&stored), 7);
+        assert_eq!(strip_table_prefix(&stored), b"acct1");
+    }
+
+    #[test]
+    fn a_key_shorter_than_the_prefix_belongs_to_the_default_table() {
+        // The default *region* starts at "", so routing an empty key must resolve, not panic.
+        assert_eq!(table_id_of(b""), DEFAULT_TABLE_ID);
+        assert_eq!(table_id_of(b"\0\0\0"), DEFAULT_TABLE_ID);
+        assert_eq!(strip_table_prefix(b"\0\0"), b"");
     }
 
     #[test]
