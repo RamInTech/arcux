@@ -1,160 +1,140 @@
-//! The consistency **catalog** — a table's declared regime (Phase 5b).
+//! The node's **catalog** — the tables it knows about, by id and by name.
 //!
-//! The headline is *"a table is declared CP or AP, and that selects the write path."* A
-//! "table" here is simply a **key-prefix**: table `t` owns every key under `t/`. The catalog
-//! is the map `prefix → `[`Regime`], populated by [`create_table`](Catalog::create_table); a
-//! key's regime is the **longest** declared prefix it falls under (default `Cp` —
-//! strong-by-default). The regime it yields becomes a region's regime at placement, which the
-//! server then dispatches on (CP → Percolator+Raft, AP → leaderless HLC/LWW).
+//! A table is a numeric id, allocated by PD. Every key it holds is stored under that id's
+//! 4-byte big-endian prefix, so table `id` owns exactly `[be32(id), be32(id + 1))` and one
+//! region serves exactly one table. There is no space between two tables for anything to fall
+//! into, which is the whole point: the untabled "gap" regions a name-prefix scheme left between
+//! and around tables — each one a CP region with its own Raft group, elections and heartbeats —
+//! cannot exist.
 //!
-//! This is the *declaration mechanism*; a PD-served, runtime `create_table` RPC (declare a
-//! table on a live cluster and spin up its region) is a later step — it needs dynamic
-//! region/group creation and the PD↔MultiRaft placement integration.
+//! Table `0` is `default`: the table an omitted name resolves to, so a client that never
+//! declares anything still has somewhere to write. Its id is fixed, so unlike every other table
+//! it needs no allocator and exists on a node that has never spoken to PD.
+//!
+//! **PD is the authority.** A node does not declare tables and does not persist them; it learns
+//! the catalog from PD's assignment (see `AppState::reconcile`) and holds it here to answer two
+//! questions on the request path: which id does this table name have, and how is that id served.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, RwLock};
 
-// Region-boundary helpers live in `pd` — both the tiling here and PD's carve of a declared
-// table need them, so there is one copy. Re-exported so `catalog::table_prefix` still resolves.
-pub(crate) use arcux_pd::{prefix_successor, table_prefix};
+pub(crate) use arcux_pd::{
+    strip_table_prefix, table_id_of, table_key, table_range, TableId,
+    DEFAULT_TABLE_ID, DEFAULT_TABLE_NAME,
+};
 
-use crate::multiraft::{Regime, RegionPlacement};
+use crate::multiraft::Regime;
 
-/// A table → regime map. Tables own key-prefixes (`name/`); lookups are longest-prefix.
+/// One table: the id its keys are stored under, its name, and how it is served.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Table {
+    pub id: TableId,
+    pub name: String,
+    pub regime: Regime,
+}
+
+impl Table {
+    /// The built-in table an omitted name resolves to. Always CP, never declarable.
+    pub fn default_table() -> Table {
+        Table { id: DEFAULT_TABLE_ID, name: DEFAULT_TABLE_NAME.to_string(), regime: Regime::Cp }
+    }
+}
+
+/// An immutable snapshot of the catalog: two indexes over one set of tables.
+///
+/// Immutable so the request path can hold an `Arc` to it without a lock — see [`Catalog`].
+pub struct Tables {
+    by_name: HashMap<String, TableId>,
+    by_id: BTreeMap<TableId, Table>,
+}
+
+impl Tables {
+    /// Just `default` — what a node knows before PD tells it anything.
+    pub fn bootstrap() -> Tables {
+        Tables::from(vec![Table::default_table()])
+    }
+
+    /// Build from a table set, adding `default` if it is absent. PD always sends it; adding it
+    /// here means a node can never end up unable to resolve an omitted table name.
+    pub fn from(tables: Vec<Table>) -> Tables {
+        let mut by_id = BTreeMap::new();
+        for t in tables {
+            by_id.insert(t.id, t);
+        }
+        by_id.entry(DEFAULT_TABLE_ID).or_insert_with(Table::default_table);
+        let by_name = by_id.values().map(|t| (t.name.clone(), t.id)).collect();
+        Tables { by_name, by_id }
+    }
+
+    /// The id a request's table name resolves to. An empty name means `default`, so a client
+    /// that names no table writes to a real table rather than a special case.
+    pub fn id_of(&self, name: &str) -> Option<TableId> {
+        if name.is_empty() {
+            return Some(DEFAULT_TABLE_ID);
+        }
+        self.by_name.get(name).copied()
+    }
+
+    pub fn get(&self, id: TableId) -> Option<&Table> {
+        self.by_id.get(&id)
+    }
+
+    /// Every table, id-ordered — which is also the order their regions tile the keyspace.
+    pub fn list(&self) -> Vec<Table> {
+        self.by_id.values().cloned().collect()
+    }
+
+    /// How the table owning `stored_key` is served. An id with no entry is `Cp`: strong by
+    /// default, the same answer an undeclared range has always given.
+    pub fn regime_of_key(&self, stored_key: &[u8]) -> Regime {
+        self.get(table_id_of(stored_key)).map(|t| t.regime).unwrap_or(Regime::Cp)
+    }
+
+    /// `name/key`, for a log line or an error — a stored key is otherwise four bytes of binary
+    /// followed by the user's key. An id the catalog doesn't know prints as `#id`.
+    pub fn render_key(&self, stored_key: &[u8]) -> String {
+        let id = table_id_of(stored_key);
+        let name = match self.get(id) {
+            Some(t) => t.name.clone(),
+            None => format!("#{id}"),
+        };
+        format!("{name}/{}", String::from_utf8_lossy(strip_table_prefix(stored_key)))
+    }
+}
+
+/// The node's live catalog: an [`Arc<Tables>`] swapped wholesale on each update.
+///
+/// Copy-on-write rather than a lock around a map. A read holds the lock only long enough to
+/// clone one `Arc`, so the request path never contends with a `create table` and never holds a
+/// lock across an `.await`; the writer builds the new set off to the side and swaps a pointer.
 pub struct Catalog {
-    tables: Vec<(Vec<u8>, Regime)>,
+    current: RwLock<Arc<Tables>>,
 }
 
 impl Catalog {
-    pub fn new() -> Catalog {
-        Catalog { tables: Vec::new() }
+    /// A catalog holding only `default`.
+    pub fn bootstrap() -> Arc<Catalog> {
+        Arc::new(Catalog { current: RwLock::new(Arc::new(Tables::bootstrap())) })
     }
 
-    /// Declare `name` a CP or AP table — it owns the key-prefix `name/`. Re-declaring the same
-    /// name overwrites its regime.
-    pub fn create_table(&mut self, name: &str, regime: Regime) {
-        debug_assert!(!name.is_empty(), "\"\" is the reserved default namespace, not a declarable table");
-        let prefix = table_prefix(name);
-        match self.tables.iter_mut().find(|(p, _)| *p == prefix) {
-            Some(entry) => entry.1 = regime,
-            None => self.tables.push((prefix, regime)),
-        }
+    /// The current set. Cheap: one `Arc` clone under a read lock.
+    pub fn snapshot(&self) -> Arc<Tables> {
+        self.current.read().expect("catalog poisoned").clone()
     }
 
-    /// The regime for `key`: the regime of the **longest** declared prefix `key` starts with,
-    /// or `Cp` if none (strong-by-default).
-    pub fn regime_for(&self, key: &[u8]) -> Regime {
-        self.tables
-            .iter()
-            .filter(|(prefix, _)| key.starts_with(prefix))
-            .max_by_key(|(prefix, _)| prefix.len())
-            .map(|(_, regime)| *regime)
-            .unwrap_or(Regime::Cp)
+    /// Replace the catalog wholesale — what a node does with the table list PD sends alongside
+    /// an assignment. PD is the authority, so this is a replace rather than a merge.
+    pub fn install(&self, tables: Vec<Table>) {
+        *self.current.write().expect("catalog poisoned") = Arc::new(Tables::from(tables));
     }
 
-    /// Build a [`RegionPlacement`] whose regime is **derived from the catalog** (by the region's
-    /// start key) rather than hand-set — so `create_table` declarations drive placement.
-    pub fn place(
-        &self,
-        region_id: u64,
-        start: Vec<u8>,
-        end: Vec<u8>,
-        voters: Vec<u64>,
-        peers: HashMap<u64, String>,
-    ) -> RegionPlacement {
-        RegionPlacement {
-            region_id,
-            regime: self.regime_for(&start),
-            start,
-            end,
-            epoch: 1,
-            voters,
-            peers,
-        }
-    }
-
-    /// Tile the whole keyspace into contiguous regions cut at the declared tables' prefix
-    /// boundaries — each region carries the regime of the range it covers (declared tables get
-    /// theirs; the gaps between/around them default to CP). Every region shares the same
-    /// replica set (`voters`/`peers`); [`crate::AppState::open_multiraft`] then hosts each CP
-    /// region as a Raft group and each AP region as a leaderless replica set.
-    pub fn placements(
-        &self,
-        voters: Vec<u64>,
-        peers: HashMap<u64, String>,
-    ) -> Vec<RegionPlacement> {
-        // Boundaries: the keyspace start, plus each table prefix's start and its successor.
-        let mut bounds: Vec<Vec<u8>> = vec![Vec::new()];
-        for (prefix, _) in &self.tables {
-            bounds.push(prefix.clone());
-            if let Some(succ) = prefix_successor(prefix) {
-                bounds.push(succ);
-            }
-        }
-        bounds.sort();
-        bounds.dedup();
-
-        // Consecutive boundaries form the regions; the last runs to +∞ (empty end).
-        bounds
-            .iter()
-            .enumerate()
-            .map(|(i, start)| {
-                let end = bounds.get(i + 1).cloned().unwrap_or_default();
-                self.place(i as u64 + 1, start.clone(), end, voters.clone(), peers.clone())
-            })
-            .collect()
-    }
-}
-
-impl Default for Catalog {
-    fn default() -> Self {
-        Catalog::new()
-    }
-}
-
-/// Combine the tables persisted in a node's [`crate::table_store`] with the `--table` flags it
-/// was started with, producing the set the startup [`Catalog`] is built from. Name-sorted, so
-/// the resulting tiling is deterministic regardless of flag or file order.
-///
-/// A name present in only one source is taken as-is — that is what restores a table declared
-/// live by `kv.CreateTable`. A name in both with the same regime is the ordinary case of an
-/// operator who keeps passing their original flags.
-///
-/// A name in both with **different** regimes is an error, and the node refuses to start. There
-/// is no `ALTER … SET consistency`, so a disagreement is an operator mistake rather than an
-/// intent to change; resolving it silently either way would swap a table's consistency
-/// guarantee underneath data already written under the other one.
-pub fn merge_declarations(
-    persisted: &[(String, Regime)],
-    flags: &[(String, Regime)],
-) -> Result<Vec<(String, Regime)>, String> {
-    let mut merged: Vec<(String, Regime)> = persisted.to_vec();
-    for (name, flag_regime) in flags {
-        match merged.iter().find(|(n, _)| n == name) {
-            Some((_, persisted_regime)) if persisted_regime != flag_regime => {
-                // One line, single-quoted: a startup error surfaces through `Box<dyn Error>`'s
-                // Debug formatting, which escapes both quotes and newlines into noise.
-                return Err(format!(
-                    "table '{name}' is declared {} in the data directory's catalog but --table \
-                     says {}; a table's regime cannot be changed after creation — drop the flag \
-                     to keep {}, or start with a fresh data directory",
-                    regime_name(*persisted_regime),
-                    regime_name(*flag_regime),
-                    regime_name(*persisted_regime),
-                ))
-            }
-            Some(_) => {}
-            None => merged.push((name.clone(), *flag_regime)),
-        }
-    }
-    merged.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(merged)
-}
-
-fn regime_name(regime: Regime) -> &'static str {
-    if regime == Regime::Ap {
-        "ap"
-    } else {
-        "cp"
+    /// Add one table, keeping the rest — the local echo of a `create table` this node just made,
+    /// so it can serve the new table without waiting for the next assignment.
+    pub fn insert(&self, table: Table) {
+        let mut tables = self.snapshot().list();
+        tables.retain(|t| t.id != table.id && t.name != table.name);
+        tables.push(table);
+        self.install(tables);
     }
 }
 
@@ -162,125 +142,61 @@ fn regime_name(regime: Regime) -> &'static str {
 mod tests {
     use super::*;
 
-    fn cp(name: &str) -> (String, Regime) {
-        (name.to_string(), Regime::Cp)
-    }
-    fn ap(name: &str) -> (String, Regime) {
-        (name.to_string(), Regime::Ap)
+    #[test]
+    fn a_fresh_catalog_resolves_only_the_default_table() {
+        let tables = Tables::bootstrap();
+        assert_eq!(tables.id_of(""), Some(DEFAULT_TABLE_ID), "an omitted name is `default`");
+        assert_eq!(tables.id_of(DEFAULT_TABLE_NAME), Some(DEFAULT_TABLE_ID));
+        assert_eq!(tables.id_of("orders"), None, "an undeclared table does not resolve");
+        assert_eq!(tables.list().len(), 1);
     }
 
     #[test]
-    fn merge_restores_persisted_tables_and_adds_new_flags() {
-        // `clicks` was created live and persisted; `ledger` comes from a --table flag.
-        let merged = merge_declarations(&[ap("clicks")], &[cp("ledger")]).unwrap();
-        assert_eq!(merged, vec![ap("clicks"), cp("ledger")]);
+    fn installing_from_pd_always_keeps_a_default_table() {
+        // Even if PD somehow omitted it, a node must be able to resolve an omitted table name.
+        let tables = Tables::from(vec![Table {
+            id: 1,
+            name: "orders".into(),
+            regime: Regime::Ap,
+        }]);
+        assert_eq!(tables.id_of(""), Some(DEFAULT_TABLE_ID));
+        assert_eq!(tables.id_of("orders"), Some(1));
+        assert_eq!(tables.list().len(), 2, "default is added back");
     }
 
     #[test]
-    fn merge_accepts_a_flag_that_repeats_the_persisted_regime() {
-        // The ordinary case: the operator keeps passing the flags they always did.
-        let merged = merge_declarations(&[cp("ledger")], &[cp("ledger")]).unwrap();
-        assert_eq!(merged, vec![cp("ledger")]);
+    fn a_keys_regime_comes_from_the_id_it_carries() {
+        let tables =
+            Tables::from(vec![Table { id: 1, name: "clicks".into(), regime: Regime::Ap }]);
+        assert_eq!(tables.regime_of_key(&table_key(1, b"post7")), Regime::Ap);
+        assert_eq!(tables.regime_of_key(&table_key(DEFAULT_TABLE_ID, b"k")), Regime::Cp);
+        assert_eq!(tables.regime_of_key(&table_key(9, b"k")), Regime::Cp, "strong by default");
     }
 
     #[test]
-    fn merge_rejects_a_flag_that_contradicts_the_persisted_regime() {
-        // Silently taking either side would swap the consistency guarantee under existing data.
-        let err = merge_declarations(&[ap("clicks")], &[cp("clicks")]).unwrap_err();
-        assert!(err.contains("clicks"), "message should name the table: {err}");
-        assert!(err.contains("ap") && err.contains("cp"), "should name both regimes: {err}");
+    fn a_stored_key_renders_as_table_slash_key() {
+        let tables =
+            Tables::from(vec![Table { id: 1, name: "orders".into(), regime: Regime::Cp }]);
+        assert_eq!(tables.render_key(&table_key(1, b"o1")), "orders/o1");
+        assert_eq!(tables.render_key(&table_key(0, b"k")), "default/k");
+        // An id this node has not learned yet must print, not panic.
+        assert_eq!(tables.render_key(&table_key(42, b"k")), "#42/k");
     }
 
     #[test]
-    fn merge_is_name_sorted_so_tiling_is_deterministic() {
-        let merged = merge_declarations(&[cp("orders"), ap("clicks")], &[cp("acct")]).unwrap();
-        let names: Vec<&str> = merged.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["acct", "clicks", "orders"]);
-    }
+    fn install_replaces_and_insert_adds() {
+        let catalog = Catalog::bootstrap();
+        catalog.install(vec![Table { id: 1, name: "a".into(), regime: Regime::Cp }]);
+        assert_eq!(catalog.snapshot().id_of("a"), Some(1));
 
-    #[test]
-    fn declared_tables_select_their_regime() {
-        let mut cat = Catalog::new();
-        cat.create_table("ledger", Regime::Cp);
-        cat.create_table("likes", Regime::Ap);
+        catalog.insert(Table { id: 2, name: "b".into(), regime: Regime::Ap });
+        let tables = catalog.snapshot();
+        assert_eq!(tables.id_of("a"), Some(1), "insert keeps what was there");
+        assert_eq!(tables.id_of("b"), Some(2));
 
-        assert_eq!(cat.regime_for(b"ledger/acct42"), Regime::Cp);
-        assert_eq!(cat.regime_for(b"likes/post7"), Regime::Ap);
-    }
-
-    #[test]
-    fn undeclared_keys_default_to_cp() {
-        let cat = Catalog::new();
-        assert_eq!(cat.regime_for(b"anything"), Regime::Cp, "strong by default");
-        // A key that doesn't fall under a declared table's prefix is also CP.
-        let mut cat = Catalog::new();
-        cat.create_table("likes", Regime::Ap);
-        assert_eq!(cat.regime_for(b"other/x"), Regime::Cp);
-        assert_eq!(cat.regime_for(b"likes_but_not_slashed"), Regime::Cp, "must be under `likes/`");
-    }
-
-    #[test]
-    fn longest_prefix_wins() {
-        let mut cat = Catalog::new();
-        cat.create_table("a", Regime::Ap); // "a/"
-        cat.create_table("a/b", Regime::Cp); // "a/b/" — more specific
-        assert_eq!(cat.regime_for(b"a/x"), Regime::Ap);
-        assert_eq!(cat.regime_for(b"a/b/y"), Regime::Cp, "the longer prefix takes precedence");
-    }
-
-    #[test]
-    fn redeclaring_overwrites() {
-        let mut cat = Catalog::new();
-        cat.create_table("t", Regime::Cp);
-        cat.create_table("t", Regime::Ap);
-        assert_eq!(cat.regime_for(b"t/k"), Regime::Ap);
-    }
-
-    #[test]
-    fn empty_name_is_rejected_in_debug_builds() {
-        // "" is the reserved default/untabled namespace (see `table_prefix`); it must never be
-        // declarable as a real table. In debug builds this is a debug_assert (see create_table);
-        // the authoritative guard for user input lives at the --table CLI parser.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut cat = Catalog::new();
-            cat.create_table("", Regime::Cp);
-        }));
-        assert!(result.is_err(), "create_table(\"\", _) must panic (debug_assert) in a debug build");
-    }
-
-    #[test]
-    fn placements_tile_the_keyspace_by_regime() {
-        let mut cat = Catalog::new();
-        cat.create_table("ledger", Regime::Cp);
-        cat.create_table("likes", Regime::Ap);
-        let ps = cat.placements(vec![1, 2, 3], HashMap::new());
-
-        // Contiguous, gap-free tiling from "" (start) to +∞ (empty end).
-        assert_eq!(ps.first().unwrap().start, b"");
-        assert!(ps.last().unwrap().end.is_empty(), "last region runs to +inf");
-        for w in ps.windows(2) {
-            assert_eq!(w[0].end, w[1].start, "regions must be contiguous");
-        }
-
-        // Each key lands in a region carrying its catalog regime.
-        let regime_of = |key: &[u8]| {
-            ps.iter()
-                .find(|p| key >= p.start.as_slice() && (p.end.is_empty() || key < p.end.as_slice()))
-                .unwrap()
-                .regime
-        };
-        assert_eq!(regime_of(b"likes/post7"), Regime::Ap);
-        assert_eq!(regime_of(b"ledger/acct1"), Regime::Cp);
-        assert_eq!(regime_of(b"zzz"), Regime::Cp, "undeclared keys default to CP");
-    }
-
-    #[test]
-    fn place_derives_regime_from_the_catalog() {
-        let mut cat = Catalog::new();
-        cat.create_table("feed", Regime::Ap);
-        let p = cat.place(2, b"feed/".to_vec(), vec![], vec![1, 2, 3], HashMap::new());
-        assert_eq!(p.regime, Regime::Ap);
-        let p = cat.place(1, b"acct/".to_vec(), b"feed/".to_vec(), vec![1, 2, 3], HashMap::new());
-        assert_eq!(p.regime, Regime::Cp, "undeclared range is CP");
+        catalog.install(vec![Table { id: 3, name: "c".into(), regime: Regime::Cp }]);
+        let tables = catalog.snapshot();
+        assert_eq!(tables.id_of("a"), None, "install replaces wholesale — PD is authoritative");
+        assert_eq!(tables.id_of("c"), Some(3));
     }
 }
