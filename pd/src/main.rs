@@ -1,6 +1,7 @@
-//! arcux-pd — the Placement Driver server: the cluster's TSO + region router.
+//! arcux-pd — the Placement Driver server: the cluster's TSO, catalog and region router.
 //!
-//! Single-process (Phase 3):
+//! Default (a one-node replicated group — it owns the catalog, so it can allocate table ids
+//! and carve regions):
 //!   arcux-pd [--data <dir>] [--listen <addr:port>]
 //!
 //! Replicated 3-node group (PD-on-Raft, Phase 4b++), one command per terminal:
@@ -24,6 +25,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut node_id: Option<u64> = None;
     let mut cluster: Option<u64> = None;
     let mut peers: Vec<(u64, String)> = Vec::new();
+    let mut single_process = false;
+    let mut replicas = arcux_pd::replicated::DEFAULT_REPLICAS;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -41,6 +44,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let (id, addr) = spec.split_once('=').ok_or("--peer must be id=address")?;
                 peers.push((id.parse()?, as_uri(addr)));
             }
+            "--single-process" => single_process = true,
+            "--replicas" | "-r" => {
+                replicas = args.next().ok_or("--replicas requires a count")?.parse()?;
+                if replicas == 0 {
+                    return Err("--replicas must be at least 1".into());
+                }
+            }
             "--help" | "-h" => {
                 println!("{HELP}");
                 return Ok(());
@@ -49,22 +59,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    // Replicated mode: any of --cluster / --node-id / --peer selects it.
-    if cluster.is_some() || node_id.is_some() || !peers.is_empty() {
-        let id = node_id.ok_or("replicated mode needs --node-id / -n")?;
-        let (addrs, bind) = topology(id, cluster, listen, peers)?;
-        // Per-node by default, so `-c N` on one host doesn't have three replicas sharing a log.
-        let data_dir = data_dir.unwrap_or_else(|| format!("./arcux-pd-n{id}"));
-        std::fs::create_dir_all(&data_dir)?;
-        return arcux_pd::raft_server::serve(id, addrs, bind, &data_dir).await;
+    // Single-process mode, explicitly asked for: a bare TSO + router with no replicated state.
+    // It keeps no region table, so it cannot carve a table's range — `create_table` is refused
+    // there. Kept for the tests that want a PD with no log, not as a way to run a cluster.
+    if single_process {
+        if cluster.is_some() || !peers.is_empty() {
+            return Err("--single-process cannot be combined with --cluster/--peer".into());
+        }
+        let listen = listen.unwrap_or_else(|| format!("127.0.0.1:{PD_BASE_PORT}"));
+        let data_dir = data_dir.unwrap_or_else(|| String::from("./arcux-pd-data"));
+        arcux_pd::format::check_or_init(&data_dir, "PD data")?;
+        let addr: SocketAddr = listen.parse()?;
+        return arcux_pd::server::serve(data_dir, addr).await;
     }
 
-    // Single-process mode (Phase 3).
-    let listen = listen.unwrap_or_else(|| format!("127.0.0.1:{PD_BASE_PORT}"));
-    let data_dir = data_dir.unwrap_or_else(|| String::from("./arcux-pd-data"));
-    std::fs::create_dir_all(&data_dir)?;
-    let addr: SocketAddr = listen.parse()?;
-    arcux_pd::server::serve(data_dir, addr).await
+    // Replicated by default, a group of one unless a topology is given. PD holds the catalog
+    // now, and allocating a table id has to go through a log every replica applies — so the
+    // no-flags PD has to be the one that can do it, or `arcux-pd` followed by `create table`
+    // would fail on the most obvious pair of commands there is.
+    let id = node_id.unwrap_or(1);
+    let (addrs, bind) = topology(id, cluster, listen, peers)?;
+    // Per-node by default, so `-c N` on one host doesn't have three replicas sharing a log.
+    let data_dir = data_dir.unwrap_or_else(|| format!("./arcux-pd-n{id}"));
+    arcux_pd::format::check_or_init(&data_dir, "PD data")?;
+    arcux_pd::raft_server::serve(id, addrs, bind, &data_dir, replicas).await
 }
 
 /// Build the `{id → PD address}` topology and this node's bind address. `--cluster N` derives a
@@ -109,21 +127,25 @@ fn as_uri(addr: &str) -> String {
 }
 
 const HELP: &str = "\
-arcux-pd — Placement Driver (TSO + region router)
+arcux-pd — Placement Driver (TSO, catalog, region router)
 
-Single-process:
+One node (the default — owns the catalog, so `create table` works):
   arcux-pd [--data <dir>] [--listen <addr:port>]
 
-Replicated 3-node group (PD-on-Raft):
+Replicated 3-node group (PD-on-Raft), one command per terminal:
   arcux-pd -n <id> --cluster <N>                 # localhost ids 1..=N, base port 2379
   arcux-pd -n <id> --listen <addr> --peer <id>=<addr> ...   # explicit topology
 
 Flags:
-  -d, --data <dir>        data directory: the TSO watermark (single-process) or the
-                          Raft log (replicated). Default ./arcux-pd-data, or
-                          ./arcux-pd-n<id> in replicated mode
-  -l, --listen <addr>     serving address (host:port)
-  -n, --node-id <id>      this node's id (required for replicated mode)
+  -d, --data <dir>        data directory for the Raft log.
+                          Default ./arcux-pd-n<id> (./arcux-pd-data with --single-process)
+  -l, --listen <addr>     serving address (host:port); default 127.0.0.1:2379
+  -n, --node-id <id>      this node's id (default 1)
   -c, --cluster <N>       derive a localhost N-node topology
       --peer <id>=<addr>  a peer's id and address (repeatable, explicit mode)
+  -r, --replicas <N>      voters to grow each data region to (default 3). The first node to
+                          join founds a region alone; each later one is added by membership
+                          change until N are voters
+      --single-process    a TSO + router with no replicated state. Holds no region table, so
+                          it cannot carve a table: `create table` is refused against it
   -h, --help              show this help";
