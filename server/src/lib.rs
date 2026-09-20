@@ -54,7 +54,7 @@ pub mod raft_cmd;
 pub mod raft_group;
 pub mod raft_transport;
 pub mod repair;
-pub mod table_store;
+pub mod upreplicate;
 
 use ap::ApReplication;
 use hlc::Hlc;
@@ -145,6 +145,19 @@ impl TimestampSource for PdClock {
 // Node state
 // ------------------------------------------------------------------------------------
 
+/// What PD tells a node in one heartbeat: the regions it should host, the catalog those
+/// regions belong to, where every other node is, and the version all of it was computed at.
+///
+/// The catalog and the addresses ride along with the assignment rather than arriving through
+/// RPCs of their own: a node needs all three to serve a region — the id to resolve a table
+/// name, the range to route a key, and the peers' addresses to replicate to them.
+struct Assignment {
+    regions: Vec<arcux_pd::ReplicaSet>,
+    tables: Vec<catalog::Table>,
+    nodes: HashMap<u64, String>,
+    version: u64,
+}
+
 /// PD connection used for heartbeats (reporting this node's regions + serving address,
 /// and adopting the regions PD assigns back).
 struct PdHandle {
@@ -201,30 +214,26 @@ pub struct AppState {
     ap: Option<ApReplication>,
     /// This node's hybrid logical clock — the timestamp source for AP writes.
     hlc: Arc<Hlc>,
-    /// Tables declared so far and their regimes (startup `--table` flags, plus any live
-    /// `CreateTable` calls). Two readers: a friendly "table already exists" check ahead of the
-    /// routing-table split machinery (not load-bearing — a re-declaration would be rejected
-    /// there too, just less clearly), and [`ListTables`](KvService::list_tables), for which this
-    /// *is* the source of truth — the startup [`catalog::Catalog`] is consumed to compute
-    /// placements and then dropped, so nothing else survives to answer "what tables exist?".
-    declared: std::sync::Mutex<Vec<(String, Regime)>>,
-    /// The voter set this node's regions are replicated across. A single entry means a
-    /// single-node deployment, which is the only shape [`CreateTable`](KvService::create_table)
-    /// supports — see the guard there.
-    voters: Vec<u64>,
+    /// The tables this node knows: name → id → regime. Every request resolves its table name
+    /// here before touching a key, because the id is the key's stored prefix. PD is the
+    /// authority; this is refreshed from the table list that rides with each assignment.
+    tables: Arc<catalog::Catalog>,
+    /// The voter set this node's regions are replicated across. Learned from PD's assignment,
+    /// which is also where the addresses in `peers` come from.
+    voters: std::sync::RwLock<Vec<u64>>,
     /// The other voters' serving addresses, so a region founded at runtime can replicate to them.
     /// Without these a newly founded CP group has a voter set it cannot reach, and never reaches
-    /// quorum.
-    peers: HashMap<u64, String>,
-    /// Serializes [`CreateTable`](KvService::create_table). Its duplicate-name check and its
-    /// record of the new table straddle several `.await` points, so without this two concurrent
-    /// calls for the same name could both pass the check. Async-aware because it is held across
-    /// those awaits.
-    create_table_lock: tokio::sync::Mutex<()>,
+    /// quorum. Filled from PD rather than from startup flags: a node is told where its peers are,
+    /// the way a TiKV store learns store addresses from PD rather than being configured with them.
+    peers: std::sync::RwLock<HashMap<u64, String>>,
     /// The highest PD catalog version this node has applied. An assignment carrying a version at
     /// or below this is ignored, so a reordered or replayed response can never walk the node back
     /// to older state.
     applied_catalog_version: std::sync::atomic::AtomicU64,
+    /// The voter set PD wants each region to reach, by region id, from the last assignment
+    /// applied. Read every heartbeat by [`drive_upreplication`](AppState::drive_upreplication),
+    /// which grows the groups this node leads toward it.
+    desired: std::sync::RwLock<HashMap<u64, Vec<u64>>>,
 }
 
 impl AppState {
@@ -232,6 +241,7 @@ impl AppState {
     /// table, with no PD and no routing enforcement (clients send no `Context`). This
     /// is the Phase-2 path used by the in-process tests and demos.
     pub fn open(opts: Options) -> arcux_engine::Result<Arc<AppState>> {
+        arcux_pd::format::check_or_init(&opts.data_dir, "data").map_err(arcux_engine::Error::from)?;
         let regions = Arc::new(RegionRegistry::open(&opts.data_dir).map_err(arcux_engine::Error::from)?);
         let engine = Arc::new(Engine::open(opts)?);
         Ok(Arc::new(AppState {
@@ -245,11 +255,11 @@ impl AppState {
             raft: None,
             ap: None,
             hlc: Arc::new(Hlc::new()),
-            declared: std::sync::Mutex::new(Vec::new()),
-            voters: vec![1],
-            peers: HashMap::new(),
-            create_table_lock: tokio::sync::Mutex::new(()),
+            tables: catalog::Catalog::bootstrap(),
+            voters: std::sync::RwLock::new(vec![1]),
+            peers: std::sync::RwLock::new(HashMap::new()),
             applied_catalog_version: std::sync::atomic::AtomicU64::new(0),
+            desired: std::sync::RwLock::new(HashMap::new()),
         }))
     }
 
@@ -263,6 +273,7 @@ impl AppState {
         node_id: u64,
         address: String,
     ) -> Result<Arc<AppState>, Box<dyn std::error::Error + Send + Sync>> {
+        arcux_pd::format::check_or_init(&opts.data_dir, "data")?;
         let regions = Arc::new(RegionRegistry::open_empty(&opts.data_dir, node_id)?);
         let engine = Arc::new(Engine::open(opts)?);
         let client = PdServiceClient::connect(pd_endpoint).await?;
@@ -282,11 +293,11 @@ impl AppState {
             raft: None,
             ap: None,
             hlc: Arc::new(Hlc::new()),
-            declared: std::sync::Mutex::new(Vec::new()),
-            voters: vec![node_id],
-            peers: HashMap::new(),
-            create_table_lock: tokio::sync::Mutex::new(()),
+            tables: catalog::Catalog::bootstrap(),
+            voters: std::sync::RwLock::new(vec![node_id]),
+            peers: std::sync::RwLock::new(HashMap::new()),
             applied_catalog_version: std::sync::atomic::AtomicU64::new(0),
+            desired: std::sync::RwLock::new(HashMap::new()),
         });
         state.heartbeat().await?; // register, adopt our assignment, become routable
         Ok(state)
@@ -326,8 +337,12 @@ impl AppState {
         placements: Vec<RegionPlacement>,
         clock: Arc<dyn TimestampSource>,
     ) -> Result<Arc<AppState>, Box<dyn std::error::Error + Send + Sync>> {
+        arcux_pd::format::check_or_init(&opts.data_dir, "data")?;
         let data_dir = opts.data_dir.clone();
         let engine = Arc::new(Engine::open(opts)?);
+        // Before the groups: each one's apply closure captures the catalog, to render the stored
+        // keys it logs as `table/key` rather than four bytes of binary and a key.
+        let tables = catalog::Catalog::bootstrap();
 
         // Seed the routing registry with the regions this node hosts.
         let regions = Arc::new(RegionRegistry::open_empty(&data_dir, node_id)?);
@@ -364,8 +379,14 @@ impl AppState {
                         voters: p.voters,
                         peers: p.peers,
                         storage,
-                        apply: make_apply(engine.clone(), node_id, p.region_id),
-                        snapshot: make_snapshot(engine.clone(), p.start.clone(), p.end.clone()),
+                        apply: make_apply(engine.clone(), tables.clone(), node_id, p.region_id),
+                        snapshot: make_snapshot(
+                            engine.clone(),
+                            regions.clone(),
+                            p.region_id,
+                            p.start.clone(),
+                            p.end.clone(),
+                        ),
                         restore: make_restore(engine.clone()),
                         tick: Duration::from_millis(DEFAULT_RAFT_TICK_MS),
                     });
@@ -386,11 +407,11 @@ impl AppState {
             raft: Some(MultiRaft::new(groups)),
             ap: Some(ap),
             hlc: Arc::new(Hlc::new()),
-            declared: std::sync::Mutex::new(Vec::new()),
-            voters,
-            peers,
-            create_table_lock: tokio::sync::Mutex::new(()),
+            tables,
+            voters: std::sync::RwLock::new(voters),
+            peers: std::sync::RwLock::new(peers),
             applied_catalog_version: std::sync::atomic::AtomicU64::new(0),
+            desired: std::sync::RwLock::new(HashMap::new()),
         }))
     }
 
@@ -477,12 +498,30 @@ impl AppState {
             voters,
             peers,
             storage,
-            apply: make_apply(self.engine.clone(), self.node_id, region_id),
-            snapshot: make_snapshot(self.engine.clone(), start, end),
+            apply: make_apply(self.engine.clone(), self.tables.clone(), self.node_id, region_id),
+            snapshot: make_snapshot(self.engine.clone(), self.regions.clone(), region_id, start, end),
             restore: make_restore(self.engine.clone()),
             tick: Duration::from_millis(DEFAULT_RAFT_TICK_MS),
         });
         Ok(mr.insert(region_id, group))
+    }
+
+    /// Resolve a request's table name to the id its keys are stored under.
+    ///
+    /// An unknown name is an error, where a name-prefixed keyspace would silently have invented
+    /// a CP range for it. `failed_precondition`, not `not_found`: on a `get`, "not found" reads
+    /// as "no such key".
+    fn table_id(&self, name: &str) -> Result<catalog::TableId, Status> {
+        self.tables.snapshot().id_of(name).ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "table {name:?} does not exist — create it with `create table {name} <cp|ap>`"
+            ))
+        })
+    }
+
+    /// A request's `(table, key)` as the key it is stored and routed under: `be32(id) ++ key`.
+    fn stored_key(&self, table: &str, user_key: &[u8]) -> Result<Vec<u8>, Status> {
+        Ok(catalog::table_key(self.table_id(table)?, user_key))
     }
 
     /// The id of the **AP** region serving `key`, if this node hosts it (route key → region →
@@ -499,7 +538,7 @@ impl AppState {
     /// Returns the HLC timestamp (used as the write's `commit_ts` and its LWW rank).
     async fn ap_write(&self, region_id: u64, key: Vec<u8>, value: Value) -> Result<u64, Status> {
         let ts = self.hlc.now();
-        log_kv(region_id, self.node_id, "AP write (local, fanning out)", &key, ts);
+        log_kv(&self.tables.snapshot(), region_id, self.node_id, "AP write (local, fanning out)", &key, ts);
         let is_delete = value.is_delete();
         let raw_value = match &value {
             Value::Put(v) => v.clone(),
@@ -521,7 +560,7 @@ impl AppState {
     async fn ap_apply(&self, key: Vec<u8>, value: Value, hlc_ts: u64) -> Result<(), Status> {
         self.hlc.observe(hlc_ts);
         let region_id = self.regions.route(&key).map(|r| r.id).unwrap_or(0);
-        log_kv(region_id, self.node_id, "AP replicated (from peer)", &key, hlc_ts);
+        log_kv(&self.tables.snapshot(), region_id, self.node_id, "AP replicated (from peer)", &key, hlc_ts);
         let batch = committed_batch(&key, &value, hlc_ts, hlc_ts);
         let engine = self.engine.clone();
         run_blocking(move || engine.write(batch))
@@ -530,13 +569,15 @@ impl AppState {
         Ok(())
     }
 
-    /// Record the tables declared up front (a real node's `--table` flags), so
-    /// [`ListTables`](KvService::list_tables) can report them and [`CreateTable`](KvService::create_table)
-    /// rejects a re-declaration. [`serve_catalog`] calls this after tiling; a caller that builds
-    /// its node through [`open_multiraft`](Self::open_multiraft) directly (placements carry
-    /// regions, not table names) uses it to say which names those regions came from.
-    pub fn declare_tables(&self, tables: Vec<(String, Regime)>) {
-        *self.declared.lock().unwrap() = tables;
+    /// Install a table set directly, naming the ids the caller's regions were built for.
+    ///
+    /// PD-connected nodes get theirs from the assignment instead (see
+    /// [`reconcile`](Self::reconcile)); this exists for a caller that builds a node through
+    /// [`open_multiraft`](Self::open_multiraft) with hand-made placements — the in-process tests
+    /// — since placements carry regions, not table names. `default` is always present, so
+    /// passing an empty list still leaves a node that can serve an omitted table name.
+    pub fn declare_tables(&self, tables: Vec<catalog::Table>) {
+        self.tables.install(tables);
     }
 
     /// Found a group for every region in the routing table that lacks one.
@@ -547,13 +588,16 @@ impl AppState {
     /// `NotLeader` — so a client waits forever for a leader that can never be elected. That is
     /// silent: the node keeps serving every other key.
     ///
-    /// An undeclared range is CP (strong-by-default), and an AP region is already registered by
-    /// whoever declared it, so anything still missing a group is CP by definition.
+    /// The regime comes from the **table id the region's start key carries**, not an assumption
+    /// that anything unaccounted for is CP. Splitting inside an AP table leaves a piece that is
+    /// still AP; founding a Raft group over it would put a consensus log on top of leaderless
+    /// data. (PD refuses splits on a PD-connected node, so this is the `SplitRegion` path.)
     ///
     /// Idempotent: checks `mr.group(id)` before building anything, because constructing a group
     /// opens a WAL and spawns an actor thread.
     async fn found_missing_regions(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let Some(mr) = self.raft.as_ref() else { return Ok(()) };
+        let tables = self.tables.snapshot();
         let mut founded = Vec::new();
         for region in self.regions.list() {
             if mr.group(region.id).is_some() {
@@ -562,12 +606,18 @@ impl AppState {
             if self.ap.as_ref().is_some_and(|ap| ap.hosts(region.id)) {
                 continue;
             }
+            if tables.regime_of_key(&region.start) == Regime::Ap {
+                if let Some(ap) = self.ap.as_ref() {
+                    ap.insert(region.id, &self.peers());
+                    continue;
+                }
+            }
             self.found_region(
                 region.id,
                 region.start.clone(),
                 region.end.clone(),
-                self.voters.clone(),
-                self.peers.clone(),
+                self.voters(),
+                self.peers(),
             )?;
             founded.push(region.id);
         }
@@ -576,13 +626,78 @@ impl AppState {
         // reason the PD path does: a brand-new region has no prior term, no data, and no competing
         // candidate, so the wait buys nothing and delays the first write by 300-600ms.
         for id in founded {
-            if self.voters.iter().min().is_none_or(|lowest| *lowest == self.node_id) {
+            if self.voters().iter().min().is_none_or(|lowest| *lowest == self.node_id) {
                 if let Some(group) = mr.group(id) {
                     group.campaign().await;
                 }
             }
         }
         Ok(())
+    }
+
+    /// The voter set PD has assigned this node's regions.
+    fn voters(&self) -> Vec<u64> {
+        self.voters.read().expect("voters poisoned").clone()
+    }
+
+    /// Where to reach the other voters, as PD last reported them.
+    fn peers(&self) -> HashMap<u64, String> {
+        self.peers.read().expect("peers poisoned").clone()
+    }
+
+    /// Adopt the voter set and peer addresses PD sent with an assignment. Also pushes the
+    /// addresses into every running Raft group, so a group founded before a peer registered can
+    /// still reach it — the group keeps its clients behind a lock for exactly this.
+    fn adopt_topology(&self, voters: Vec<u64>, addrs: HashMap<u64, String>) {
+        if !voters.is_empty() {
+            *self.voters.write().expect("voters poisoned") = voters;
+        }
+        if addrs.is_empty() {
+            return;
+        }
+        if let Some(mr) = self.raft.as_ref() {
+            for group in mr.all() {
+                for (id, addr) in addrs.iter().filter(|(id, _)| **id != self.node_id) {
+                    group.add_peer(*id, addr);
+                }
+            }
+        }
+        *self.peers.write().expect("peers poisoned") = addrs;
+    }
+
+    /// Where to reach each of `ids` other than this node, from the addresses PD last reported.
+    fn peers_among(&self, ids: &[u64]) -> HashMap<u64, String> {
+        let peers = self.peers();
+        ids.iter()
+            .filter(|id| **id != self.node_id)
+            .filter_map(|id| peers.get(id).map(|a| (*id, a.clone())))
+            .collect()
+    }
+
+    /// Grow every region this node **leads** toward the voter set PD wants: one membership change
+    /// per region per call (see [`upreplicate::next_step`]).
+    ///
+    /// Stateless on purpose — it reads the group's current voters and learners each time, so a
+    /// sequence interrupted by a lost leader or a change still in flight simply resumes on the next
+    /// heartbeat. A failed or refused proposal is left for that next pass too.
+    pub async fn drive_upreplication(&self) {
+        let Some(mr) = self.raft.as_ref() else { return };
+        let desired = self.desired.read().expect("desired poisoned").clone();
+        for (region_id, want) in desired {
+            let Some(group) = mr.group(region_id) else { continue };
+            if !group.is_leader() {
+                continue;
+            }
+            let voters = group.voters();
+            let learners = group.learners();
+            let Some(change) =
+                upreplicate::next_step(&voters, &learners, &want, |id| group.peer_caught_up(id))
+            else {
+                continue;
+            };
+            eprintln!("[raft region {region_id}] node {}: up-replicating — {change:?}", self.node_id);
+            let _ = group.propose_conf_change(change).await;
+        }
     }
 
     /// The region ids this node currently hosts, sorted. Introspection for tests and tooling —
@@ -593,9 +708,10 @@ impl AppState {
         ids
     }
 
-    /// The tables declared on this node, as [`ListTables`](KvService::list_tables) reports them.
-    pub fn declared_tables(&self) -> Vec<(String, Regime)> {
-        self.declared.lock().unwrap().clone()
+    /// The tables this node knows, as [`ListTables`](KvService::list_tables) reports them:
+    /// id-ordered, always including the built-in `default`.
+    pub fn declared_tables(&self) -> Vec<catalog::Table> {
+        self.tables.snapshot().list()
     }
 
     /// Set the background AP anti-entropy period (ms). A large value effectively disables the
@@ -904,6 +1020,9 @@ impl AppState {
         // routing-only adopt, where regions carry no groups to found.
         if !pd.adopt_assignment {
             self.reconcile().await?;
+            // Every beat, not only when the catalog version moves: promoting a learner needs a
+            // later pass after it catches up, and nothing changes PD's version in between.
+            self.drive_upreplication().await;
             return Ok(());
         }
 
@@ -914,7 +1033,7 @@ impl AppState {
                 node_id: pd.node_id,
                 regions: self.reported_regions(),
                 address: pd.address.clone(),
-                tables: self.reported_tables(),
+                tables: Vec::new(),
             })
             .await?
             .into_inner();
@@ -940,12 +1059,24 @@ impl AppState {
         let applied = self.applied_catalog_version.load(std::sync::atomic::Ordering::SeqCst);
         let Some(pd) = self.pd.get() else { return Ok(applied) };
 
-        let (assigned, version) = self.fetch_assignment(pd).await?;
+        let Assignment { regions: assigned, tables, nodes, version } =
+            self.fetch_assignment(pd).await?;
         // Version 0 means PD holds no catalog (a plain PD cluster), and a version we have already
         // applied means this is a replay. Either way there is nothing to adopt.
         if version == 0 || version <= applied {
             return Ok(applied);
         }
+
+        // Tables and topology first, before any region is founded. A name that resolves to an id
+        // whose region is not hosted yet yields `NotLeader`/`RegionStale`, which the client
+        // retries; a hosted region whose name does not resolve is a hard error with no retry —
+        // it reads as "create table succeeded but the table doesn't exist".
+        self.tables.install(tables);
+        // Peer addresses only. Voters are per region now — each region's own set is used where it
+        // is founded or joined below — so there is no node-wide voter list to take from here.
+        self.adopt_topology(Vec::new(), nodes);
+        *self.desired.write().expect("desired poisoned") =
+            assigned.iter().map(|rs| (rs.region.id, rs.desired.clone())).collect();
 
         // Found everything missing, outside the lock. `MultiRaft::insert` is idempotent in the
         // map, but building a group first opens a WAL and spawns a thread — so check membership
@@ -958,26 +1089,48 @@ impl AppState {
             match rs.regime {
                 arcux_pd::Regime::Ap => {
                     if let Some(ap) = self.ap.as_ref() {
-                        if !ap.hosts(id) {
-                            ap.insert(id, &self.peers);
-                        }
+                        // (Re)register on every applied assignment, not only the first time: the
+                        // replica set grows as nodes join, and a peer list fixed when this node
+                        // first hosted the region would leave its writes fanning out to nobody —
+                        // reaching the others only when *their* anti-entropy pulled them, and its
+                        // own read-repair and anti-entropy consulting no one. Fan out to the
+                        // region's own replica set, not every node PD knows.
+                        ap.insert(id, &self.peers_among(&rs.desired));
                     }
                 }
                 arcux_pd::Regime::Cp => {
                     let already = self.raft.as_ref().and_then(|mr| mr.group(id)).is_some();
-                    if !already {
+                    if already {
+                        continue;
+                    }
+                    if rs.voters.contains(&self.node_id) {
+                        // A founding member: start the group with the region's founding voters.
                         self.found_region(
                             id,
                             rs.region.start.clone(),
                             rs.region.end.clone(),
                             rs.voters.clone(),
-                            self.peers.clone(),
+                            self.peers(),
                         )?;
                         // Exactly one voter campaigns, chosen deterministically, so a brand-new
                         // region does not idle out a randomized election timeout before it can
                         // serve. Safe because it has no prior term, no data, and no competing
                         // candidate; every other voter simply votes.
                         founded_cp.push(id);
+                    } else if rs.desired.contains(&self.node_id) {
+                        // Wanted, but not yet a member: join blank and wait. A blank replica never
+                        // campaigns; it adopts the real membership from the leader's log or
+                        // snapshot once the leader adds it as a learner. Founding it with
+                        // voters of its own is exactly the split-brain this replaced.
+                        self.host_region(RegionPlacement {
+                            region_id: id,
+                            start: rs.region.start.clone(),
+                            end: rs.region.end.clone(),
+                            epoch: rs.region.epoch,
+                            regime: Regime::Cp,
+                            voters: Vec::new(),
+                            peers: self.peers(),
+                        })?;
                     }
                 }
             }
@@ -1007,7 +1160,7 @@ impl AppState {
     async fn fetch_assignment(
         &self,
         pd: &PdHandle,
-    ) -> Result<(Vec<arcux_pd::ReplicaSet>, u64), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Assignment, Box<dyn std::error::Error + Send + Sync>> {
         let resp = pd
             .client
             .clone()
@@ -1015,13 +1168,29 @@ impl AppState {
                 node_id: pd.node_id,
                 regions: self.reported_regions(),
                 address: pd.address.clone(),
-                tables: self.reported_tables(),
+                // A node declares no tables of its own: PD owns the catalog, and this field is
+                // what it used to hear from nodes that each had their own `--table` flags.
+                tables: Vec::new(),
             })
             .await?
             .into_inner();
-        let assigned =
-            resp.regions.iter().map(arcux_pd::convert::replica_set_from_proto).collect();
-        Ok((assigned, resp.catalog_version))
+        Ok(Assignment {
+            regions: resp.regions.iter().map(arcux_pd::convert::replica_set_from_proto).collect(),
+            tables: resp
+                .tables
+                .iter()
+                .map(|t| catalog::Table {
+                    id: t.id,
+                    name: t.name.clone(),
+                    regime: match arcux_pd::convert::regime_from_proto(t.regime) {
+                        arcux_pd::Regime::Ap => Regime::Ap,
+                        arcux_pd::Regime::Cp => Regime::Cp,
+                    },
+                })
+                .collect(),
+            nodes: resp.nodes.iter().map(|n| (n.node_id, n.address.clone())).collect(),
+            version: resp.catalog_version,
+        })
     }
 
     /// The regions this node hosts, each tagged with how it is actually served here and the
@@ -1036,28 +1205,24 @@ impl AppState {
                 } else {
                     arcux_pd::Regime::Cp
                 };
-                let rs = arcux_pd::ReplicaSet {
-                    region: r.clone(),
-                    regime,
-                    voters: self.voters.clone(),
-                };
+                // Voters only from the leader: its view is the group's committed membership,
+                // where a follower may hold a change that never commits. PD adopts a reported set
+                // only if it grows the region, so an empty report here says nothing.
+                let voters = self
+                    .raft_group(r.id)
+                    .filter(|g| g.is_leader())
+                    .map(|g| {
+                        let mut v = g.voters();
+                        v.sort_unstable();
+                        v
+                    })
+                    .unwrap_or_default();
+                let rs = arcux_pd::ReplicaSet { region: r.clone(), regime, voters, desired: Vec::new() };
                 arcux_pd::convert::replica_set_to_proto(&rs)
             })
             .collect()
     }
 
-    fn reported_tables(&self) -> Vec<pd::TableDecl> {
-        self.declared_tables()
-            .iter()
-            .map(|(name, regime)| {
-                let regime = match regime {
-                    Regime::Ap => arcux_pd::Regime::Ap,
-                    Regime::Cp => arcux_pd::Regime::Cp,
-                };
-                arcux_pd::convert::table_decl_to_proto(name, regime)
-            })
-            .collect()
-    }
 
     /// Connect a already-open node to PD for **placement reporting only**: it registers, then
     /// heartbeats its regions and declared tables so PD holds a cluster-wide view and can
@@ -1180,22 +1345,23 @@ fn committed_batch(key: &[u8], value: &Value, start_ts: u64, commit_ts: u64) -> 
     b
 }
 
-/// Print a KV data operation on this node's terminal (server-side observability). Keys are
-/// shown as text. CP writes are logged from the apply path (so on **every** replica); AP writes
-/// from the receiving node and again on each peer; reads only on the node that serves them.
-fn log_kv(region: u64, node: u64, what: &str, key: &[u8], ts: u64) {
-    eprintln!(
-        "[kv region {region}] node {node}: {what} {} @ {ts}",
-        String::from_utf8_lossy(key)
-    );
+/// Print a KV data operation on this node's terminal (server-side observability). CP writes are
+/// logged from the apply path (so on **every** replica); AP writes from the receiving node and
+/// again on each peer; reads only on the node that serves them.
+///
+/// `key` is a *stored* key, so it begins with four bytes of table id: rendered through the
+/// catalog as `table/key`, or `#id/key` for an id this node has not learned yet. Never panics on
+/// an unknown id — a log line must not be able to take the node down.
+fn log_kv(tables: &catalog::Tables, region: u64, node: u64, what: &str, key: &[u8], ts: u64) {
+    eprintln!("[kv region {region}] node {node}: {what} {} @ {ts}", tables.render_key(key));
 }
 
 /// Log each user key in a committed autocommit batch (recovered from its Write-CF entry).
-fn log_committed_write(region: u64, node: u64, batch: &WriteBatch) {
+fn log_committed_write(tables: &catalog::Tables, region: u64, node: u64, batch: &WriteBatch) {
     for op in &batch.ops {
         if op.cf() == Cf::Write {
             if let Some((user_key, commit_ts)) = decode_data_key(op.key()) {
-                log_kv(region, node, "committed (raft)", user_key, commit_ts);
+                log_kv(tables, region, node, "committed (raft)", user_key, commit_ts);
             }
         }
     }
@@ -1239,7 +1405,12 @@ fn prewrite_region(
 /// the same log prefix against identical state) by reusing the single-node Percolator. The
 /// returned engine `Result` answers the leader's proposer; a Percolator conflict is an
 /// `Err` here, surfaced to the client as a `KeyError`. An empty entry is the election no-op.
-fn make_apply(engine: Arc<Engine>, node_id: u64, region_id: u64) -> ApplyFn {
+fn make_apply(
+    engine: Arc<Engine>,
+    tables: Arc<catalog::Catalog>,
+    node_id: u64,
+    region_id: u64,
+) -> ApplyFn {
     Arc::new(move |data: &[u8]| -> Result<(), Error> {
         if data.is_empty() {
             return Ok(());
@@ -1248,7 +1419,7 @@ fn make_apply(engine: Arc<Engine>, node_id: u64, region_id: u64) -> ApplyFn {
             Some(Command::Autocommit(batch)) => {
                 // Log on *every* replica that applies this committed entry — a CP write shows
                 // up in all nodes' terminals, the visible face of Raft replication.
-                log_committed_write(region_id, node_id, &batch);
+                log_committed_write(&tables.snapshot(), region_id, node_id, &batch);
                 engine.write(batch)?;
                 Ok(())
             }
@@ -1296,8 +1467,27 @@ fn make_apply(engine: Arc<Engine>, node_id: u64, region_id: u64) -> ApplyFn {
 ///
 /// This is **latest-value-per-key**, not the full MVCC version history — a catching-up
 /// replica only needs the current committed state (full-history snapshots are deferred).
-fn make_snapshot(engine: Arc<Engine>, start: Vec<u8>, end: Vec<u8>) -> SnapshotFn {
+///
+/// The range is read from the routing table **when the snapshot is taken**, not captured when
+/// the group starts. A region's bounds change under a live group: every `create table` splits
+/// the tail region, narrowing whichever group owned it. A range fixed at founding would keep
+/// scanning the old, wider span and ship a catching-up replica the keys of every table carved
+/// off it since. `start`/`end` are only the fallback for a region no longer in the routing
+/// table, where the group is on its way out and the range it last served is the best answer.
+fn make_snapshot(
+    engine: Arc<Engine>,
+    regions: Arc<RegionRegistry>,
+    region_id: u64,
+    start: Vec<u8>,
+    end: Vec<u8>,
+) -> SnapshotFn {
     Arc::new(move || -> Vec<u8> {
+        let (start, end) = regions
+            .list()
+            .into_iter()
+            .find(|r| r.id == region_id)
+            .map(|r| (r.start, r.end))
+            .unwrap_or_else(|| (start.clone(), end.clone()));
         let pairs = engine.scan(&start, &end, u64::MAX, 0, false).unwrap_or_default();
         encode_kv_pairs(&pairs)
     })
@@ -1450,9 +1640,11 @@ impl KvApi {
             .into_inner();
 
         // Adopt immediately rather than waiting for PD's push to land on *this* node — the caller
-        // is about to write to the table through this connection.
+        // is about to write to the table through this connection. `reconcile` installs the whole
+        // catalog PD sent; the insert below only covers the window where this node's heartbeat
+        // has not come back yet.
         let _ = self.state.reconcile().await;
-        self.state.declared.lock().unwrap().push((name, regime));
+        self.state.tables.insert(catalog::Table { id: resp.table_id, name, regime });
 
         let region = resp
             .region
@@ -1464,6 +1656,7 @@ impl KvApi {
                 end_key: region.end_key,
                 epoch: region.epoch,
             }),
+            table_id: resp.table_id,
         }))
     }
 
@@ -1583,7 +1776,7 @@ impl KvService for KvApi {
         request: Request<kv::GetRequest>,
     ) -> Result<Response<kv::GetResponse>, Status> {
         let mut req = request.into_inner();
-        req.key = [catalog::table_prefix(&req.table), req.key].concat();
+        req.key = self.state.stored_key(&req.table, &req.key)?;
         if let Some(ke) = self.state.check_context(&req.context, &req.key) {
             return Ok(Response::new(kv::GetResponse {
                 found: false,
@@ -1595,7 +1788,7 @@ impl KvService for KvApi {
         // AP read: leaderless Last-Writer-Wins — any replica returns the highest-HLC version
         // (read at the max timestamp). No leader, always serveable.
         if let Some(region_id) = self.state.ap_for(&req.key) {
-            log_kv(region_id, self.state.node_id, "GET (AP, read-repair)", &req.key, 0);
+            log_kv(&self.state.tables.snapshot(), region_id, self.state.node_id, "GET (AP, read-repair)", &req.key, 0);
             // Read-repair: consult the peers, return the LWW winner, and heal stale replicas.
             let res = self.state.ap_read_repair(region_id, &req.key).await?;
             return Ok(Response::new(match res {
@@ -1633,6 +1826,7 @@ impl KvService for KvApi {
             }
         }
         log_kv(
+            &self.state.tables.snapshot(),
             self.state.regions.route(&req.key).map(|r| r.id).unwrap_or(0),
             self.state.node_id,
             "GET (leader/direct)",
@@ -1699,7 +1893,7 @@ impl KvService for KvApi {
         request: Request<kv::PutRequest>,
     ) -> Result<Response<kv::PutResponse>, Status> {
         let mut req = request.into_inner();
-        req.key = [catalog::table_prefix(&req.table), req.key].concat();
+        req.key = self.state.stored_key(&req.table, &req.key)?;
         if let Some(ke) = self.state.check_context(&req.context, &req.key) {
             return Ok(Response::new(kv::PutResponse { commit_ts: 0, error: Some(ke) }));
         }
@@ -1730,7 +1924,7 @@ impl KvService for KvApi {
         request: Request<kv::DeleteRequest>,
     ) -> Result<Response<kv::DeleteResponse>, Status> {
         let mut req = request.into_inner();
-        req.key = [catalog::table_prefix(&req.table), req.key].concat();
+        req.key = self.state.stored_key(&req.table, &req.key)?;
         if let Some(ke) = self.state.check_context(&req.context, &req.key) {
             return Ok(Response::new(kv::DeleteResponse { commit_ts: 0, error: Some(ke) }));
         }
@@ -1765,28 +1959,23 @@ impl KvService for KvApi {
         let mut req = request.into_inner();
 
         // Empty start_key and end_key together mean "scan the whole table" — the server derives
-        // the table's own bounds from the catalog rather than the client guessing them. Empty
-        // table + empty bounds is the one unsupported case: the untabled "" default namespace
-        // isn't a single contiguous range (see catalog.rs), so there's nothing to derive.
+        // the table's own bounds from its id rather than the client guessing them. This works for
+        // every table now, `default` included: a table is one contiguous id range, so there is no
+        // longer a namespace scattered across the gaps between other tables.
         let whole_table = req.start_key.is_empty() && req.end_key.is_empty();
-        if whole_table && req.table.is_empty() {
-            return Err(Status::invalid_argument(
-                "scan: the untabled default namespace (\"\") has no contiguous range — pass an \
-                 explicit [start, end) or scope the scan to a declared table",
-            ));
-        }
-        let prefix = catalog::table_prefix(&req.table);
+        let id = self.state.table_id(&req.table)?;
+        let (table_start, table_end) = catalog::table_range(id);
         if whole_table {
-            req.start_key = prefix.clone();
-            req.end_key = catalog::prefix_successor(&prefix).unwrap_or_default();
+            req.start_key = table_start;
+            req.end_key = table_end;
         } else {
-            req.start_key = [prefix.clone(), req.start_key].concat();
+            req.start_key = catalog::table_key(id, &req.start_key);
             // An empty end is bounded to the active table (not the whole keyspace), consistent
-            // with put/get/delete always being table-scoped once a table is in play.
+            // with put/get/delete always being table-scoped.
             req.end_key = if req.end_key.is_empty() {
-                catalog::prefix_successor(&prefix).unwrap_or_default()
+                table_end
             } else {
-                [prefix, req.end_key].concat()
+                catalog::table_key(id, &req.end_key)
             };
         }
 
@@ -1822,7 +2011,12 @@ impl KvService for KvApi {
         .await?
         .map_err(|e| Status::internal(format!("scan: {e}")))?;
 
-        let pairs = pairs.into_iter().map(|(key, value)| kv::Kv { key, value }).collect();
+        // Strip the id prefix: a client asked for keys in a table and gets back the keys it
+        // would have written, not the four bytes of routing that precede them on disk.
+        let pairs = pairs
+            .into_iter()
+            .map(|(key, value)| kv::Kv { key: catalog::strip_table_prefix(&key).to_vec(), value })
+            .collect();
         Ok(Response::new(kv::ScanResponse { pairs }))
     }
 
@@ -1872,134 +2066,39 @@ impl KvService for KvApi {
         Ok(Response::new(kv::MergeRegionResponse { merged: Some(region_info(&merged)) }))
     }
 
-    /// Declare a new table and stand up its region live — no restart. Single-node only for
-    /// now: the new region's sole voter is this node, and there's no PD/multi-node push to
-    /// tell other replicas about it (see `arcux.md`'s "Dynamic table creation" entry). Rejects
-    /// a re-declared name and rejects a target key range that already holds data — carving a
-    /// region out of one with live data would mean splitting an existing Raft group's log,
-    /// which isn't supported.
+    /// Declare a new table and stand up its region live — no restart.
+    ///
+    /// PD owns the catalog: it allocates the table's id, carves the one region that id owns, and
+    /// pushes the new assignment to every node. This handler is the client's entry point to
+    /// that, and adopts the result locally so the caller can write to the table immediately.
+    ///
+    /// There is no local-carve path. A node choosing ids for itself is exactly how two nodes end
+    /// up giving one name two ids — and so two key ranges — with nothing to detect it.
     async fn create_table(
         &self,
         request: Request<kv::CreateTableRequest>,
     ) -> Result<Response<kv::CreateTableResponse>, Status> {
         let req = request.into_inner();
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("create_table: name must not be empty"));
+        if req.name.is_empty() || req.name == catalog::DEFAULT_TABLE_NAME {
+            return Err(Status::invalid_argument(format!(
+                "create_table: {:?} is reserved — it is the table an omitted table name resolves to",
+                catalog::DEFAULT_TABLE_NAME
+            )));
         }
         let regime = match kv::Regime::try_from(req.regime) {
             Ok(kv::Regime::Cp) => Regime::Cp,
             Ok(kv::Regime::Ap) => Regime::Ap,
             Err(_) => return Err(Status::invalid_argument("create_table: invalid regime")),
         };
-
-        // PD-connected: PD owns the region table, so it carves and pushes the result to every
-        // node. That is what makes this work on a cluster at all — carving locally would leave the
-        // other nodes with the old, wider region and, because a catalog tiling numbers regions by
-        // position, the same id naming a different key range on each of them.
-        if self.state.pd.get().is_some() {
-            return self.create_table_via_pd(req.name, regime).await;
-        }
-
-        // No PD: carve locally. Single-node only, and the voter check still guards that.
-        if self.state.voters.len() > 1 {
+        if self.state.pd.get().is_none() {
             return Err(Status::failed_precondition(
-                "create_table: a multi-node cluster needs PD to carve the table cluster-wide — \
-                 start the nodes with --pd, or declare it with --table <name>=cp|ap on each.",
+                "create_table: PD allocates table ids, and this node has none — start it with --pd",
             ));
         }
-
-        // Held for the whole handler: the duplicate check below and the record of the new table
-        // straddle several `.await`s, so concurrent calls for one name could otherwise both pass.
-        let _create_guard = self.state.create_table_lock.lock().await;
-
-        if self.state.declared.lock().unwrap().iter().any(|(n, _)| n == &req.name) {
-            return Err(Status::already_exists(format!("table {:?} is already declared", req.name)));
+        if self.state.tables.snapshot().id_of(&req.name).is_some() {
+            return Err(Status::already_exists(format!("table {:?} already exists", req.name)));
         }
-
-        let start = catalog::table_prefix(&req.name);
-        let end = catalog::prefix_successor(&start).unwrap_or_default();
-
-        // Emptiness check: the target range must hold no live data (see the module doc above).
-        let state = self.state.clone();
-        let (scan_start, scan_end) = (start.clone(), end.clone());
-        let existing = run_blocking(move || state.engine.scan(&scan_start, &scan_end, u64::MAX, 1, true))
-            .await?
-            .map_err(|e| Status::internal(format!("create_table: emptiness check failed: {e}")))?;
-        if !existing.is_empty() {
-            return Err(Status::failed_precondition(format!(
-                "create_table: the range for {:?} already has data — dynamic creation requires an empty range",
-                req.name
-            )));
-        }
-
-        // Carve the routing table: narrow at `start`, then at `end`, unless a boundary is
-        // already there. Two `RegionRegistry::split` calls — the same operation `SplitRegion`
-        // already performs — mint a fresh, stable id for the carved-out middle piece.
-        let already_at_start = self.state.regions.route(&start).map(|r| r.start == start).unwrap_or(false);
-        if !already_at_start {
-            let regions = self.state.regions.clone();
-            let s = start.clone();
-            run_blocking(move || regions.split(&s))
-                .await?
-                .map_err(|e| Status::internal(format!("create_table: {e}")))?;
-        }
-        if !end.is_empty() {
-            let already_at_end = self.state.regions.route(&start).map(|r| r.end == end).unwrap_or(false);
-            if !already_at_end {
-                let regions = self.state.regions.clone();
-                let e = end.clone();
-                run_blocking(move || regions.split(&e))
-                    .await?
-                    .map_err(|err| Status::internal(format!("create_table: {err}")))?;
-            }
-        }
-        let region = self
-            .state
-            .regions
-            .route(&start)
-            .ok_or_else(|| Status::internal("create_table: carve failed"))?;
-
-        // Found the new region live, keyed by the carved id.
-        match regime {
-            Regime::Cp => {
-                self.state
-                    .found_region(region.id, region.start.clone(), region.end.clone(), vec![self.state.node_id], HashMap::new())
-                    .map_err(|e| Status::internal(format!("create_table: {e}")))?;
-            }
-            Regime::Ap => {
-                let Some(ap) = self.state.ap.as_ref() else {
-                    return Err(Status::failed_precondition(
-                        "create_table: node is not in AP-capable (multiraft) mode",
-                    ));
-                };
-                ap.insert(region.id, &HashMap::new());
-            }
-        }
-
-        // The carve also produced gap regions either side of the table. Without groups behind
-        // them, every untabled key sorting after this table would route into a dead region.
-        self.state
-            .found_missing_regions()
-            .await
-            .map_err(|e| Status::internal(format!("create_table: {e}")))?;
-
-        self.state.declared.lock().unwrap().push((req.name.clone(), regime));
-
-        // Make the declaration durable before acking, so a restart restores the table with its
-        // regime instead of silently re-tiling it back into the default CP namespace. On failure
-        // the next boot tiles from the catalog without this entry, dropping the half-created
-        // region — so the node self-corrects rather than coming back inconsistent.
-        let data_dir = self.state.engine.options().data_dir.clone();
-        let snapshot = self.state.declared.lock().unwrap().clone();
-        run_blocking(move || table_store::save(&data_dir, &snapshot))
-            .await?
-            .map_err(|e| Status::internal(format!("create_table: persisting the catalog failed: {e}")))?;
-
-        // Tell PD about the new topology so clients re-routing after a RegionStale see it.
-        if let Err(e) = self.state.heartbeat().await {
-            return Err(Status::internal(format!("create_table applied but PD heartbeat failed: {e}")));
-        }
-        Ok(Response::new(kv::CreateTableResponse { region: Some(region_info(&region)) }))
+        self.create_table_via_pd(req.name, regime).await
     }
 
     /// List this node's declared tables and their regimes. Node-local, mirroring
@@ -2014,12 +2113,13 @@ impl KvService for KvApi {
             .state
             .declared_tables()
             .iter()
-            .map(|(name, regime)| kv::TableInfo {
-                name: name.clone(),
-                regime: match regime {
+            .map(|t| kv::TableInfo {
+                name: t.name.clone(),
+                regime: match t.regime {
                     Regime::Cp => kv::Regime::Cp as i32,
                     Regime::Ap => kv::Regime::Ap as i32,
                 },
+                id: t.id,
             })
             .collect();
         // Sorted, so the listing doesn't leak startup-flag/creation ordering.
@@ -2341,87 +2441,68 @@ pub async fn serve_with_pd(
     Ok(())
 }
 
-/// Open the engine as a **replicated CP node** — a single whole-keyspace Raft group across
-/// `voters` — bind `addr`, and serve until Ctrl-C. This node is `node_id` (which must be one
-/// of `voters`); `peers` maps the *other* voter ids to their gRPC addresses so the group can
-/// replicate. Timestamps come from a local clock, so run one cluster per machine-time source;
-/// front the nodes with PD for a globally monotonic oracle in a real deployment.
+/// Open a **PD-connected node**: bind `addr`, register with PD, and serve until Ctrl-C.
 ///
-/// Writes go to whichever node the group elected leader (others reply `NotLeader`); killing
-/// the leader triggers a re-election among the survivors.
-pub async fn serve_replicated(
-    opts: Options,
-    addr: SocketAddr,
-    node_id: u64,
-    voters: Vec<u64>,
-    peers: HashMap<u64, String>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let clock: Arc<dyn TimestampSource> = Arc::new(LocalClock::new());
-    let state = AppState::open_replicated(opts, node_id, voters.clone(), peers, clock)?;
-    let listener = TcpListener::bind(addr).await?;
-    eprintln!(
-        "arcux-server listening on {} (replicated CP, node {node_id}, voters {voters:?})",
-        listener.local_addr()?
-    );
-    serve_on(state, listener, shutdown_signal()).await?;
-    Ok(())
-}
-
-/// Open a **catalog-driven multi-region** node: the keyspace is tiled at the declared tables'
-/// prefix boundaries and each region is hosted per its regime — a **CP** table as a Raft group
-/// (replicated across `voters`), an **AP** table as a leaderless HLC/LWW replica set (fanning
-/// out to `peers`). `node_id` is this node (must be one of `voters`); undeclared key ranges
-/// default to CP (strong-by-default). Bind `addr` and serve until Ctrl-C.
+/// This is the only way to run a node. PD holds the catalog, allocates every table's id, carves
+/// the one region each id owns, and tells this node which of those regions to host, who the
+/// other voters are, and where to reach them. A node therefore starts knowing only its own
+/// identity and where PD is — the way a TiKV store is given `--pd-endpoints` rather than a list
+/// of its peers.
 ///
-/// `pd` is an optional `(endpoint, this node's advertised address)` to report to. Reporting
-/// **only** — see [`AppState::attach_pd`]: PD records the cluster-wide catalog and can flag
-/// nodes that disagree about a table's regime, but it neither places this node's regions nor
-/// serves its timestamps.
+/// Until PD answers, the node serves the built-in `default` table and nothing else.
 pub async fn serve_catalog(
     opts: Options,
     addr: SocketAddr,
     node_id: u64,
-    voters: Vec<u64>,
-    peers: HashMap<u64, String>,
-    tables: Vec<(String, Regime)>,
-    pd: Option<(String, String)>,
+    pd_endpoint: String,
+    advertise: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let state = open_catalog_node(opts, node_id, voters.clone(), peers, tables)?;
+    // Bind first so the advertised address reflects the real (possibly ephemeral) port.
     let listener = TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
+    let address = advertise.unwrap_or_else(|| format!("http://{bound}"));
 
-    if let Some((endpoint, address)) = pd {
-        // Before serve_on, which decides then whether to run the periodic heartbeat.
-        state.attach_pd(endpoint.clone(), address).await?;
-        eprintln!("  PD {endpoint}: reporting tables and placement only (timestamps stay node-local)");
-    }
+    let state = open_pd_node(opts, node_id)?;
+    state.attach_pd(pd_endpoint.clone(), address.clone()).await?;
 
-    let map = state
+    eprintln!("arcux-server listening on {bound} as {address} (node {node_id}, PD {pd_endpoint})");
+    let tables = state
         .declared_tables()
         .iter()
-        .map(|(n, r)| format!("{n}={}", if *r == Regime::Ap { "AP" } else { "CP" }))
+        .map(|t| format!("{}={}", t.name, if t.regime == Regime::Ap { "AP" } else { "CP" }))
         .collect::<Vec<_>>()
         .join(", ");
-    eprintln!(
-        "arcux-server listening on {} (catalog, node {node_id}, voters {voters:?})",
-        listener.local_addr()?
-    );
-    eprintln!("  tables: {map}  (undeclared keys: CP)");
+    eprintln!("  tables: {tables}  (create more with `create table <name> <cp|ap>`)");
 
     serve_on(state, listener, shutdown_signal()).await?;
     Ok(())
 }
 
-/// Build a catalog-driven node's [`AppState`] without binding a socket — the half of
-/// [`serve_catalog`] that decides which tables exist and tiles the keyspace for them.
+/// Open a node that will take **every** region from PD: it founds nothing itself.
 ///
-/// The declarations come from two places: whatever this data directory already recorded (via
-/// [`table_store`]) and the `--table` flags in `tables`. Merging them is what makes a live
-/// `kv.CreateTable` durable — startup flags alone would drop it, silently re-tiling an AP table
-/// back into the default CP namespace. A flag contradicting a persisted regime is an error and
-/// the node refuses to start; see [`catalog::merge_declarations`].
+/// This is how a real node starts, and the distinction is the whole point. A node that tiled its
+/// own `default` region at startup would found it with itself as the only voter, and so would
+/// every other node — three independent single-voter groups for one region, each electing itself
+/// and accepting writes the others never see. Starting empty means the first assignment decides
+/// every region's voters, and PD decides them once for everyone.
 ///
-/// Split out from `serve_catalog` so tests can drive the real startup path — including the
-/// restore-after-restart behaviour — rather than a copy of it that could drift.
+/// Call [`AppState::attach_pd`] next; until its first heartbeat the node serves nothing.
+pub fn open_pd_node(
+    opts: Options,
+    node_id: u64,
+) -> Result<Arc<AppState>, Box<dyn std::error::Error + Send + Sync>> {
+    let clock: Arc<dyn TimestampSource> = Arc::new(LocalClock::new());
+    AppState::open_multiraft(opts, node_id, Vec::new(), clock)
+}
+
+/// Build a node's [`AppState`] without binding a socket — the half of [`serve_catalog`] a test
+/// can drive directly.
+///
+/// `voters`, `peers` and `tables` let an **in-process test** stand up a node with hand-made
+/// regions and no PD. A real node does not come through here: it uses [`open_pd_node`] and learns
+/// all three from PD.
+/// Tables are numbered `1..=n` in the order given, matching the tiling below, so a caller cannot
+/// get the ids and the regions out of step.
 pub fn open_catalog_node(
     opts: Options,
     node_id: u64,
@@ -2429,18 +2510,42 @@ pub fn open_catalog_node(
     peers: HashMap<u64, String>,
     tables: Vec<(String, Regime)>,
 ) -> Result<Arc<AppState>, Box<dyn std::error::Error + Send + Sync>> {
-    let persisted = table_store::load(&opts.data_dir)?;
-    let tables = catalog::merge_declarations(&persisted, &tables)?;
+    let voters = if voters.is_empty() { vec![node_id] } else { voters };
+    let tables: Vec<catalog::Table> = tables
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, regime))| catalog::Table { id: i as catalog::TableId + 1, name, regime })
+        .collect();
 
-    let mut cat = catalog::Catalog::new();
-    for (name, regime) in &tables {
-        cat.create_table(name, *regime);
+    // One region per table, plus the default table's, which starts at the keyspace start so that
+    // routing an empty key resolves. Contiguous by construction: each table's range ends exactly
+    // where the next begins, and the last runs to +inf.
+    let mut placements = vec![RegionPlacement {
+        region_id: 1,
+        start: Vec::new(),
+        end: catalog::table_range(catalog::DEFAULT_TABLE_ID + 1).0,
+        epoch: 1,
+        regime: Regime::Cp,
+        voters: voters.clone(),
+        peers: peers.clone(),
+    }];
+    for (i, t) in tables.iter().enumerate() {
+        let (start, end) = catalog::table_range(t.id);
+        let last = i + 1 == tables.len();
+        placements.push(RegionPlacement {
+            region_id: t.id as u64 + 1,
+            start,
+            end: if last { Vec::new() } else { end },
+            epoch: 1,
+            regime: t.regime,
+            voters: voters.clone(),
+            peers: peers.clone(),
+        });
     }
-    let placements = cat.placements(voters, peers);
-
-    // Record the merged set, so a table introduced by a `--table` flag survives a later restart
-    // without it — the same durability a live-created table now gets.
-    table_store::save(&opts.data_dir, &tables)?;
+    if tables.is_empty() {
+        // Nothing declared: the default table owns the whole keyspace.
+        placements[0].end = Vec::new();
+    }
 
     let clock: Arc<dyn TimestampSource> = Arc::new(LocalClock::new());
     let state = AppState::open_multiraft(opts, node_id, placements, clock)?;
@@ -2451,4 +2556,40 @@ pub fn open_catalog_node(
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     eprintln!("arcux-server shutting down");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A region's range changes under a live group — every `create table` splits the tail — so a
+    /// snapshot must scan the range the region has *now*. One fixed at founding would ship a
+    /// catching-up replica the keys of every table carved off the region since.
+    #[test]
+    fn a_snapshot_covers_the_regions_current_range_not_its_founding_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = Arc::new(Engine::open(Options::new(dir.path().join("engine"))).expect("engine"));
+        // One region over the whole keyspace, as a fresh node's `default` region starts.
+        let regions = Arc::new(RegionRegistry::open(dir.path().join("regions")).expect("regions"));
+        let region_id = regions.list()[0].id;
+
+        // Keys in the default table and in table 1.
+        for key in [catalog::table_key(0, b"a"), catalog::table_key(1, b"o1")] {
+            engine.write(committed_batch(&key, &Value::Put(b"v".to_vec()), 1, 2)).expect("write");
+        }
+
+        // Founded while it owned everything.
+        let snapshot = make_snapshot(engine.clone(), regions.clone(), region_id, vec![], vec![]);
+        assert_eq!(decode_kv_pairs(&snapshot()).len(), 2, "before the carve it owns both keys");
+
+        // `create table` carves table 1 off the tail: this region now ends at be32(1).
+        regions.split(&catalog::table_range(1).0).expect("split");
+
+        let keys: Vec<Vec<u8>> = decode_kv_pairs(&snapshot()).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            keys,
+            vec![catalog::table_key(0, b"a")],
+            "the snapshot must not carry table 1's keys once the region no longer owns them"
+        );
+    }
 }
