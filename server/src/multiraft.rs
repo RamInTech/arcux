@@ -50,6 +50,12 @@ impl MultiRaft {
         MultiRaft { groups: RwLock::new(groups) }
     }
 
+    /// Every group this node hosts — for an operation that applies to all of them, such as
+    /// installing peer addresses PD has just reported.
+    pub fn all(&self) -> Vec<RaftGroup> {
+        self.groups.read().unwrap().values().cloned().collect()
+    }
+
     /// The group for `region_id`, if this node hosts it. Returns an owned handle
     /// ([`RaftGroup`] is a cheap clone sharing the actor's channels).
     pub fn group(&self, region_id: u64) -> Option<RaftGroup> {
