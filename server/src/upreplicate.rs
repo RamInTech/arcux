@@ -45,9 +45,81 @@ pub fn next_step(
     }
 }
 
+/// How a region reads at founding when PD wants more voters than it has — or `None` once it has
+/// them all. The first node on a fresh cluster founds every region **alone** and elects itself,
+/// which is intended (the group's configuration really is `{1}`, so a majority is 1 of 1), but a
+/// single-voter group holds the only copy of every write until the others join. That is worth
+/// saying out loud: read as `LEADER` with no other context, founding alone looks like a quorum
+/// rule being skipped.
+///
+/// `target` is PD's replication target (`--replicas`), which is the number that matters on a
+/// fresh cluster: `desired` there is just this node, so it cannot distinguish a complete one-node
+/// cluster from the first node of three. A `target` of 0 means PD did not say (the single-process
+/// PD, or a peer older than wire v18), and then `desired` is all there is to go on.
+///
+/// A target below the voters a region already has — `--replicas` lowered after the fact — is not
+/// under-replication, so it is `None` rather than a negative count.
+pub fn under_replicated_note(voters: &[u64], desired: &[u64], target: usize) -> Option<String> {
+    let want = target.max(desired.len());
+    if voters.len() >= want {
+        return None;
+    }
+    let mut missing: Vec<u64> = desired.iter().copied().filter(|id| !voters.contains(id)).collect();
+    missing.sort_unstable();
+    let waiting = match missing.as_slice() {
+        // Nobody else has registered yet, so PD cannot name who will join — only how many.
+        [] => format!("waiting for {} more node(s) to register", want - voters.len()),
+        ids => format!(
+            "waiting for node{} {} to register",
+            if ids.len() == 1 { "" } else { "s" },
+            ids.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    Some(format!("{} of {want} voters — no redundancy yet; {waiting}", voters.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The case that prompted this: the very first node of a fresh 3-replica cluster. PD lists
+    /// only this node as desired — nobody else has registered — so the target is the only thing
+    /// that says the region is one of three, not one of one.
+    #[test]
+    fn founding_alone_on_a_fresh_cluster_counts_against_the_target() {
+        let note = under_replicated_note(&[1], &[1], 3).expect("under-replicated");
+        assert_eq!(note, "1 of 3 voters — no redundancy yet; waiting for 2 more node(s) to register");
+    }
+
+    #[test]
+    fn known_nodes_are_named() {
+        let note = under_replicated_note(&[1], &[1, 2, 3], 3).expect("under-replicated");
+        assert_eq!(note, "1 of 3 voters — no redundancy yet; waiting for nodes 2, 3 to register");
+    }
+
+    #[test]
+    fn a_partly_grown_region_names_only_what_is_still_missing() {
+        let note = under_replicated_note(&[1, 2], &[1, 2, 3], 3).expect("under-replicated");
+        assert_eq!(note, "2 of 3 voters — no redundancy yet; waiting for node 3 to register");
+    }
+
+    #[test]
+    fn a_full_region_says_nothing() {
+        assert_eq!(under_replicated_note(&[1, 2, 3], &[1, 2, 3], 3), None);
+        // `--replicas 1`: a one-voter region is exactly what was asked for.
+        assert_eq!(under_replicated_note(&[1], &[1], 1), None);
+        // A target lowered below what a region already has is not under-replication.
+        assert_eq!(under_replicated_note(&[1, 2, 3], &[1, 2, 3], 2), None);
+    }
+
+    /// An older PD, or the single-process one, sends no target. `desired` is then the only
+    /// evidence — never a guess that every cluster wants three.
+    #[test]
+    fn no_target_falls_back_to_the_desired_set() {
+        assert_eq!(under_replicated_note(&[1], &[1], 0), None, "no evidence of a bigger cluster");
+        let note = under_replicated_note(&[1], &[1, 2], 0).expect("under-replicated");
+        assert_eq!(note, "1 of 2 voters — no redundancy yet; waiting for node 2 to register");
+    }
 
     #[test]
     fn a_new_node_is_added_as_a_learner_first() {

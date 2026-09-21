@@ -156,6 +156,9 @@ struct Assignment {
     tables: Vec<catalog::Table>,
     nodes: HashMap<u64, String>,
     version: u64,
+    /// How many voters PD grows a region to (`arcux-pd --replicas N`); 0 when PD does not say
+    /// (the single-process one, or a peer older than wire v18).
+    replicas: u32,
 }
 
 /// PD connection used for heartbeats (reporting this node's regions + serving address,
@@ -1059,7 +1062,7 @@ impl AppState {
         let applied = self.applied_catalog_version.load(std::sync::atomic::Ordering::SeqCst);
         let Some(pd) = self.pd.get() else { return Ok(applied) };
 
-        let Assignment { regions: assigned, tables, nodes, version } =
+        let Assignment { regions: assigned, tables, nodes, version, replicas } =
             self.fetch_assignment(pd).await?;
         // Version 0 means PD holds no catalog (a plain PD cluster), and a version we have already
         // applied means this is a replay. Either way there is nothing to adopt.
@@ -1112,6 +1115,19 @@ impl AppState {
                             rs.voters.clone(),
                             self.peers(),
                         )?;
+                        // Founding is once per region per node, so this says it once. Without it
+                        // a solo bootstrap only ever prints `LEADER`, which reads as a quorum
+                        // rule being skipped rather than a group whose configuration is `{1}`.
+                        if let Some(note) = upreplicate::under_replicated_note(
+                            &rs.voters,
+                            &rs.desired,
+                            replicas as usize,
+                        ) {
+                            eprintln!(
+                                "[raft region {id}] node {}: founded with {note}",
+                                self.node_id
+                            );
+                        }
                         // Exactly one voter campaigns, chosen deterministically, so a brand-new
                         // region does not idle out a randomized election timeout before it can
                         // serve. Safe because it has no prior term, no data, and no competing
@@ -1190,6 +1206,7 @@ impl AppState {
                 .collect(),
             nodes: resp.nodes.iter().map(|n| (n.node_id, n.address.clone())).collect(),
             version: resp.catalog_version,
+            replicas: resp.replicas,
         })
     }
 
