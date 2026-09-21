@@ -121,6 +121,11 @@ message HeartbeatResponse {
   // Where to reach every node PD knows about. A region's `voters` are ids; these are the
   // addresses for them, so a node can found a group with peers it was never given at startup.
   repeated NodeAddr nodes = 4;
+  // How many voters PD grows every region to (`arcux-pd --replicas N`). A node cannot derive
+  // this: `desired` is members ∪ live, so on a fresh one-node cluster it is a single id and says
+  // nothing about the target. Sent so a node can report what a region it founds is still short
+  // of. 0 means "unknown" — an older PD, or the single-process one, which places nothing.
+  uint32 replicas = 5;
   reserved 50 to 99;
 }
 

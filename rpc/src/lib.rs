@@ -51,7 +51,12 @@
 /// to, alongside the `voters` it actually has. Regions are founded by the nodes registered when they
 /// are created and grow by membership change as more register, up to a replication target, rather
 /// than every node guessing the voter set at founding from one global list.
-pub const VERSION: u32 = 17;
+/// v18 (replication target): added `replicas` to `pd.HeartbeatResponse` — how many voters PD grows
+/// every region to. `desired` is members ∪ live, so on a fresh one-node cluster it is a single id
+/// and a node cannot tell whether the region it just founded alone is complete or is the first of
+/// three; with the target it can say which. 0 means "unknown" (an older PD, or the single-process
+/// one), and a node then says nothing rather than guessing.
+pub const VERSION: u32 = 18;
 
 /// KV API v1 — the transactional + autocommit surface (fully implemented in Phase 2).
 pub mod kv {
