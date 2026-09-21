@@ -107,7 +107,15 @@ fn topology(
         let port = PD_BASE_PORT + (id as u16) - 1;
         bind = format!("127.0.0.1:{port}").parse()?;
     } else {
-        let listen = listen.ok_or("explicit replicated mode needs --listen")?;
+        // A group of one is the no-flags default, so it must have a default address too —
+        // `arcux-pd` followed by `create table` is the most obvious pair of commands there is.
+        // An explicit topology is the one case that still needs `--listen`: the address a peer
+        // dials is this node's own, and guessing localhost for it would be wrong.
+        let listen = match listen {
+            Some(l) => l,
+            None if peers.is_empty() => format!("127.0.0.1:{PD_BASE_PORT}"),
+            None => return Err("--peer needs this node's own --listen, for peers to reach it".into()),
+        };
         bind = listen.parse()?;
         addrs.insert(id, as_uri(&listen));
         for (pid, addr) in peers {
@@ -149,3 +157,38 @@ Flags:
       --single-process    a TSO + router with no replicated state. Holds no region table, so
                           it cannot carve a table: `create table` is refused against it
   -h, --help              show this help";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `arcux-pd` with no flags at all: a group of one on the default port. This is the first
+    /// command in every walkthrough, and it once failed outright — the replicated path was made
+    /// the default without giving it the default address the help already promised.
+    #[test]
+    fn no_flags_is_a_group_of_one_on_the_default_port() {
+        let (addrs, bind) = topology(1, None, None, Vec::new()).expect("no flags must work");
+        assert_eq!(bind, format!("127.0.0.1:{PD_BASE_PORT}").parse().unwrap());
+        assert_eq!(addrs.len(), 1, "a group of one");
+        assert_eq!(addrs[&1], format!("http://127.0.0.1:{PD_BASE_PORT}"));
+    }
+
+    #[test]
+    fn cluster_derives_a_localhost_topology() {
+        let (addrs, bind) = topology(2, Some(3), None, Vec::new()).unwrap();
+        assert_eq!(bind, format!("127.0.0.1:{}", PD_BASE_PORT + 1).parse().unwrap());
+        assert_eq!(addrs.len(), 3);
+        assert_eq!(addrs[&3], format!("http://127.0.0.1:{}", PD_BASE_PORT + 2));
+    }
+
+    #[test]
+    fn an_explicit_peer_needs_this_node_s_own_listen() {
+        let peers = vec![(2, "http://10.0.0.2:2379".to_string())];
+        assert!(topology(1, None, None, peers.clone()).is_err(), "cannot guess our own address");
+
+        let (addrs, bind) = topology(1, None, Some("10.0.0.1:2379".into()), peers).unwrap();
+        assert_eq!(bind, "10.0.0.1:2379".parse().unwrap());
+        assert_eq!(addrs[&1], "http://10.0.0.1:2379");
+        assert_eq!(addrs[&2], "http://10.0.0.2:2379");
+    }
+}
