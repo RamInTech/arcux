@@ -32,7 +32,7 @@ arcux-server --pd <addr:port> [--data <dir>] [--listen <addr:port>]
 a single node:
   arcux-pd                                     # terminal 1
   arcux-server --pd 127.0.0.1:2379             # terminal 2
-  arcux-client --bin arcux                     # terminal 3
+  arcux                                        # terminal 3 (the shell)
 
 a 3-node cluster (PD assigns the regions and tells each node about the others):
   arcux-pd
