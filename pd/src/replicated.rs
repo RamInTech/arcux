@@ -201,7 +201,10 @@ impl PdFsm {
         self.replicas.store(n.max(1), Ordering::SeqCst);
     }
 
-    fn replicas(&self) -> usize {
+    /// The replication target every region is grown to. Public so the service can send it with
+    /// an assignment: a node measuring a region it founded against `desired` alone cannot tell a
+    /// complete one-node cluster from the first node of three.
+    pub fn replicas(&self) -> usize {
         self.replicas.load(Ordering::SeqCst)
     }
 

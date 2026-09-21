@@ -83,6 +83,8 @@ impl PdService for PdApi {
             catalog_version: 0,
             tables: Vec::new(),
             nodes: Vec::new(),
+            // No region table here, so no placement and no target to report.
+            replicas: 0,
         }))
     }
 

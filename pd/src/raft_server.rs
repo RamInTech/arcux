@@ -115,6 +115,9 @@ impl PdService for ReplicatedPdApi {
                         .iter()
                         .map(|(id, addr)| node_addr_to_proto(*id, addr))
                         .collect(),
+                    // The target a founding node measures itself against: `desired` alone cannot
+                    // say whether a one-voter region is complete or is the first of three.
+                    replicas: fsm.replicas() as u32,
                 }))
             }
             None => Err(self.redirect()),
