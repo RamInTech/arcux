@@ -100,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "use" => match args.get(1).map(String::as_str) {
                 Some("none" | "-") => {
                     current_table = None;
-                    println!("{DIM}cleared — put/get/delete now default to the untabled \"\" (CP) namespace unless given <table> inline{RESET}");
+                    println!("{DIM}cleared — put/get/delete now use the 'default' table (CP) unless given <table> inline{RESET}");
                 }
                 Some(t) => {
                     current_table = Some(t.to_string());
@@ -108,7 +108,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 None => match &current_table {
                     Some(t) => println!("{DIM}current table: {t:?}{RESET}"),
-                    None => println!("{DIM}no table selected — usage: use <table>{RESET}"),
+                    None => println!(
+                        "{DIM}no table selected — commands use 'default'; select another with 'use <table>'{RESET}"
+                    ),
                 },
             },
             _ => {
@@ -205,7 +207,7 @@ fn resolve_endpoints() -> Vec<String> {
 ///
 /// `table` is the `use`-selected session default (see `main`'s `"use"` arm). put/get/delete/scan
 /// accept a table either explicit (`put <table> <key> <value>`, unchanged) or omitted — omitted
-/// resolves to `use`'s selection if any, else the untabled `""` default namespace (always CP),
+/// resolves to `use`'s selection if any, else the built-in `default` table (always CP),
 /// per `default_table` below. The two forms never collide because they differ in arg count.
 async fn dispatch(
     client: &mut Client,
@@ -236,15 +238,11 @@ async fn dispatch(
             let ts = client.delete(default_table(table), key.as_bytes().to_vec()).await?;
             println!("OK  {DIM}commit_ts {ts}{RESET}");
         }
-        ["scan"] => match table {
-            Some(t) => print_pairs(client.scan(t.clone(), vec![], vec![], 0).await?),
-            None => {
-                return Err(
-                    "usage: scan <start> <end> [limit] | scan <table> — or 'use <table>' first for bare 'scan'"
-                        .into(),
-                )
-            }
-        },
+        // A bare `scan` scans the selected table, or `default` when none is selected. It used to
+        // need a selection: the untabled namespace had no contiguous range to scan, because other
+        // tables carved it into pieces. `default` is an ordinary table now, so there is nothing
+        // left to refuse.
+        ["scan"] => print_pairs(client.scan(default_table(table), vec![], vec![], 0).await?),
         ["scan", table_arg] => print_pairs(client.scan(table_arg.to_string(), vec![], vec![], 0).await?),
         ["scan", start, end] => {
             print_pairs(client.scan(default_table(table), start.as_bytes().to_vec(), end.as_bytes().to_vec(), 0).await?)
@@ -255,18 +253,11 @@ async fn dispatch(
                 client.scan(default_table(table), start.as_bytes().to_vec(), end.as_bytes().to_vec(), limit).await?,
             );
         }
-        ["split", key] => {
-            let (l, r) = client.split_region(key.as_bytes().to_vec()).await?;
-            println!("OK  {DIM}split into regions {l} | {r}{RESET}");
-        }
-        ["merge", key] => {
-            let id = client.merge_region(key.as_bytes().to_vec()).await?;
-            println!("OK  {DIM}merged region {id}{RESET}");
-        }
         ["create", "table", name, regime] => {
             let regime = parse_regime(regime)?;
-            let (id, start, end) = client.create_table(name.to_string(), regime).await?;
-            println!("OK  {DIM}region {id} [{}, {}){RESET}", render(&start), render(&end));
+            let (table_id, region, _start, _end) =
+                client.create_table(name.to_string(), regime).await?;
+            println!("OK  {DIM}table {table_id} in region {region}{RESET}");
         }
         ["tables"] => print_tables(client.list_tables().await?),
         [other, ..] => return Err(format!("unknown command {other:?} — try 'help'").into()),
@@ -275,9 +266,9 @@ async fn dispatch(
     Ok(())
 }
 
-/// Resolve the table for an argument-omitted put/get/delete/scan: the `use`-selected default, or
-/// the empty/default namespace `""` (always CP) if none was selected. Never errors — the
-/// beginner-mode contract is that omitting <table> "just works" with zero setup.
+/// Resolve the table for an argument-omitted put/get/delete/scan: the `use`-selected table, or
+/// the built-in `default` table if none was selected. Never errors — the beginner-mode contract
+/// is that omitting <table> "just works" with zero setup.
 /// Parse a `create table`'s regime argument — matches `arcux-server --table`'s parser.
 fn parse_regime(s: &str) -> Result<Regime, String> {
     match s.to_ascii_lowercase().as_str() {
@@ -288,7 +279,7 @@ fn parse_regime(s: &str) -> Result<Regime, String> {
 }
 
 fn default_table(table: &Option<String>) -> String {
-    table.clone().unwrap_or_default()
+    table.clone().unwrap_or_else(|| "default".to_string())
 }
 
 fn print_banner(endpoints: &[String], mode: &str) {
@@ -308,32 +299,27 @@ fn print_help() {
 commands:
   use <table>                        select a default table — then put/get/delete can drop <table>
   use                                show the currently selected table
-  use none                           clear the selection (put/get/delete need <table> again)
+  use none                           clear the selection (put/get/delete fall back to 'default')
   put [<table>] <key> <value>        write a value (autocommit); prints commit_ts
   get [<table>] <key> [read_ts]      read latest, or the MVCC snapshot at read_ts
   delete [<table>] <key>             delete a key (autocommit)
   scan <start> <end> [limit]         range scan [start, end) within a table (empty end = to the
                                       end of that table); table-scoped via 'use' or the default
-  scan <table>                       full-table scan (every key under <table>)
-  scan                               full-table scan of the 'use'-selected table (errors if none
-                                      selected — a bare scan of the whole default store isn't
-                                      supported, since it isn't one contiguous range)
-  split <key>                        split the region owning <key> at <key>
-  merge <key>                        merge the region starting at <key> leftward
-  create table <name> <cp|ap>        declare a new table and host its region live, no restart
-                                      (single-node only; fails if the range already has data)
-  tables                             list the declared tables and each one's CP/AP regime
+  scan <table>                       full-table scan (every key in <table>)
+  scan                               full-table scan of the 'use'-selected table, or of 'default'
+  create table <name> <cp|ap>        create a table and host its region live, no restart
+  tables                             list every table with its id and CP/AP regime
   connect <uri>                      point the shell at a different server
   leader                             show the node currently assumed to be the leader
   help | quit
 
 notes:
-  <table> is optional — omitted, it defaults to the untabled \"\" namespace (always CP);
-  select one with 'use <table>' for advanced multi-table mode
+  <table> is optional — omitted, it means the built-in 'default' table (always CP);
+  select another with 'use <table>'
   'scan <word>' is always a full-table scan by name, even a mistyped single-word range scan
   values with spaces: put ledger greeting \"hello, arcux\"
-  <table> selects CP-vs-AP placement (declared server-side via --table); keys are stored
-  without the table prefix, scoped per table internally
+  <table> selects CP-vs-AP placement, fixed when the table is created; keys are stored under
+  the table's numeric id, and reads give them back to you without it
   cluster mode: set ARCUX_CLUSTER=3 (or a comma-separated ARCUX_ADDR) to auto-follow the leader"
     );
 }
@@ -357,22 +343,20 @@ fn print_pairs(pairs: Vec<(Vec<u8>, Vec<u8>)>) {
     println!("{DIM}{} row(s){RESET}", pairs.len());
 }
 
-/// Print the declared tables and their regimes. The untabled `""` default namespace is never in
-/// the listing (it is reserved, not declarable), so both branches say so — otherwise an empty
-/// listing reads as "there is nowhere to write", which is exactly wrong.
-fn print_tables(tables: Vec<(String, Regime)>) {
-    if tables.is_empty() {
-        println!("{DIM}no tables declared — keys still work in the default namespace (CP){RESET}");
-        println!("{DIM}declare one with 'create table <name> <cp|ap>'{RESET}");
-        return;
-    }
-    let width = tables.iter().map(|(n, _)| n.chars().count()).max().unwrap_or(4).max(4);
-    println!("  {BOLD}{:<width$}  REGIME{RESET}", "NAME", width = width);
-    for (name, regime) in &tables {
+/// Print every table with its id and regime. `default` (id 0) is a real table now, so it is a
+/// row like any other — the listing is never empty, and the footer names it as where a command
+/// with no `<table>` goes.
+fn print_tables(tables: Vec<(u32, String, Regime)>) {
+    let width = tables.iter().map(|(_, n, _)| n.chars().count()).max().unwrap_or(4).max(4);
+    println!("  {BOLD}{:>3}  {:<width$}  REGIME{RESET}", "ID", "NAME", width = width);
+    for (id, name, regime) in &tables {
         let regime = if *regime == Regime::Ap { "AP" } else { "CP" };
-        println!("  {name:<width$}  {regime}", width = width);
+        println!("  {id:>3}  {name:<width$}  {regime}", width = width);
     }
-    println!("{DIM}{} table(s); undeclared keys go to the default namespace (CP){RESET}", tables.len());
+    println!(
+        "{DIM}{} table(s); a command with no <table> uses 'default'{RESET}",
+        tables.len()
+    );
 }
 
 /// Render bytes as UTF-8 if valid, else as a byte-array debug string.
