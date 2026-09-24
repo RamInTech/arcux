@@ -79,6 +79,11 @@ impl Tables {
         self.by_id.get(&id)
     }
 
+    /// The regime a named table was created with, if this node knows the table.
+    pub fn regime_of(&self, name: &str) -> Option<Regime> {
+        self.id_of(name).and_then(|id| self.get(id)).map(|t| t.regime)
+    }
+
     /// Every table, id-ordered — which is also the order their regions tile the keyspace.
     pub fn list(&self) -> Vec<Table> {
         self.by_id.values().cloned().collect()
