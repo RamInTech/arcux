@@ -38,6 +38,23 @@ use crate::convert::{
 };
 use crate::raft_group::{self, PdGroup, PdGroupOptions};
 
+/// The refusal for a heartbeat whose node id already belongs to another data directory.
+fn identity_conflict(node_id: u64, bound: &str) -> Status {
+    Status::already_exists(format!(
+        "node id {node_id} already belongs to another data directory (store {bound}) — a second \
+         process started with -n {node_id}, or a disk reused under it. Every node needs its own -n, \
+         and a replacement disk needs a new one"
+    ))
+}
+
+/// How a regime reads in an error a person will see.
+fn regime_name(regime: crate::Regime) -> &'static str {
+    match regime {
+        crate::Regime::Cp => "CP",
+        crate::Regime::Ap => "AP",
+    }
+}
+
 /// The `PdService` handler for a replicated node. Clones share the same [`PdGroup`].
 #[derive(Clone)]
 pub struct ReplicatedPdApi {
@@ -99,8 +116,20 @@ impl PdService for ReplicatedPdApi {
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let req = request.into_inner();
+        // A node id belongs to one data directory. Refused before proposing, so an impostor's
+        // address never reaches the membership view — where it would redirect every peer's Raft
+        // traffic for that id to a disk that holds none of its log.
+        if let Some(bound) = self.group.fsm().store_conflict(req.node_id, &req.store_id) {
+            return Err(identity_conflict(req.node_id, &bound));
+        }
         let reported = req.regions.iter().map(replica_set_from_proto).collect();
-        match self.group.heartbeat(req.node_id, req.address, reported, now_ms()).await {
+        match self.group.heartbeat(req.node_id, req.address, reported, now_ms(), req.store_id.clone()).await {
+            // Two first heartbeats for one id can race past the check above; `apply` binds the
+            // first, and the loser learns it here.
+            Some(_) if self.group.fsm().store_conflict(req.node_id, &req.store_id).is_some() => {
+                let bound = self.group.fsm().store_conflict(req.node_id, &req.store_id).unwrap_or_default();
+                Err(identity_conflict(req.node_id, &bound))
+            }
             Some(assigned) => {
                 let fsm = self.group.fsm();
                 Ok(Response::new(HeartbeatResponse {
@@ -168,10 +197,13 @@ impl PdService for ReplicatedPdApi {
             return Err(self.redirect());
         }
         let req = request.into_inner();
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument(
-                "create_table: name must not be empty; \"\" is the reserved default namespace",
-            ));
+        if req.name.is_empty() || req.name == crate::DEFAULT_TABLE_NAME {
+            // Both name the built-in `default` table. Refused here, explicitly: `apply` ignores
+            // the declaration, and resolving it afterwards would report a leadership error.
+            return Err(Status::invalid_argument(format!(
+                "create_table: {:?} is reserved — it is the table an omitted table name resolves to",
+                crate::DEFAULT_TABLE_NAME
+            )));
         }
         let regime = regime_from_proto(req.regime);
 
@@ -179,6 +211,18 @@ impl PdService for ReplicatedPdApi {
         else {
             return Err(self.redirect());
         };
+        // A declaration of a name that already exists resolves to the existing table — which is
+        // only the right answer if it has the regime this caller asked for. Two creates of one
+        // name racing with different regimes both reach here; the loser must hear that it lost,
+        // not be told its table exists as requested. A same-regime re-create stays a success, so
+        // a retry after a lost reply gets the answer the first attempt earned.
+        if carved.regime != regime {
+            return Err(Status::already_exists(format!(
+                "table {:?} already exists as {}",
+                req.name,
+                regime_name(carved.regime)
+            )));
+        }
 
         let confirmed = self.push_reconcile(version).await;
         if regime == crate::Regime::Cp && !carved.voters.is_empty() {
@@ -355,7 +399,7 @@ pub async fn serve(
     let data_dir = data_dir.as_ref();
     let group = start_group(node_id, addrs, data_dir)?;
     group.fsm().set_replicas(replicas);
-    let listener = TcpListener::bind(listen).await?;
+    let listener = crate::bind(listen, "arcux-pd").await?;
     eprintln!(
         "arcux-pd (replicated) node {node_id} listening on {} (data {}, {replicas} replicas per region)",
         listener.local_addr()?,
