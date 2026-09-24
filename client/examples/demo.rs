@@ -11,7 +11,7 @@
 //!   cargo run -p arcux-client --example demo                 # defaults to 127.0.0.1:50051
 //!   cargo run -p arcux-client --example demo http://host:port
 
-use arcux_client::{put_mutation, Client};
+use arcux_client::Client;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,12 +26,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("get  greeting           -> {}", render(&got));
 
     // 2. Multi-key transaction (first mutation is the primary) committed atomically.
-    let txn_ts = c
-        .transact(vec![
-            put_mutation(b"acct:alice".to_vec(), b"100".to_vec()),
-            put_mutation(b"acct:bob".to_vec(), b"50".to_vec()),
-        ])
-        .await?;
+    let alice = c.put_mutation("", b"acct:alice".to_vec(), b"100".to_vec()).await?;
+    let bob = c.put_mutation("", b"acct:bob".to_vec(), b"50".to_vec()).await?;
+    let txn_ts = c.transact(vec![alice, bob]).await?;
     println!("txn  {{alice,bob}}            committed @ ts {txn_ts}");
 
     // 3. Read both keys back at the post-commit snapshot.
