@@ -144,9 +144,13 @@ async fn a_table_created_on_one_node_is_usable_through_another() {
     let cluster = Cluster::start().await;
 
     let mut creator = cluster.client(1);
-    let (region_id, start, end) = creator.create_table("orders", Regime::Cp).await.unwrap();
+    let (table_id, region_id, start, end) = creator.create_table("orders", Regime::Cp).await.unwrap();
     assert!(region_id > 0);
-    assert_eq!((start, end), (b"orders/".to_vec(), b"orders0".to_vec()));
+    // The first user table gets id 1 (0 is the built-in `default`), and owns exactly its own id
+    // range — so the region PD carved is `[be32(1), +inf)`, the tail it split off.
+    assert_eq!(table_id, 1);
+    assert_eq!(start, 1u32.to_be_bytes().to_vec());
+    assert!(end.is_empty(), "the newest table runs to +inf");
 
     // The case that was impossible: a client that never spoke to the creating node can use it.
     let mut other = cluster.cluster_client_from(3);
@@ -214,10 +218,11 @@ async fn split_is_rejected_while_pd_owns_the_region_table() {
     cluster.stop().await;
 }
 
-/// `--table` flags still declare tables for a non-PD node; this pins that the PD path did not
-/// change the single-node contract.
+/// A node built in-process with hand-made tables — the shape the protocol tests use — serves
+/// them without PD, and reconciling is a no-op because there is no PD to reconcile against.
+/// Creating a *new* table still needs PD, which allocates the id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_node_without_pd_still_carves_locally() {
+async fn a_node_without_pd_serves_its_tables_but_cannot_create_one() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = open_catalog_node(
         Options::new(dir.path()),
@@ -227,6 +232,12 @@ async fn a_node_without_pd_still_carves_locally() {
         vec![("ledger".to_string(), ServerRegime::Cp)],
     )
     .expect("open_catalog_node");
-    assert_eq!(state.declared_tables().len(), 1);
+
+    let tables = state.declared_tables();
+    assert_eq!(
+        tables.iter().map(|t| (t.id, t.name.as_str())).collect::<Vec<_>>(),
+        vec![(0, "default"), (1, "ledger")],
+        "the built-in default, plus the table this node was built with"
+    );
     assert_eq!(state.reconcile().await.expect("no-op without PD"), 0);
 }
