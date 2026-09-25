@@ -47,3 +47,18 @@ pub use replicated::{PdCmd, PdFsm, PdReplica, Ready};
 pub use server::Pd;
 pub use service::PdApi;
 pub use tso::Tso;
+/// Bind a server's listening socket, turning the one failure an operator hits routinely — the
+/// port is taken, usually by a copy of the same process left running — into a sentence instead
+/// of `Os { code: 48, kind: AddrInUse, … }`. Shared by `arcux-pd` and `arcux-server`.
+pub async fn bind(addr: std::net::SocketAddr, what: &str) -> std::io::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            std::io::Error::new(
+                e.kind(),
+                format!("{addr} is already in use — is another {what} running there?"),
+            )
+        } else {
+            e
+        }
+    })
+}

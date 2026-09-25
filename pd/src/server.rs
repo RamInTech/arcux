@@ -105,7 +105,7 @@ pub async fn serve(
     addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pd = Arc::new(Pd::open(dir)?);
-    let listener = TcpListener::bind(addr).await?;
+    let listener = crate::bind(addr, "arcux-pd").await?;
     eprintln!("arcux-pd listening on {}", listener.local_addr()?);
     serve_on(pd, listener, async {
         let _ = tokio::signal::ctrl_c().await;
