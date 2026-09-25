@@ -1,17 +1,22 @@
-//! arcux Phase 3 — region-aware cluster demo.
+//! arcux — region-aware routing demo.
 //!
-//! Drives a running PD + data node with a routed client: a couple of writes, a region
-//! split, then writes on both sides of the split — the client transparently re-routes.
+//! Drives a running PD + node(s) with a **routed** client: every table is its own region, the
+//! client asks PD which region (and node) owns each key, and one transaction commits atomically
+//! across two of those regions.
 //!
-//! Usage (three terminals):
+//! Usage:
 //!   cargo run -p arcux-pd                                  # PD on :2379
-//!   cargo run -p arcux-server -- --pd 127.0.0.1:2379       # node on :50051, joined to PD
+//!   cargo run -p arcux-server -- --pd 127.0.0.1:2379       # node on :50051
 //!   cargo run -p arcux-client --example cluster            # this demo
 //!
-//! Endpoints come from $ARCUX_ADDR (node, default http://127.0.0.1:50051) and
-//! $ARCUX_PD (PD, default http://127.0.0.1:2379).
+//! Endpoints come from $ARCUX_ADDR (a node, default http://127.0.0.1:50051) and $ARCUX_PD (PD,
+//! default http://127.0.0.1:2379). Safe to run twice: re-creating a table with the regime it
+//! already has is answered with that table.
+
+use std::time::Duration;
 
 use arcux_client::Client;
+use arcux_rpc::kv::Regime;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,27 +25,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("→ node {node}, pd {pd}");
     let mut c = Client::connect_with_pd(node, pd)?;
 
-    // One region covers the whole keyspace; the client routes to it via PD.
-    c.put("", b"apple".to_vec(), b"1".to_vec()).await?;
-    c.put("", b"mango".to_vec(), b"2".to_vec()).await?;
-    println!("put apple, mango         (single whole-keyspace region)");
+    // Each table is one region: `be32(id) ++ key`, so a table's range ends where the next begins.
+    for (name, regime) in [("accounts", Regime::Cp), ("audit", Regime::Cp), ("views", Regime::Ap)] {
+        let (id, region, ..) = c.create_table(name, regime).await?;
+        println!("table {name:<9} id {id}  → region {region}  ({regime:?})");
+    }
 
-    // Split at "m": "apple" now lives in the left region, "mango" in the right.
-    let (left, right) = c.split_region(b"m".to_vec()).await?;
-    println!("split @ \"m\"              -> region {left} [.., \"m\") + region {right} [\"m\", ..)");
+    // A just-founded CP region needs one election (up to ~600ms) before it can serve.
+    put_until_ready(&mut c, "accounts", b"alice", b"100").await?;
+    put_until_ready(&mut c, "audit", b"opened", b"alice").await?;
+    c.put("views", b"home".to_vec(), b"1".to_vec()).await?;
+    println!("put accounts/alice, audit/opened, views/home   (each routed to its own region)");
 
-    // The client still cached the pre-split route, so these writes hit RegionStale,
-    // re-resolve from PD, and retry — transparently to us.
-    c.put("", b"zebra".to_vec(), b"3".to_vec()).await?;
-    c.put("", b"acorn".to_vec(), b"4".to_vec()).await?;
-    println!("put zebra, acorn         (re-routed across the split)");
+    // One transaction, two regions: Percolator prewrites both, then commits the primary key as
+    // the single linearization point. Either both writes are visible or neither is.
+    let muts = vec![
+        c.put_mutation("accounts", b"alice".to_vec(), b"90".to_vec()).await?,
+        c.put_mutation("audit", b"withdraw".to_vec(), b"alice:10".to_vec()).await?,
+    ];
+    let ts = c.transact(muts).await?;
+    println!("txn accounts/alice + audit/withdraw   committed @ {ts}");
 
-    for k in ["acorn", "apple", "mango", "zebra"] {
-        let v = c.get("", k.as_bytes().to_vec()).await?;
-        println!("get {k:<8}            -> {}", render(&v));
+    for (table, key) in [("accounts", "alice"), ("audit", "withdraw"), ("views", "home")] {
+        let v = c.get(table, key.as_bytes().to_vec()).await?;
+        println!("get {table}/{key:<9} -> {}", render(&v));
     }
     println!("✓ cluster demo complete");
     Ok(())
+}
+
+async fn put_until_ready(
+    c: &mut Client,
+    table: &str,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut last = None;
+    for _ in 0..40 {
+        match c.put(table, key.to_vec(), value.to_vec()).await {
+            Ok(_) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(format!("{table} never became writable: {}", last.map(|e| e.to_string()).unwrap_or_default()).into())
 }
 
 fn render(v: &Option<Vec<u8>>) -> String {
