@@ -1,7 +1,7 @@
 //! arcux-server — opens the Phase-1 engine and serves the gRPC API.
 //!
 //! Usage:
-//!   arcux-server --pd <addr:port> [--data <dir>] [--listen <addr:port>]
+//!   arcux-server --pd <addr:port>[,<addr:port>...] [--data <dir>] [--listen <addr:port>]
 //!                [--node-id <n>] [--address <uri>]
 //!
 //! **PD is required.** It holds the catalog, allocates every table's id, carves the one region
@@ -22,7 +22,8 @@ const HELP: &str = "\
 arcux-server --pd <addr:port> [--data <dir>] [--listen <addr:port>]
              [--node-id <n>] [--address <uri>]
 
-      --pd        <addr:port>  the Placement Driver to join (required)
+      --pd        <addr:port>  the Placement Driver to join (required); a comma-separated list
+                               for a replicated PD — the node follows its leader either way
   -d, --data      <dir>        data directory (default ./arcux-data)
   -l, --listen    <addr:port>  bind address (default 127.0.0.1:50051)
   -n, --node-id   <n>          this node's id (default 1)
@@ -53,8 +54,20 @@ fn as_uri(s: &str) -> String {
     }
 }
 
+/// Print a failure as the sentence it is. Returning the error from `main` would print its
+/// `Debug` form — `Custom { kind: AddrInUse, error: "…" }` — around a message written to be read.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("arcux-server: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut data_dir: Option<String> = None;
     let mut listen: Option<String> = None;
     let mut pd: Option<String> = None;
@@ -66,7 +79,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match arg.as_str() {
             "--data" | "-d" => data_dir = Some(args.next().ok_or("--data requires a directory")?),
             "--listen" | "-l" => listen = Some(args.next().ok_or("--listen requires an addr:port")?),
-            "--pd" => pd = Some(as_uri(&args.next().ok_or("--pd requires a PD addr:port")?)),
+            // One address or a comma-separated list; the node follows PD's leader either way.
+            "--pd" => pd = Some(args.next().ok_or("--pd requires a PD addr:port")?),
             "--node-id" | "-n" => {
                 node_id = args
                     .next()
