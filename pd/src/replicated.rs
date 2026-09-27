@@ -43,6 +43,10 @@ use crate::{Membership, PlacedRegion, Regime, Region, ReplicaSet};
 /// Mirrors the single-process oracle's window ([`crate::Tso`]).
 const RESERVE_WINDOW: u64 = 1 << 16;
 
+/// Marks the snapshot's node-store section. ASCII, so it cannot be mistaken for the region
+/// table's leading counter, which is what an older snapshot has in this position.
+const STORES_TAG: &[u8; 8] = b"arcuxSTR";
+
 /// How many voters PD grows each region to, unless `--replicas` says otherwise. TiKV's default.
 pub const DEFAULT_REPLICAS: usize = 3;
 
@@ -68,6 +72,9 @@ pub enum PdCmd {
         address: String,
         regions: Vec<ReplicaSet>,
         now: u64,
+        /// The data directory's store id ([`crate::format::claim_identity`]); empty from a node
+        /// older than wire v19. The first one PD sees for a node id is bound to it for good.
+        store_id: String,
     },
 }
 
@@ -87,7 +94,7 @@ impl PdCmd {
                 put_bytes(&mut out, name.as_bytes());
                 out.push(regime_tag(*regime));
             }
-            PdCmd::Heartbeat { node_id, address, regions, now } => {
+            PdCmd::Heartbeat { node_id, address, regions, now, store_id } => {
                 out.push(2);
                 out.extend_from_slice(&node_id.to_be_bytes());
                 out.extend_from_slice(&now.to_be_bytes());
@@ -96,6 +103,9 @@ impl PdCmd {
                 for rs in regions {
                     put_replica_set(&mut out, rs);
                 }
+                // Last, so an entry written before it existed — already in a durable PD log —
+                // still decodes: nothing follows the regions there, and that reads as "none".
+                put_bytes(&mut out, store_id.as_bytes());
             }
         }
         out
@@ -122,7 +132,12 @@ impl PdCmd {
                 for _ in 0..n {
                     regions.push(get_replica_set(bytes, &mut pos)?);
                 }
-                Some(PdCmd::Heartbeat { node_id, address, regions, now })
+                let store_id = if pos < bytes.len() {
+                    String::from_utf8(get_bytes(bytes, &mut pos)?.to_vec()).ok()?
+                } else {
+                    String::new()
+                };
+                Some(PdCmd::Heartbeat { node_id, address, regions, now, store_id })
             }
             _ => None,
         }
@@ -164,6 +179,10 @@ pub struct PdFsm {
     /// Set once, inside `apply`, when a region is first founded; after that it only **grows**, when
     /// the region's leader reports a larger voter set it has reached by membership change.
     region_members: Mutex<BTreeMap<u64, Vec<u64>>>,
+    /// Each node id's store — the data directory it was first heard from. Bound once, inside
+    /// `apply`, and never rebound: a second process claiming the id, or a disk reused under it,
+    /// is refused rather than allowed to vote as that node.
+    stores: Mutex<BTreeMap<u64, String>>,
     /// The voter count each region is grown toward. Configuration, not replicated state — every
     /// PD replica must be started with the same value, as with its topology.
     replicas: AtomicUsize,
@@ -192,6 +211,7 @@ impl PdFsm {
             // is true only of the single-process PD. This PD has `default` from the start.
             version: AtomicU64::new(1),
             region_members: Mutex::new(BTreeMap::new()),
+            stores: Mutex::new(BTreeMap::new()),
             replicas: AtomicUsize::new(DEFAULT_REPLICAS),
         }
     }
@@ -219,7 +239,14 @@ impl PdFsm {
             PdCmd::ReserveTs { upper } => {
                 self.tso_upper.fetch_max(upper, Ordering::SeqCst);
             }
-            PdCmd::Heartbeat { node_id, address, regions, now } => {
+            PdCmd::Heartbeat { node_id, address, regions, now, store_id } => {
+                // The first store id heard for a node id is bound to it, inside `apply` so every
+                // replica binds the same one. A later heartbeat under that id from a different
+                // store is refused before it is proposed; if two race in, the loser still never
+                // rebinds the id here.
+                if !store_id.is_empty() {
+                    self.stores.lock().expect("stores poisoned").entry(node_id).or_insert(store_id);
+                }
                 let is_new = !self.members.node_addrs().iter().any(|(id, _)| *id == node_id);
                 let grown = self.adopt_grown_voters(node_id, &regions);
                 self.members.heartbeat(node_id, address, regions, now);
@@ -344,6 +371,17 @@ impl PdFsm {
     }
 
     /// PD's catalog version — monotonic, bumped per accepted declaration.
+    /// The store bound to `node_id` if it is **not** `store_id` — i.e. the heartbeat comes from a
+    /// different data directory than the one this node id belongs to. `None` when it matches,
+    /// when the id is not bound yet, or when the heartbeat carries no store id (an older node).
+    pub fn store_conflict(&self, node_id: u64, store_id: &str) -> Option<String> {
+        if store_id.is_empty() {
+            return None;
+        }
+        let stores = self.stores.lock().expect("stores poisoned");
+        stores.get(&node_id).filter(|bound| bound.as_str() != store_id).cloned()
+    }
+
     pub fn catalog_version(&self) -> u64 {
         self.version.load(Ordering::SeqCst)
     }
@@ -446,6 +484,16 @@ impl PdFsm {
                 out.extend_from_slice(&v.to_be_bytes());
             }
         }
+        // Node-id → store bindings, behind a tag: `restore` reads them only if the tag is there,
+        // so a snapshot taken before this section existed — region bytes where the tag would be —
+        // still restores. Before the region table, which takes the rest of the buffer.
+        let stores = self.stores.lock().expect("stores poisoned").clone();
+        out.extend_from_slice(STORES_TAG);
+        out.extend_from_slice(&(stores.len() as u32).to_be_bytes());
+        for (node, store) in &stores {
+            out.extend_from_slice(&node.to_be_bytes());
+            put_bytes(&mut out, store.as_bytes());
+        }
         self.regions.encode_into(&mut out);
         out
     }
@@ -487,9 +535,23 @@ impl PdFsm {
             }
             members.insert(region, voters);
         }
+        let mut stores = BTreeMap::new();
+        if bytes[pos..].starts_with(STORES_TAG) {
+            pos += STORES_TAG.len();
+            let Some(n) = get_u32(bytes, &mut pos) else { return false };
+            for _ in 0..n {
+                let Some(node) = get_u64(bytes, &mut pos) else { return false };
+                let Some(store) = get_bytes(bytes, &mut pos).and_then(|b| String::from_utf8(b.to_vec()).ok())
+                else {
+                    return false;
+                };
+                stores.insert(node, store);
+            }
+        }
         if !self.regions.decode_from(&bytes[pos..]) {
             return false;
         }
+        *self.stores.lock().expect("stores poisoned") = stores;
 
         *self.catalog.lock().expect("catalog poisoned") = catalog;
         *self.region_members.lock().expect("members poisoned") = members;
@@ -811,6 +873,7 @@ mod tests {
                     .map(ReplicaSet::bare)
                     .collect(),
                 now: 1_000,
+                store_id: String::new(),
             }
             .encode(),
         );
@@ -890,6 +953,7 @@ mod tests {
                     .map(ReplicaSet::bare)
                     .collect(),
                 now: 1_000,
+                store_id: String::new(),
             };
             r.propose(&hb).unwrap();
             let _ = r.ready();
@@ -929,12 +993,14 @@ mod tests {
                     .map(ReplicaSet::bare)
                     .collect(),
                 now: 123_456,
+                store_id: String::new(),
             },
             PdCmd::Heartbeat {
                 node_id: 3,
                 address: String::new(),
                 regions: vec![],
                 now: 0,
+                store_id: String::new(),
             },
             // A regime and a replica set on the wire — what a node reports about its regions.
             PdCmd::Heartbeat {
@@ -947,6 +1013,7 @@ mod tests {
                     desired: Vec::new(),
                 }],
                 now: 99,
+                store_id: String::new(),
             },
         ];
         for c in cmds {
@@ -975,6 +1042,7 @@ mod tests {
                     .map(ReplicaSet::bare)
                     .collect(),
                 now: 100,
+                store_id: String::new(),
             }
             .encode(),
         );
@@ -1119,8 +1187,28 @@ mod tests {
             })
             .collect();
         fsm.apply(
-            &PdCmd::Heartbeat { node_id: node, address: format!("http://n{node}"), regions, now: 1 }
-                .encode(),
+            &PdCmd::Heartbeat {
+                node_id: node,
+                address: format!("http://n{node}"),
+                regions,
+                now: 1,
+                store_id: String::new(),
+            }
+            .encode(),
+        );
+    }
+
+    /// A heartbeat from `node` carrying `store` — the data directory it runs on.
+    fn heartbeat_from(fsm: &PdFsm, node: u64, store: &str) {
+        fsm.apply(
+            &PdCmd::Heartbeat {
+                node_id: node,
+                address: format!("http://n{node}"),
+                regions: vec![],
+                now: 1,
+                store_id: store.to_string(),
+            }
+            .encode(),
         );
     }
 
@@ -1227,5 +1315,67 @@ mod tests {
         let b = PdFsm::new();
         assert!(b.restore(&a.snapshot()));
         assert_eq!(default_region(&b).voters, vec![1, 2], "members are not rebuilt by heartbeats");
+    }
+
+    #[test]
+    fn a_node_id_is_bound_to_the_first_store_that_claims_it() {
+        let fsm = PdFsm::new();
+        heartbeat_from(&fsm, 2, "store-a");
+        assert_eq!(fsm.store_conflict(2, "store-a"), None, "its own store is fine");
+        assert_eq!(
+            fsm.store_conflict(2, "store-b"),
+            Some("store-a".to_string()),
+            "a second directory claiming node 2 is a conflict"
+        );
+        // Even if a conflicting heartbeat were applied, the binding never moves.
+        heartbeat_from(&fsm, 2, "store-b");
+        assert_eq!(fsm.store_conflict(2, "store-a"), None, "the first store still owns the id");
+        // An older node sends no store id: nothing to compare, so no conflict either way.
+        assert_eq!(fsm.store_conflict(2, ""), None);
+        assert_eq!(fsm.store_conflict(9, "store-x"), None, "an unbound id is free");
+    }
+
+    #[test]
+    fn store_bindings_survive_a_snapshot() {
+        let a = PdFsm::new();
+        heartbeat_from(&a, 1, "store-1");
+        heartbeat_from(&a, 2, "store-2");
+        let b = PdFsm::new();
+        assert!(b.restore(&a.snapshot()));
+        assert_eq!(b.store_conflict(2, "impostor"), Some("store-2".to_string()));
+        assert_eq!(b.store_conflict(1, "store-1"), None);
+    }
+
+    /// A snapshot written before the store section existed has the region table where the tag
+    /// now sits. It must still restore — a PD upgraded over an existing directory reads it.
+    #[test]
+    fn a_snapshot_from_before_store_bindings_still_restores() {
+        let a = PdFsm::new();
+        heartbeat(&a, 1, vec![]);
+        declare(&a, "orders", Regime::Cp);
+        let mut old = a.snapshot();
+        // Cut the tagged section out: tag + zero-length count.
+        let at = old.windows(STORES_TAG.len()).position(|w| w == STORES_TAG).expect("tag present");
+        old.drain(at..at + STORES_TAG.len() + 4);
+
+        let b = PdFsm::new();
+        assert!(b.restore(&old), "the older layout restores");
+        assert_eq!(b.table_id("orders"), a.table_id("orders"), "and loses nothing it had");
+        assert_eq!(b.store_conflict(1, "anything"), None, "no bindings, so no false conflicts");
+    }
+
+    /// A heartbeat entry already in a durable PD log from before wire v19 carries no store id.
+    #[test]
+    fn a_heartbeat_encoded_without_a_store_id_still_decodes() {
+        let cmd = PdCmd::Heartbeat {
+            node_id: 3,
+            address: "http://n3".into(),
+            regions: vec![],
+            now: 5,
+            store_id: String::new(),
+        };
+        let mut old = cmd.encode();
+        old.truncate(old.len() - 4); // drop the trailing store id's length prefix
+        assert_eq!(PdCmd::decode(&old), Some(cmd), "decodes with an empty store id");
     }
 }

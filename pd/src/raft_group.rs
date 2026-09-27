@@ -43,6 +43,7 @@ enum Cmd {
         address: String,
         regions: Vec<ReplicaSet>,
         now: u64,
+        store_id: String,
         reply: tokio::sync::oneshot::Sender<Option<Vec<ReplicaSet>>>,
     },
     /// Allocate `count` timestamps (`None` if not the leader). Served from the reserved window,
@@ -130,9 +131,10 @@ impl PdGroup {
         address: String,
         regions: Vec<ReplicaSet>,
         now: u64,
+        store_id: String,
     ) -> Option<Vec<ReplicaSet>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = Cmd::Heartbeat { node_id, address, regions, now, reply: tx };
+        let cmd = Cmd::Heartbeat { node_id, address, regions, now, store_id, reply: tx };
         if self.cmd_tx.send(cmd).is_err() {
             return None;
         }
@@ -285,11 +287,11 @@ fn run_actor(
                 replica.step(m);
                 reply = Some((from, tx));
             }
-            Cmd::Heartbeat { node_id, address, regions, now, reply: tx } => {
+            Cmd::Heartbeat { node_id, address, regions, now, store_id, reply: tx } => {
                 if !replica.is_leader() {
                     let _ = tx.send(None);
                 } else {
-                    let cmd = PdCmd::Heartbeat { node_id, address, regions, now };
+                    let cmd = PdCmd::Heartbeat { node_id, address, regions, now, store_id };
                     match replica.propose(&cmd) {
                         Ok(index) => {
                             pending_hb.insert(index, (node_id, tx));
