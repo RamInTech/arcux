@@ -18,8 +18,20 @@ use std::net::SocketAddr;
 /// Base port for `--cluster`: node `i` listens on `PD_BASE_PORT + i - 1`.
 const PD_BASE_PORT: u16 = 2379;
 
+/// Print a failure as the sentence it is. Returning the error from `main` would print its
+/// `Debug` form — `Custom { kind: AddrInUse, error: "…" }` — around a message written to be read.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("arcux-pd: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut data_dir: Option<String> = None;
     let mut listen: Option<String> = None;
     let mut node_id: Option<u64> = None;
@@ -69,6 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let listen = listen.unwrap_or_else(|| format!("127.0.0.1:{PD_BASE_PORT}"));
         let data_dir = data_dir.unwrap_or_else(|| String::from("./arcux-pd-data"));
         arcux_pd::format::check_or_init(&data_dir, "PD data")?;
+        arcux_pd::format::claim_identity(&data_dir, "pd", 1)?;
         let addr: SocketAddr = listen.parse()?;
         return arcux_pd::server::serve(data_dir, addr).await;
     }
@@ -82,6 +95,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Per-node by default, so `-c N` on one host doesn't have three replicas sharing a log.
     let data_dir = data_dir.unwrap_or_else(|| format!("./arcux-pd-n{id}"));
     arcux_pd::format::check_or_init(&data_dir, "PD data")?;
+    // A PD replica's Raft log and votes belong to its id exactly as a data node's do.
+    arcux_pd::format::claim_identity(&data_dir, "pd", id)?;
     arcux_pd::raft_server::serve(id, addrs, bind, &data_dir, replicas).await
 }
 
