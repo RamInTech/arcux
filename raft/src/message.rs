@@ -162,15 +162,20 @@ pub enum MessageBody {
     /// Peer → candidate: the vote decision (`raft.RequestVoteResponse`).
     RequestVoteResp { granted: bool },
     /// Leader → followers: replicate entries / heartbeat (`raft.AppendEntriesRequest`).
+    ///
+    /// `read_round` is the leader's current ReadIndex round, echoed in the response. A read is
+    /// confirmed only by acks of a round at least its own, so an ack of a heartbeat sent before
+    /// the read arrived — which proves nothing about leadership *now* — can never confirm it.
     AppendEntries {
         prev_log_index: u64,
         prev_log_term: u64,
         entries: Vec<Entry>,
         leader_commit: u64,
+        read_round: u64,
     },
-    /// Follower → leader: append result + the follower's new match point
-    /// (`raft.AppendEntriesResponse`).
-    AppendEntriesResp { success: bool, match_index: u64 },
+    /// Follower → leader: append result + the follower's new match point, and the request's
+    /// `read_round` echoed back (`raft.AppendEntriesResponse`).
+    AppendEntriesResp { success: bool, match_index: u64, read_round: u64 },
     /// Leader → follower: install a snapshot of committed state through
     /// `last_included_index`, sent when the leader has already **compacted** the log the
     /// follower still needs (`raft.InstallSnapshotRequest`). `conf_state` carries the group's

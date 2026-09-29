@@ -43,6 +43,10 @@ pub struct Config {
     /// Seed for the per-node election-timeout randomization (kept explicit so
     /// tests are fully deterministic).
     pub seed: u64,
+    /// **CheckQuorum**: a leader that has not heard from a majority of voters within one
+    /// election timeout steps down. Without it, a leader cut off from the others keeps believing
+    /// it leads — accepting writes it can never commit, and parking its callers forever.
+    pub check_quorum: bool,
 }
 
 impl Config {
@@ -55,6 +59,7 @@ impl Config {
             election_timeout: 10,
             heartbeat_timeout: 1,
             seed: id.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            check_quorum: true,
         }
     }
 }
@@ -127,6 +132,23 @@ pub struct RaftNode<S: Storage> {
     transfer_target: Option<u64>,
     transfer_elapsed: u32,
 
+    // CheckQuorum (leader only): voters heard from in this term since the last check, and ticks
+    // since that check.
+    check_quorum: bool,
+    recent_active: BTreeSet<u64>,
+    quorum_elapsed: u32,
+
+    // ReadIndex (leader only). Each read registered bumps `read_round`, and every AppendEntries
+    // carries the current round; `acked_round[v]` is the highest round voter `v` has answered in
+    // this term. A read is confirmed by a majority of acks of its round or later — never by an
+    // ack of a heartbeat sent before it arrived.
+    read_round: u64,
+    acked_round: BTreeMap<u64, u64>,
+    /// `(ctx, round)`, oldest first — rounds only grow, so confirmation is in order.
+    pending_reads: Vec<(u64, u64)>,
+    /// Confirmed `(ctx, read_index)`, drained by `take_read_states`.
+    ready_reads: Vec<(u64, u64)>,
+
     // Outbox, drained by `take_messages`.
     messages: Vec<Message>,
 
@@ -165,6 +187,13 @@ impl<S: Storage> RaftNode<S> {
             rng: cfg.seed | 1,
             transfer_target: None,
             transfer_elapsed: 0,
+            check_quorum: cfg.check_quorum,
+            recent_active: BTreeSet::new(),
+            quorum_elapsed: 0,
+            read_round: 0,
+            acked_round: BTreeMap::new(),
+            pending_reads: Vec::new(),
+            ready_reads: Vec::new(),
             messages: Vec::new(),
             pending_snapshot: None,
         };
@@ -260,6 +289,24 @@ impl<S: Storage> RaftNode<S> {
                     self.heartbeat_elapsed = 0;
                     self.broadcast_append();
                 }
+                // CheckQuorum, once per election timeout: a leader that heard from fewer than a
+                // majority of voters in that window may already have been replaced on the other
+                // side of a partition. It steps down rather than keep taking writes it can never
+                // commit and serving reads that may be stale.
+                self.quorum_elapsed += 1;
+                if self.quorum_elapsed >= self.election_timeout {
+                    self.quorum_elapsed = 0;
+                    let heard = self
+                        .voters
+                        .iter()
+                        .filter(|v| **v == self.id || self.recent_active.contains(v))
+                        .count();
+                    self.recent_active.clear();
+                    if self.check_quorum && heard < self.majority() {
+                        let term = self.current_term;
+                        self.become_follower(term, None);
+                    }
+                }
             }
             Role::Follower | Role::Candidate => {
                 self.election_elapsed += 1;
@@ -292,6 +339,58 @@ impl<S: Storage> RaftNode<S> {
         self.maybe_advance_commit();
         self.broadcast_append();
         Ok(index)
+    }
+
+    /// Register a linearizable read (leader only) under the caller's `ctx`. It is confirmed —
+    /// surfaced by [`take_read_states`](Self::take_read_states) with the index the caller must
+    /// have applied before answering — once a majority of voters has acknowledged a heartbeat
+    /// sent **after** this call, proving this node was still leader when the read arrived.
+    ///
+    /// Serving a read from local state without that proof is how a leader cut off from the
+    /// cluster answered with a value the rest had already overwritten.
+    pub fn read_index(&mut self, ctx: u64) -> Result<(), ProposeError> {
+        if self.role != Role::Leader {
+            return Err(ProposeError::NotLeader);
+        }
+        self.read_round += 1;
+        self.pending_reads.push((ctx, self.read_round));
+        self.broadcast_append(); // carries the new round; no need to wait for the next tick
+        self.advance_reads(); // a single-voter group confirms here
+        Ok(())
+    }
+
+    /// Take the reads confirmed since the last call: `(ctx, read_index)`. The caller answers each
+    /// once it has applied through `read_index`. Reads still pending when this node loses
+    /// leadership are dropped; the caller fails any it is still holding.
+    pub fn take_read_states(&mut self) -> Vec<(u64, u64)> {
+        std::mem::take(&mut self.ready_reads)
+    }
+
+    /// Confirm every pending read whose round a majority has acknowledged — but only once this
+    /// leader has committed an entry of its own term. Before that its `commit_index` may lag the
+    /// previous leader's, and a read at it could miss a write already acknowledged.
+    fn advance_reads(&mut self) {
+        if self.role != Role::Leader
+            || self.pending_reads.is_empty()
+            || self.storage.term(self.commit_index) != Some(self.current_term)
+        {
+            return;
+        }
+        let majority = self.majority();
+        let mut confirmed = 0;
+        for &(ctx, round) in &self.pending_reads {
+            let acks = self
+                .voters
+                .iter()
+                .filter(|v| **v == self.id || self.acked_round.get(v).is_some_and(|r| *r >= round))
+                .count();
+            if acks < majority {
+                break; // rounds only grow: if this one isn't confirmed, no later one is
+            }
+            self.ready_reads.push((ctx, self.commit_index));
+            confirmed += 1;
+        }
+        self.pending_reads.drain(..confirmed);
     }
 
     /// Append a single-server membership change (leader only). `AddLearner` starts
@@ -406,6 +505,7 @@ impl<S: Storage> RaftNode<S> {
                 prev_log_term,
                 entries,
                 leader_commit,
+                read_round,
             } => self.handle_append_entries(
                 msg.from,
                 msg.term,
@@ -413,11 +513,13 @@ impl<S: Storage> RaftNode<S> {
                 prev_log_term,
                 entries,
                 leader_commit,
+                read_round,
             ),
             MessageBody::AppendEntriesResp {
                 success,
                 match_index,
-            } => self.handle_append_resp(msg.from, msg.term, success, match_index),
+                read_round,
+            } => self.handle_append_resp(msg.from, msg.term, success, match_index, read_round),
             MessageBody::InstallSnapshot {
                 last_included_index,
                 last_included_term,
@@ -533,6 +635,11 @@ impl<S: Storage> RaftNode<S> {
         self.heartbeat_elapsed = 0;
         self.transfer_target = None;
         self.transfer_elapsed = 0;
+        self.recent_active.clear();
+        self.quorum_elapsed = 0;
+        self.acked_round.clear();
+        self.pending_reads.clear();
+        self.ready_reads.clear();
         // Assert leadership immediately so followers reset their election timers.
         self.broadcast_append();
     }
@@ -547,6 +654,9 @@ impl<S: Storage> RaftNode<S> {
         self.leader_id = leader;
         self.transfer_target = None;
         self.transfer_elapsed = 0;
+        // A read this node registered as leader cannot be confirmed by it any more.
+        self.pending_reads.clear();
+        self.ready_reads.clear();
         self.reset_election_timer();
     }
 
@@ -603,6 +713,7 @@ impl<S: Storage> RaftNode<S> {
         self.start_election();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_append_entries(
         &mut self,
         from: u64,
@@ -611,6 +722,7 @@ impl<S: Storage> RaftNode<S> {
         prev_log_term: u64,
         entries: Vec<Entry>,
         leader_commit: u64,
+        read_round: u64,
     ) {
         // Reject a leader from an older term.
         if term < self.current_term {
@@ -621,6 +733,7 @@ impl<S: Storage> RaftNode<S> {
                 MessageBody::AppendEntriesResp {
                     success: false,
                     match_index: 0,
+                    read_round,
                 },
             );
             return;
@@ -644,7 +757,7 @@ impl<S: Storage> RaftNode<S> {
             self.send(
                 from,
                 t,
-                MessageBody::AppendEntriesResp { success: true, match_index: base },
+                MessageBody::AppendEntriesResp { success: true, match_index: base, read_round },
             );
             return;
         }
@@ -660,6 +773,7 @@ impl<S: Storage> RaftNode<S> {
                 MessageBody::AppendEntriesResp {
                     success: false,
                     match_index: 0,
+                    read_round,
                 },
             );
             return;
@@ -703,14 +817,27 @@ impl<S: Storage> RaftNode<S> {
             MessageBody::AppendEntriesResp {
                 success: true,
                 match_index: last_new_index,
+                read_round,
             },
         );
     }
 
-    fn handle_append_resp(&mut self, from: u64, term: u64, success: bool, match_index: u64) {
+    fn handle_append_resp(
+        &mut self,
+        from: u64,
+        term: u64,
+        success: bool,
+        match_index: u64,
+        read_round: u64,
+    ) {
         if self.role != Role::Leader || term != self.current_term {
             return; // stale response
         }
+        // Any answer in this term — success or a log mismatch — proves `from` still recognises
+        // this leader: it counts for CheckQuorum, and it acknowledges the round it echoes.
+        self.recent_active.insert(from);
+        let acked = self.acked_round.entry(from).or_insert(0);
+        *acked = (*acked).max(read_round);
         if success {
             let prev = *self.match_index.get(&from).unwrap_or(&0);
             // Reordered responses must never regress a peer's match point.
@@ -729,6 +856,9 @@ impl<S: Storage> RaftNode<S> {
             self.next_index.insert(from, next.saturating_sub(1).max(1));
             self.send_append(from);
         }
+        // After the commit index may have moved: a read waiting on this leader's first entry of
+        // its term can be confirmed by the same response that committed it.
+        self.advance_reads();
     }
 
     /// Follower: install a snapshot the leader sent because it had compacted the entries we
@@ -791,6 +921,7 @@ impl<S: Storage> RaftNode<S> {
         if self.role != Role::Leader || term != self.current_term {
             return; // stale response
         }
+        self.recent_active.insert(from);
         let prev = *self.match_index.get(&from).unwrap_or(&0);
         let m = match_index.max(prev);
         self.match_index.insert(from, m);
@@ -816,6 +947,9 @@ impl<S: Storage> RaftNode<S> {
                     .count();
                 if count >= majority {
                     self.commit_index = n;
+                    // A pending read may have been waiting on this leader's first commit of its
+                    // term — on a one-voter group no response ever arrives to trigger it.
+                    self.advance_reads();
                     return;
                 }
             }
@@ -843,6 +977,7 @@ impl<S: Storage> RaftNode<S> {
         let entries = self.storage.entries(next, last);
         let term = self.current_term;
         let leader_commit = self.commit_index;
+        let read_round = self.read_round;
         self.send(
             to,
             term,
@@ -851,6 +986,7 @@ impl<S: Storage> RaftNode<S> {
                 prev_log_term,
                 entries,
                 leader_commit,
+                read_round,
             },
         );
     }
@@ -1139,6 +1275,7 @@ mod tests {
                 prev_log_term: 0,
                 entries: (1..=5).map(|i| ent(1, i)).collect(),
                 leader_commit: 64,
+                read_round: 0,
             },
         });
         assert_eq!(n.first_index(), 65, "snapshot boundary preserved");
@@ -1147,7 +1284,7 @@ mod tests {
         let ack = n.take_messages();
         assert!(matches!(
             ack.last().map(|m| &m.body),
-            Some(MessageBody::AppendEntriesResp { success: true, match_index: 64 })
+            Some(MessageBody::AppendEntriesResp { success: true, match_index: 64, .. })
         ));
 
         // A stale append that *starts* below the snapshot but extends above it must splice in
@@ -1161,6 +1298,7 @@ mod tests {
                 prev_log_term: 0,
                 entries: (1..=70).map(|i| ent(1, i)).collect(),
                 leader_commit: 70,
+                read_round: 0,
             },
         });
         assert_eq!(n.last_log_index(), 70, "the above-snapshot tail was appended");
