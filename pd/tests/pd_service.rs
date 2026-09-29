@@ -79,6 +79,7 @@ async fn heartbeat_populates_routing() {
         regions,
         address: "http://node1".into(),
         tables: vec![],
+        store_id: String::new(),
     })
         .await
         .unwrap();

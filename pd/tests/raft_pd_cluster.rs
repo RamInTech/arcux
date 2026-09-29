@@ -12,8 +12,8 @@ use arcux_pd::raft_server::{self, DEFAULT_FD_INTERVAL_MS, DEFAULT_FD_TIMEOUT_MS}
 use arcux_pd::PdGroup;
 use arcux_rpc::pd::pd_service_client::PdServiceClient;
 use arcux_rpc::pd::{
-    GetRegionRequest, GetTimestampRequest, HeartbeatRequest, ListTablesRequest, Regime, Region,
-    TableDecl,
+    CreateTableRequest, GetRegionRequest, GetTimestampRequest, HeartbeatRequest, ListTablesRequest,
+    Regime, Region,
 };
 use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
@@ -91,46 +91,70 @@ fn region(id: u64, start: &[u8], end: &[u8], epoch: u64) -> Region {
         address: String::new(),
         regime: Regime::Cp as i32,
         voters: vec![],
+        desired: vec![],
     }
 }
 
-fn decl(name: &str, regime: Regime) -> TableDecl {
-    TableDecl { name: name.to_string(), regime: regime as i32 }
-}
-
-/// PD holds the cluster-wide catalog and can name nodes that disagree about a table's regime.
-/// Nothing else checks that a cluster was started with matching `--table` flags, and a mismatch
-/// is otherwise silent: the nodes tile the keyspace differently and route the same keys to
-/// different regimes.
+/// PD owns the catalog: it allocates each table's id, carves exactly one region for it, and
+/// reports the result. Nodes declare nothing of their own, so there is no cross-node
+/// disagreement left to detect — the conflict list is always empty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pd_reports_the_cluster_catalog_and_flags_disagreeing_nodes() {
+async fn pd_allocates_table_ids_and_reports_its_own_catalog() {
     let mut nodes = start_cluster().await;
     let leader = wait_for_leader(&nodes, &[]).await;
     let mut lc = client(&nodes[leader].addr).await;
 
-    // Two data nodes agree on `ledger` but disagree about `events`.
-    for (node_id, addr, events) in
-        [(7u64, "http://node7", Regime::Ap), (8, "http://node8", Regime::Cp)]
-    {
-        lc.heartbeat(HeartbeatRequest {
-            node_id,
-            regions: vec![],
-            address: addr.into(),
-            tables: vec![decl("ledger", Regime::Cp), decl("events", events)],
-        })
+    // No data node is registered yet, so PD carves with an empty voter set and does not wait for
+    // anyone to confirm hosting. (A cluster with live nodes is covered end to end by
+    // `server/tests/pd_cluster_tables.rs`, which has real nodes to host what PD carves.)
+    let ledger = lc
+        .create_table(CreateTableRequest { name: "ledger".into(), regime: Regime::Cp as i32 })
         .await
-        .unwrap();
-    }
+        .unwrap()
+        .into_inner();
+    let events = lc
+        .create_table(CreateTableRequest { name: "events".into(), regime: Regime::Ap as i32 })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // Ids are handed out in order, above the default table's fixed id 0.
+    assert_eq!((ledger.table_id, events.table_id), (1, 2));
+    // Each table's region is exactly its id range, so no gap can exist between them.
+    let carved = events.region.expect("carved region");
+    assert_eq!(carved.start_key, 2u32.to_be_bytes().to_vec());
+    assert!(carved.end_key.is_empty(), "the newest table runs to +inf");
+    assert!(carved.voters.is_empty(), "no node has registered to vote on it yet");
 
     let resp = lc.list_tables(ListTablesRequest {}).await.unwrap().into_inner();
-    let names: Vec<&str> = resp.tables.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(names, vec!["events", "ledger"], "the union, name-sorted");
+    let listed: Vec<(&str, u32)> =
+        resp.tables.iter().map(|t| (t.name.as_str(), t.id)).collect();
+    assert_eq!(
+        listed,
+        vec![("default", 0), ("events", 2), ("ledger", 1)],
+        "PD's own catalog, name-sorted, including the built-in default"
+    );
+    assert!(resp.conflicts.is_empty(), "nodes declare nothing, so nothing can disagree");
 
-    assert_eq!(resp.conflicts.len(), 1, "only `events` disagrees");
-    let c = &resp.conflicts[0];
-    assert_eq!(c.name, "events");
-    assert_eq!((c.node_id, c.other_node_id), (7, 8), "both nodes are named");
-    assert_ne!(c.regime, c.other_regime);
+    // Once a node registers, the heartbeat carries the catalog and every node address — what
+    // lets a node resolve a table name and reach voters it was never given at startup.
+    let hb = lc
+        .heartbeat(HeartbeatRequest {
+            node_id: 7,
+            regions: vec![],
+            address: "http://node7".into(),
+            tables: vec![],
+            store_id: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(hb.tables.len(), 3, "default + 2 declared");
+    assert_eq!(
+        hb.nodes.iter().map(|n| (n.node_id, n.address.as_str())).collect::<Vec<_>>(),
+        vec![(7, "http://node7")]
+    );
+    assert_eq!(hb.regions.len(), 3, "one region per table, and nothing in between");
 
     // A follower redirects rather than answering with a possibly stale view.
     if let Some(f) = nodes.iter().position(|n| !n.group.is_leader()) {
@@ -172,6 +196,7 @@ async fn pd_cluster_elects_serves_redirects_and_fails_over() {
         regions: vec![region(1, b"", b"m", 1)],
         address: "http://node7".into(),
         tables: vec![],
+        store_id: String::new(),
     })
     .await
     .unwrap();
@@ -210,6 +235,7 @@ async fn pd_cluster_elects_serves_redirects_and_fails_over() {
         regions: vec![region(2, b"m", b"", 1)],
         address: "http://node8".into(),
         tables: vec![],
+        store_id: String::new(),
     })
     .await
     .unwrap();

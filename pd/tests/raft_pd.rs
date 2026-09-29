@@ -123,8 +123,8 @@ fn pd_survives_leader_failover_without_losing_placement_or_regressing_tso() {
             node_id: 7,
             address: "http://node7".into(),
             regions: vec![ReplicaSet::bare(region(1, b"", b"m", 1))],
-            tables: vec![],
             now: 1_000,
+            store_id: String::new(),
         },
     );
 
@@ -180,8 +180,8 @@ fn pd_survives_leader_failover_without_losing_placement_or_regressing_tso() {
             node_id: 8,
             address: "http://node8".into(),
             regions: vec![ReplicaSet::bare(region(2, b"m", b"", 1))],
-            tables: vec![],
             now: 2_000,
+            store_id: String::new(),
         },
     );
     let survivors: Vec<u64> = c.nodes.keys().copied().filter(|id| !c.down.contains(id)).collect();
