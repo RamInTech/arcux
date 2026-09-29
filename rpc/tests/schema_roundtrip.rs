@@ -67,10 +67,19 @@ fn kv_messages_roundtrip() {
     roundtrip(&kv::PrewriteResponse { errors: vec![stale] });
 
     roundtrip(&kv::CreateTableRequest { name: "clicks".into(), regime: kv::Regime::Ap as i32 });
+    roundtrip(&kv::CreateTableResponse {
+        region: Some(kv::RegionInfo {
+            id: 4,
+            start_key: 2u32.to_be_bytes().to_vec(),
+            end_key: 3u32.to_be_bytes().to_vec(),
+            epoch: 1,
+        }),
+        table_id: 2,
+    });
     roundtrip(&kv::ListTablesResponse {
         tables: vec![
-            kv::TableInfo { name: "clicks".into(), regime: kv::Regime::Ap as i32 },
-            kv::TableInfo { name: "ledger".into(), regime: kv::Regime::Cp as i32 },
+            kv::TableInfo { name: "clicks".into(), regime: kv::Regime::Ap as i32, id: 2 },
+            kv::TableInfo { name: "ledger".into(), regime: kv::Regime::Cp as i32, id: 1 },
         ],
     });
 }
@@ -89,6 +98,7 @@ fn pd_messages_roundtrip() {
             address: "http://n1".into(),
             regime: pd::Regime::Cp as i32,
             voters: vec![1, 2, 3],
+            desired: vec![],
         },
         pd::Region {
             id: 2,
@@ -99,6 +109,7 @@ fn pd_messages_roundtrip() {
             address: "http://n2".into(),
             regime: pd::Regime::Cp as i32,
             voters: vec![1, 2, 3],
+            desired: vec![],
         },
     ];
     roundtrip(&pd::ListRegionsResponse { regions: regions.clone() });
@@ -107,19 +118,22 @@ fn pd_messages_roundtrip() {
         regions,
         address: "http://n7".into(),
         tables: vec![],
+        store_id: String::new(),
     });
     roundtrip(&pd::CreateTableResponse {
         region: Some(pd::Region {
             id: 9,
-            start_key: b"orders/".to_vec(),
-            end_key: b"orders0".to_vec(),
+            start_key: 2u32.to_be_bytes().to_vec(),
+            end_key: 3u32.to_be_bytes().to_vec(),
             epoch: 3,
             node_id: 0,
             address: String::new(),
             regime: pd::Regime::Cp as i32,
             voters: vec![1, 2, 3],
+            desired: vec![],
         }),
         catalog_version: 4,
+        table_id: 2,
     });
     roundtrip(&pd::HeartbeatResponse {
         regions: vec![pd::Region {
@@ -130,22 +144,30 @@ fn pd_messages_roundtrip() {
             node_id: 7,
             address: "http://n7".into(),
             regime: pd::Regime::Cp as i32,
-            voters: vec![1, 2, 3],
+            voters: vec![1],
+            desired: vec![1, 2, 3],
         }],
         catalog_version: 2,
-        tables: vec![pd::TableDecl { name: "orders".into(), regime: pd::Regime::Cp as i32 }],
+        tables: vec![pd::TableDecl { name: "orders".into(), regime: pd::Regime::Cp as i32, id: 1 }],
+        nodes: vec![
+            pd::NodeAddr { node_id: 1, address: "http://n1".into() },
+            pd::NodeAddr { node_id: 2, address: "http://n2".into() },
+        ],
+        replicas: 3,
     });
     roundtrip(&pd::HeartbeatRequest {
         node_id: 1,
         regions: vec![],
         address: "http://n1".into(),
         tables: vec![
-            pd::TableDecl { name: "ledger".into(), regime: pd::Regime::Cp as i32 },
-            pd::TableDecl { name: "events".into(), regime: pd::Regime::Ap as i32 },
+            pd::TableDecl { name: "ledger".into(), regime: pd::Regime::Cp as i32, id: 1 },
+            pd::TableDecl { name: "events".into(), regime: pd::Regime::Ap as i32, id: 2 },
         ],
+        // v19: the directory's store id rides every heartbeat.
+        store_id: "0123456789abcdef0123456789abcdef".into(),
     });
     roundtrip(&pd::ListTablesResponse {
-        tables: vec![pd::TableDecl { name: "events".into(), regime: pd::Regime::Ap as i32 }],
+        tables: vec![pd::TableDecl { name: "events".into(), regime: pd::Regime::Ap as i32, id: 2 }],
         conflicts: vec![pd::TableConflict {
             name: "events".into(),
             regime: pd::Regime::Ap as i32,
@@ -167,5 +189,5 @@ fn pd_messages_roundtrip() {
 
 #[test]
 fn version_is_pinned() {
-    assert_eq!(arcux_rpc::VERSION, 15);
+    assert_eq!(arcux_rpc::VERSION, 21);
 }
