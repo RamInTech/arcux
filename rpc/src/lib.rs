@@ -56,7 +56,19 @@
 /// and a node cannot tell whether the region it just founded alone is complete or is the first of
 /// three; with the target it can say which. 0 means "unknown" (an older PD, or the single-process
 /// one), and a node then says nothing rather than guessing.
-pub const VERSION: u32 = 18;
+/// v19 (node identity): added `store_id` to `pd.HeartbeatRequest` — a random token a data
+/// directory is stamped with the first time it is claimed. PD binds the first store id it hears
+/// for a node id and refuses heartbeats from any other, so two processes started with the same
+/// `-n`, or one disk reused under another id, can no longer both vote as that node.
+/// v20 (linearizable reads): added `read_round` to `raft.AppendEntries{Request,Response}`. A
+/// leader now confirms it still leads — a majority acking a heartbeat sent *after* the read
+/// arrived — before serving a read, instead of answering from local state. A leader cut off from
+/// the cluster could otherwise return a value the rest had already replaced.
+/// v21 (undetermined writes): added `undetermined` to `kv.KeyError`. A write already appended to
+/// a leader's log that the leader cannot confirm — it stepped down, or the commit passed its
+/// deadline — is reported as such instead of `NotLeader`, which a client would retry and thereby
+/// risk applying twice.
+pub const VERSION: u32 = 21;
 
 /// KV API v1 — the transactional + autocommit surface (fully implemented in Phase 2).
 pub mod kv {

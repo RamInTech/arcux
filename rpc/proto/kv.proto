@@ -120,6 +120,11 @@ message KeyError {
     string retryable = 4;         // key locked by an in-flight txn => back off & retry
     NotLeader not_leader = 5;     // frozen; not emitted single-node
     RegionStale region_stale = 6; // frozen; not emitted single-node
+    // The write was appended to a leader's log but never confirmed committed: that leader
+    // stepped down, or the commit did not land within its deadline. It may still commit under
+    // the next leader, or be discarded with the old one — so the caller must **not** simply
+    // retry, as it would with NotLeader. Read the key back to find out.
+    string undetermined = 7;
   }
   reserved 50 to 99;
 }

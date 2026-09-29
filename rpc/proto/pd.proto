@@ -104,6 +104,10 @@ message HeartbeatRequest {
   string address = 3;           // this node's serving endpoint (Phase 3b)
   repeated TableDecl tables = 4;  // the tables this node has declared (--table flags plus any
                                   // live CreateTable); empty for a node with no catalog
+  // The data directory's store id, minted the first time the directory is claimed. PD binds the
+  // first one it hears for a node id and refuses a different one, so a second process under the
+  // same id — or a disk reused under it — cannot vote as that node. Empty from an older node.
+  string store_id = 5;
   reserved 50 to 99;
 }
 message HeartbeatResponse {
