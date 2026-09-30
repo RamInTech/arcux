@@ -838,3 +838,132 @@ fn dead_voter_is_replaced_via_learner_then_promotion() {
     }
     c.assert_logs_converged();
 }
+
+// ---------------------------------------------------------------------------
+// CheckQuorum and ReadIndex — a leader must prove it still leads before it serves a read, and
+// must stop leading once it can no longer hear a majority.
+// ---------------------------------------------------------------------------
+
+/// A leader cut off from every follower steps down within one election timeout, instead of
+/// believing it leads — and parking writes it can never commit — until the partition heals.
+#[test]
+fn an_isolated_leader_steps_down_within_an_election_timeout() {
+    let mut c = Cluster::new(&[1, 2, 3]);
+    let leader = c.run_until_leader(80);
+    c.propose(leader, b"x");
+    c.isolate(leader);
+    // The configured election timeout is 10 ticks; a check fires at most that far apart.
+    c.tick_n(21);
+    assert!(!c.nodes[&leader].is_leader(), "isolated node {leader} still thinks it leads");
+    assert_eq!(c.nodes[&leader].leader_id(), None, "and names no leader either");
+}
+
+/// **The stale read.** A leader cut off from the cluster used to answer reads from its own state
+/// while the majority elected a successor and moved on — a client saw `old` after `new` had
+/// committed. Now a read needs a majority to acknowledge a heartbeat sent after it arrived, so
+/// the cut-off leader cannot confirm one, and the real leader can.
+#[test]
+fn a_stale_leader_cannot_confirm_a_read_while_the_new_one_can() {
+    let mut c = Cluster::new(&[1, 2, 3]);
+    let old = c.run_until_leader(80);
+    c.propose(old, b"before");
+    c.isolate(old);
+
+    // Before CheckQuorum has had a chance to depose it, the old leader takes a read.
+    c.nodes.get_mut(&old).unwrap().read_index(1).expect("still leader for now");
+    c.pump();
+    assert!(c.nodes.get_mut(&old).unwrap().take_read_states().is_empty(), "no majority to confirm it");
+
+    // The other two elect a leader, which commits in its own term and confirms a read.
+    let mut new = None;
+    for _ in 0..120 {
+        c.tick();
+        new = c.nodes.iter().find(|(id, n)| **id != old && n.is_leader()).map(|(id, _)| *id);
+        if new.is_some() {
+            break;
+        }
+    }
+    let new = new.expect("the majority elects a leader");
+    c.propose(new, b"after");
+    c.nodes.get_mut(&new).unwrap().read_index(2).expect("leader");
+    c.pump();
+    let confirmed = c.nodes.get_mut(&new).unwrap().take_read_states();
+    assert_eq!(confirmed.len(), 1, "the new leader confirms its read");
+    assert_eq!(confirmed[0], (2, c.commit_index(new)), "at the index it has committed");
+
+    // The old leader's read is never confirmed: it steps down and drops it.
+    c.tick_n(21);
+    assert!(!c.nodes[&old].is_leader());
+    assert!(c.nodes.get_mut(&old).unwrap().take_read_states().is_empty());
+}
+
+/// An acknowledgement of a heartbeat sent **before** a read arrived proves nothing about who
+/// leads now — a newer leader may have been elected in between. Only acks of the read's own
+/// round, or later, may confirm it.
+#[test]
+fn an_ack_of_a_heartbeat_sent_before_the_read_does_not_confirm_it() {
+    let mut c = Cluster::new(&[1, 2, 3]);
+    let leader = c.run_until_leader(80);
+    c.propose(leader, b"x");
+
+    // A heartbeat round goes out and the followers answer it — but the answers are held.
+    c.nodes.get_mut(&leader).unwrap().tick();
+    let beats = c.nodes.get_mut(&leader).unwrap().take_messages();
+    let mut old_acks = Vec::new();
+    for m in beats {
+        let to = m.to;
+        let f = c.nodes.get_mut(&to).unwrap();
+        f.step(m);
+        old_acks.extend(f.take_messages());
+    }
+    assert!(!old_acks.is_empty());
+
+    // Now the read arrives; its own heartbeats are lost.
+    c.nodes.get_mut(&leader).unwrap().read_index(9).expect("leader");
+    let _lost = c.nodes.get_mut(&leader).unwrap().take_messages();
+
+    // The held, older acks arrive. They must not confirm the read.
+    for m in old_acks {
+        c.nodes.get_mut(&leader).unwrap().step(m);
+    }
+    assert!(
+        c.nodes.get_mut(&leader).unwrap().take_read_states().is_empty(),
+        "acks from before the read confirmed it"
+    );
+
+    // The next heartbeat carries the read's round; its acks do confirm it.
+    c.tick();
+    assert_eq!(c.nodes.get_mut(&leader).unwrap().take_read_states().len(), 1);
+}
+
+/// A leader fresh from an election may hold committed entries from the previous term that it
+/// has not committed *itself* yet — its `commit_index` can trail. A read confirmed at that index
+/// could miss an acknowledged write, so reads wait for the leader's first commit of its term.
+#[test]
+fn reads_wait_for_the_leader_to_commit_an_entry_of_its_own_term() {
+    let mut c = Cluster::new(&[1, 2, 3]);
+    let leader = c.run_until_leader(80);
+    // No entry of this term committed yet (the core proposes no election no-op itself).
+    c.nodes.get_mut(&leader).unwrap().read_index(3).expect("leader");
+    c.tick_n(3);
+    assert!(
+        c.nodes.get_mut(&leader).unwrap().take_read_states().is_empty(),
+        "confirmed before the leader committed anything of its term"
+    );
+    c.propose(leader, b"first-of-term");
+    assert_eq!(
+        c.nodes.get_mut(&leader).unwrap().take_read_states(),
+        vec![(3, c.commit_index(leader))],
+        "confirmed as soon as the term's first entry commits"
+    );
+}
+
+/// A single-voter group is its own majority: a read confirms immediately, with no network.
+#[test]
+fn a_single_voter_group_confirms_a_read_at_once() {
+    let mut c = Cluster::new(&[1]);
+    let leader = c.run_until_leader(40);
+    c.propose(leader, b"x");
+    c.nodes.get_mut(&leader).unwrap().read_index(4).expect("leader");
+    assert_eq!(c.nodes.get_mut(&leader).unwrap().take_read_states(), vec![(4, 1)]);
+}
