@@ -53,12 +53,51 @@ const COMPACT_THRESHOLD: u64 = 64;
 /// default 30ms tick).
 const STALL_LOG_TICKS: u32 = 15;
 
+/// Deadlines on the peer-to-peer Raft channel. A frozen peer — stopped, in a long GC pause, on a
+/// stalled disk — accepts the connection and never answers, and the sender spawns a task per
+/// message: without a deadline each one waits forever, one per tick per region, and they only
+/// accumulate. A Raft RPC that has not answered within this is not going to be useful anyway; the
+/// next heartbeat carries the same state.
+const RAFT_RPC_TIMEOUT: Duration = Duration::from_secs(1);
+const RAFT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long a proposal may sit appended-but-uncommitted before its caller is told the outcome
+/// is unknown. Long enough that a slow-but-live majority still commits (fsync spikes reach
+/// hundreds of ms), short enough that no client waits on a partition that is not healing. Before
+/// this, a write on a leader cut off from its majority hung for as long as the partition lasted
+/// — nearly three minutes in a live test.
+const PROPOSAL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Outcome of a leader `propose`.
 #[derive(Debug)]
 pub enum ProposeResult {
     /// The entry committed (a majority persisted it) and applied, with the apply result.
     Applied(Result<(), Error>),
-    /// This node is not the leader; `leader_hint` is its best guess at who is.
+    /// This node is not the leader; `leader_hint` is its best guess at who is. The entry was
+    /// **never appended**, so nothing can come of it — the caller may retry elsewhere freely.
+    NotLeader { leader_hint: Option<u64> },
+    /// The entry was appended to this leader's log but never confirmed committed here — the
+    /// leader stepped down, or [`PROPOSAL_TIMEOUT`] passed. It may still commit under a new
+    /// leader, or be discarded with the old one: the outcome is genuinely unknown, and saying
+    /// "not leader, try again" would invite a caller to apply it twice.
+    Undetermined,
+}
+
+/// A read waiting for this leader to prove it still leads: the index it must have applied, once
+/// the core confirms it.
+struct PendingRead {
+    tx: tokio::sync::oneshot::Sender<ReadResult>,
+    /// Set when the core confirms; the read is answered once `last_applied` reaches it.
+    index: Option<u64>,
+}
+
+/// Outcome of [`RaftGroup::read_index`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadResult {
+    /// This leader is confirmed current: everything committed before the read arrived is
+    /// applied locally, so reading local state now is linearizable.
+    Ready,
+    /// Not the leader (or leadership was lost while confirming) — route to `leader_hint`.
     NotLeader { leader_hint: Option<u64> },
 }
 
@@ -73,6 +112,8 @@ enum Cmd {
     Propose(Vec<u8>, tokio::sync::oneshot::Sender<ProposeResult>),
     /// Leader-only: append a single-server membership change, parking `tx` until it commits.
     ProposeConf(ConfChange, tokio::sync::oneshot::Sender<ProposeResult>),
+    /// Leader-only: confirm this node still leads before a read is served from local state.
+    ReadIndex(tokio::sync::oneshot::Sender<ReadResult>),
     /// Leader-only: hand leadership to a caught-up voter (fire-and-forget; the target's
     /// election deposes this leader). `tx` reports whether the transfer was accepted.
     TransferLeader(u64, tokio::sync::oneshot::Sender<bool>),
@@ -86,10 +127,6 @@ enum Cmd {
 struct Observable {
     role: Role,
     leader_id: Option<u64>,
-    /// `true` once this leader has applied an entry of its **current** term (its election
-    /// no-op). Until then it hasn't re-applied prior-term committed entries, so a read would
-    /// not be linearizable — the read barrier (`readIndex`).
-    read_ready: bool,
     /// The group's current voter set (derived from the log; changes on a committed membership
     /// change). Lets the routing/PD layer observe the replica set.
     voters: Vec<u64>,
@@ -145,12 +182,6 @@ impl RaftGroup {
         self.obs.lock().unwrap().role == Role::Leader
     }
 
-    /// Whether this node is a leader that has applied its current-term no-op, so reads it
-    /// serves are linearizable (it has re-applied every prior committed entry).
-    pub fn read_ready(&self) -> bool {
-        self.obs.lock().unwrap().read_ready
-    }
-
     pub fn leader_id(&self) -> Option<u64> {
         self.obs.lock().unwrap().leader_id
     }
@@ -187,7 +218,13 @@ impl RaftGroup {
                     .lock()
                     .unwrap()
                     .entry(peer)
-                    .or_insert_with(|| RaftServiceClient::new(ep.connect_lazy()));
+                    .or_insert_with(|| {
+                        RaftServiceClient::new(
+                            ep.connect_timeout(RAFT_CONNECT_TIMEOUT)
+                                .timeout(RAFT_RPC_TIMEOUT)
+                                .connect_lazy(),
+                        )
+                    });
             }
             Err(e) => eprintln!("raft: bad peer address {address}: {e}"),
         }
@@ -212,6 +249,21 @@ impl RaftGroup {
             return ProposeResult::NotLeader { leader_hint: None };
         }
         rx.await.unwrap_or(ProposeResult::NotLeader { leader_hint: None })
+    }
+
+    /// Confirm that this node may serve a linearizable read right now: it is the leader, a
+    /// majority has acknowledged a heartbeat sent after this call, and everything committed
+    /// before the read arrived has been applied here.
+    ///
+    /// Reads used to be served by any node that believed it led and had applied its election
+    /// no-op. A leader cut off from the cluster believes that indefinitely, and answered with
+    /// state the rest had already moved past.
+    pub async fn read_index(&self) -> ReadResult {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.cmd_tx.send(Cmd::ReadIndex(tx)).is_err() {
+            return ReadResult::NotLeader { leader_hint: None };
+        }
+        rx.await.unwrap_or(ReadResult::NotLeader { leader_hint: None })
     }
 
     /// Propose a single-server membership change (leader only) and await its commit. Adds or
@@ -300,7 +352,6 @@ pub fn start(opts: GroupOptions) -> RaftGroup {
     let obs = Arc::new(Mutex::new(Observable {
         role: Role::Follower,
         leader_id: None,
-        read_ready: false,
         voters: Vec::new(),
         learners: Vec::new(),
         progress: BTreeMap::new(),
@@ -312,7 +363,14 @@ pub fn start(opts: GroupOptions) -> RaftGroup {
     for (peer, addr) in &opts.peers {
         match Channel::from_shared(addr.clone()) {
             Ok(ep) => {
-                initial.insert(*peer, RaftServiceClient::new(ep.connect_lazy()));
+                initial.insert(
+                    *peer,
+                    RaftServiceClient::new(
+                        ep.connect_timeout(RAFT_CONNECT_TIMEOUT)
+                            .timeout(RAFT_RPC_TIMEOUT)
+                            .connect_lazy(),
+                    ),
+                );
             }
             Err(e) => eprintln!("raft: bad peer address {addr}: {e}"),
         }
@@ -327,10 +385,22 @@ pub fn start(opts: GroupOptions) -> RaftGroup {
     let obs_actor = obs.clone();
     let group_id = opts.group_id;
     let self_id = opts.id;
+    let tick_ms = opts.tick.as_millis().max(1);
     std::thread::Builder::new()
         .name(format!("raft-{}", opts.id))
         .spawn(move || {
-            run_actor(node, group_id, self_id, apply, snapshot, restore, cmd_rx, out_tx, obs_actor)
+            run_actor(
+                node,
+                group_id,
+                self_id,
+                apply,
+                snapshot,
+                restore,
+                cmd_rx,
+                out_tx,
+                obs_actor,
+                tick_ms,
+            )
         })
         .expect("spawn raft actor thread");
 
@@ -383,13 +453,17 @@ fn run_actor(
     cmd_rx: smpsc::Receiver<Cmd>,
     out_tx: tokio::sync::mpsc::UnboundedSender<Message>,
     obs: Arc<Mutex<Observable>>,
+    // The ticker period, so the proposal deadline can be counted in ticks.
+    tick_ms: u128,
 ) {
-    // Pending leader proposals: log index → waiter.
-    let mut pending: BTreeMap<u64, tokio::sync::oneshot::Sender<ProposeResult>> = BTreeMap::new();
+    // Pending leader proposals: log index → (waiter, ticks parked).
+    let mut pending: BTreeMap<u64, (tokio::sync::oneshot::Sender<ProposeResult>, u32)> =
+        BTreeMap::new();
+    // Reads waiting on a leadership confirmation, by the ctx handed to the core.
+    let mut reads: BTreeMap<u64, PendingRead> = BTreeMap::new();
+    let mut next_read_ctx = 0u64;
     // Tracks leadership so we can commit a no-op on each election (see below).
     let mut was_leader = false;
-    // Term of the last entry applied — drives the read barrier (`read_ready`).
-    let mut applied_term = 0u64;
     // Last Raft state we logged, so we announce only genuine transitions (election activity).
     let (mut last_role, mut last_term, mut last_leader) =
         (node.role(), node.current_term(), node.leader_id());
@@ -418,9 +492,21 @@ fn run_actor(
                 node.step(m);
                 reply = Some((from, tx));
             }
+            Cmd::ReadIndex(tx) => {
+                next_read_ctx += 1;
+                let ctx = next_read_ctx;
+                match node.read_index(ctx) {
+                    Ok(()) => {
+                        reads.insert(ctx, PendingRead { tx, index: None });
+                    }
+                    Err(_) => {
+                        let _ = tx.send(ReadResult::NotLeader { leader_hint: node.leader_id() });
+                    }
+                }
+            }
             Cmd::Propose(data, tx) => match node.propose(data) {
                 Ok(index) => {
-                    pending.insert(index, tx);
+                    pending.insert(index, (tx, 0));
                 }
                 Err(_) => {
                     let _ = tx.send(ProposeResult::NotLeader { leader_hint: node.leader_id() });
@@ -428,7 +514,7 @@ fn run_actor(
             },
             Cmd::ProposeConf(cc, tx) => match node.propose_conf_change(cc) {
                 Ok(index) => {
-                    pending.insert(index, tx);
+                    pending.insert(index, (tx, 0));
                 }
                 Err(_) => {
                     let _ = tx.send(ProposeResult::NotLeader { leader_hint: node.leader_id() });
@@ -516,17 +602,14 @@ fn run_actor(
         }
 
         // A snapshot the leader installed on us supersedes the log below its index — load its
-        // state into the engine before applying anything above it. `take_snapshot` also
-        // advances `applied_term` implicitly (the entries it covers are already applied).
+        // state into the engine before applying anything above it.
         if let Some((_idx, data)) = node.take_snapshot() {
             restore(&data);
-            applied_term = node.current_term();
         }
 
         // Apply newly-committed entries in order; answer each one's parked proposer (if we
         // are the leader that proposed it) with the apply outcome.
         for e in node.take_committed() {
-            applied_term = e.term;
             // A config-change entry's membership effect was already applied by the core; the
             // state machine has nothing to run for it (its `data` is a ConfChange, not a
             // command), so skip the apply closure and report success to the proposer.
@@ -535,7 +618,7 @@ fn run_actor(
             } else {
                 apply(&e.data)
             };
-            if let Some(tx) = pending.remove(&e.index) {
+            if let Some((tx, _)) = pending.remove(&e.index) {
                 let _ = tx.send(ProposeResult::Applied(outcome));
             }
         }
@@ -550,13 +633,54 @@ fn run_actor(
             node.compact(index, bytes);
         }
 
-        // If we've lost leadership, fail any still-parked proposals — their entries can no
-        // longer commit on this node.
+        // Confirmed reads: the core has proved this node still leads. Answer each once the
+        // index it was confirmed at has actually been applied here.
+        for (ctx, index) in node.take_read_states() {
+            if let Some(read) = reads.get_mut(&ctx) {
+                read.index = Some(index);
+            }
+        }
+        let applied = node.last_applied();
+        reads.retain(|_, read| match read.index {
+            Some(index) if index <= applied => {
+                let tx = std::mem::replace(&mut read.tx, tokio::sync::oneshot::channel().0);
+                let _ = tx.send(ReadResult::Ready);
+                false
+            }
+            _ => true,
+        });
+
+        // If we've lost leadership, fail any still-parked proposal and any waiting read. A
+        // parked proposal is **undetermined**, not `NotLeader`: its entry is already in this
+        // log and may yet commit under the next leader, so telling the caller to retry
+        // elsewhere would invite the same write twice.
         let role = node.role();
-        if role != Role::Leader && !pending.is_empty() {
+        if role != Role::Leader && (!pending.is_empty() || !reads.is_empty()) {
             let hint = node.leader_id();
-            for (_, tx) in std::mem::take(&mut pending) {
-                let _ = tx.send(ProposeResult::NotLeader { leader_hint: hint });
+            for (_, (tx, _)) in std::mem::take(&mut pending) {
+                let _ = tx.send(ProposeResult::Undetermined);
+            }
+            for (_, read) in std::mem::take(&mut reads) {
+                let _ = read.tx.send(ReadResult::NotLeader { leader_hint: hint });
+            }
+        }
+
+        // A write parked past the deadline: still uncommitted, still this node's leadership as
+        // far as it knows. The caller is told the outcome is unknown rather than left waiting on
+        // a partition that may not heal.
+        if ticked && !pending.is_empty() {
+            let ticks = PROPOSAL_TIMEOUT.as_millis() / tick_ms.max(1);
+            let mut expired = Vec::new();
+            for (index, (_, parked)) in pending.iter_mut() {
+                *parked += 1;
+                if u128::from(*parked) >= ticks {
+                    expired.push(*index);
+                }
+            }
+            for index in expired {
+                if let Some((tx, _)) = pending.remove(&index) {
+                    let _ = tx.send(ProposeResult::Undetermined);
+                }
             }
         }
 
@@ -590,9 +714,6 @@ fn run_actor(
             }
         }
 
-        // A leader is read-ready once it has applied an entry of its current term (its
-        // no-op) — only then has it re-applied every prior committed entry.
-        let read_ready = role == Role::Leader && applied_term == node.current_term();
         // Publish per-peer replication progress (leader only) — the repair driver reads it
         // to decide when a catching-up learner is safe to promote.
         let mut progress = BTreeMap::new();
@@ -606,7 +727,6 @@ fn run_actor(
         *obs.lock().unwrap() = Observable {
             role,
             leader_id: node.leader_id(),
-            read_ready,
             voters: node.voters().to_vec(),
             learners: node.learners().to_vec(),
             progress,
