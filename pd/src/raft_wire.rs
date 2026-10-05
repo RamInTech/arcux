@@ -47,7 +47,13 @@ pub fn vote_request(m: &Message) -> raft::RequestVoteRequest {
 
 pub fn append_request(m: &Message) -> raft::AppendEntriesRequest {
     match &m.body {
-        MessageBody::AppendEntries { prev_log_index, prev_log_term, entries, leader_commit } => {
+        MessageBody::AppendEntries {
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit,
+            read_round,
+        } => {
             raft::AppendEntriesRequest {
                 term: m.term,
                 leader_id: m.from,
@@ -56,6 +62,7 @@ pub fn append_request(m: &Message) -> raft::AppendEntriesRequest {
                 entries: entries.iter().map(entry_to_proto).collect(),
                 leader_commit: *leader_commit,
                 group_id: PD_GROUP_ID,
+                read_round: *read_round,
             }
         }
         _ => unreachable!("append_request on a non-AppendEntries message"),
@@ -118,6 +125,7 @@ pub fn append_request_to_msg(req: &raft::AppendEntriesRequest, self_id: u64) -> 
             prev_log_term: req.prev_log_term,
             entries: req.entries.iter().map(entry_from_proto).collect(),
             leader_commit: req.leader_commit,
+            read_round: req.read_round,
         },
     }
 }
@@ -154,10 +162,15 @@ pub fn vote_response(reply: Option<&Message>) -> raft::RequestVoteResponse {
 
 pub fn append_response(reply: Option<&Message>) -> raft::AppendEntriesResponse {
     match reply.map(|m| (&m.body, m.term)) {
-        Some((MessageBody::AppendEntriesResp { success, match_index }, term)) => {
-            raft::AppendEntriesResponse { term, success: *success, match_index: *match_index }
+        Some((MessageBody::AppendEntriesResp { success, match_index, read_round }, term)) => {
+            raft::AppendEntriesResponse {
+                term,
+                success: *success,
+                match_index: *match_index,
+                read_round: *read_round,
+            }
         }
-        _ => raft::AppendEntriesResponse { term: 0, success: false, match_index: 0 },
+        _ => raft::AppendEntriesResponse { term: 0, success: false, match_index: 0, read_round: 0 },
     }
 }
 
@@ -181,7 +194,11 @@ pub fn append_response_to_msg(resp: &raft::AppendEntriesResponse, peer: u64, sel
         from: peer,
         to: self_id,
         term: resp.term,
-        body: MessageBody::AppendEntriesResp { success: resp.success, match_index: resp.match_index },
+        body: MessageBody::AppendEntriesResp {
+            success: resp.success,
+            match_index: resp.match_index,
+            read_round: resp.read_round,
+        },
     }
 }
 
@@ -227,6 +244,7 @@ mod tests {
                 prev_log_term: 6,
                 entries: vec![Entry::normal(7, 3, b"x".to_vec())],
                 leader_commit: 2,
+                read_round: 5,
             },
         };
         let req = append_request(&out);
@@ -236,7 +254,7 @@ mod tests {
             from: 3,
             to: 1,
             term: 7,
-            body: MessageBody::AppendEntriesResp { success: true, match_index: 3 },
+            body: MessageBody::AppendEntriesResp { success: true, match_index: 3, read_round: 5 },
         };
         let resp = append_response(Some(&reply));
         assert_eq!(append_response_to_msg(&resp, 3, 1), reply);
