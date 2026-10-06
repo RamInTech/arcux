@@ -139,6 +139,9 @@ impl Supervisor {
                     }
                     // Not the leader anymore, or a change is still in flight — retry.
                     ProposeResult::NotLeader { .. } => {}
+                    // Appended but unconfirmed. Safe to retry, unlike a data write: re-adding a
+                    // node that the change already made a voter is a no-op.
+                    ProposeResult::Undetermined => {}
                 }
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
