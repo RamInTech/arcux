@@ -33,14 +33,13 @@ use arcux_pd::{Region, RegionRegistry, Tso};
 use arcux_raft_wal::WalStorage;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::{Channel, Server};
+use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 use arcux_rpc::kv::key_error::Kind;
 use arcux_rpc::kv::kv_service_server::{KvService, KvServiceServer};
 use arcux_rpc::kv::{self, Context, KeyError, NotLeader, RegionInfo, RegionStale};
 use arcux_rpc::pd;
-use arcux_rpc::pd::pd_service_client::PdServiceClient;
 use arcux_rpc::raft::raft_service_server::{RaftService, RaftServiceServer};
 use arcux_rpc::raft;
 
@@ -50,6 +49,8 @@ pub mod catalog;
 pub mod cross_txn;
 pub mod hlc;
 pub mod multiraft;
+pub mod memlock;
+pub mod pd_link;
 pub mod raft_cmd;
 pub mod raft_group;
 pub mod raft_transport;
@@ -60,7 +61,7 @@ use ap::ApReplication;
 use hlc::Hlc;
 use multiraft::{MultiRaft, Regime, RegionPlacement};
 use raft_cmd::Command;
-use raft_group::{ApplyFn, GroupOptions, ProposeResult, RaftGroup, RestoreFn, SnapshotFn};
+use raft_group::{ApplyFn, GroupOptions, ProposeResult, RaftGroup, ReadResult, RestoreFn, SnapshotFn};
 
 /// A logical lease (in TSO ticks) added to `start_ts` to form a lock's expiry. The TSO
 /// is a monotonic counter (not wall-clock), so a generous lease keeps autocommit locks
@@ -77,8 +78,32 @@ const TSO_BATCH: u32 = 256;
 
 /// The node's source of `start_ts`/`commit_ts`/read timestamps. Always called on a
 /// blocking thread (inside `spawn_blocking`), so a PD-backed implementation may block.
+///
+/// Fallible, because the real one is PD: when PD cannot be reached and the reserved window is
+/// spent, there is no timestamp to give — and handing out one from anywhere else would break
+/// the single thing the oracle exists to guarantee, that no two transactions share one.
 pub trait TimestampSource: Send + Sync {
-    fn now(&self) -> u64;
+    fn now(&self) -> Result<u64, TsoUnavailable>;
+}
+
+/// No timestamp could be allocated: PD's oracle is unreachable and this node's reserved window
+/// is exhausted. CP transactions stop; AP writes (HLC-stamped) and reads already served are
+/// unaffected.
+#[derive(Debug)]
+pub struct TsoUnavailable(pub String);
+
+impl std::fmt::Display for TsoUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "timestamp oracle unavailable — CP transactions need PD ({})", self.0)
+    }
+}
+
+impl std::error::Error for TsoUnavailable {}
+
+impl From<TsoUnavailable> for Status {
+    fn from(e: TsoUnavailable) -> Status {
+        Status::unavailable(e.to_string())
+    }
 }
 
 /// An in-process monotonic oracle. Used by the direct single-node path (Phase-2 tests
@@ -98,9 +123,9 @@ impl Default for LocalClock {
 }
 
 impl TimestampSource for LocalClock {
-    fn now(&self) -> u64 {
+    fn now(&self) -> Result<u64, TsoUnavailable> {
         // The ephemeral oracle does no I/O, so this never actually fails.
-        self.0.now().expect("ephemeral tso never fails")
+        Ok(self.0.now().expect("ephemeral tso never fails"))
     }
 }
 
@@ -108,7 +133,7 @@ impl TimestampSource for LocalClock {
 /// window of timestamps per `pd.GetTimestamp` and hands them out locally until it is
 /// exhausted, then refills.
 struct PdClock {
-    pd: PdServiceClient<Channel>,
+    pd: Arc<pd_link::PdLink>,
     /// Runtime handle so the (synchronous) `now()` can drive an async refill. Safe
     /// because `now()` only ever runs on a `spawn_blocking` thread, never a reactor.
     handle: tokio::runtime::Handle,
@@ -117,27 +142,34 @@ struct PdClock {
 }
 
 impl PdClock {
-    fn new(pd: PdServiceClient<Channel>) -> PdClock {
+    fn new(pd: Arc<pd_link::PdLink>) -> PdClock {
         PdClock { pd, handle: tokio::runtime::Handle::current(), window: std::sync::Mutex::new((0, 0)) }
     }
 }
 
 impl TimestampSource for PdClock {
-    fn now(&self) -> u64 {
+    /// The next timestamp from the reserved window, refilling it from PD's leader when spent.
+    /// A refill that cannot reach PD is an error, never a panic and never a local fallback: the
+    /// window already reserved keeps serving, and once it is gone CP transactions wait for PD.
+    fn now(&self) -> Result<u64, TsoUnavailable> {
         let mut w = self.window.lock().expect("pd clock poisoned");
         if w.0 >= w.1 {
-            let mut pd = self.pd.clone();
+            let pd = self.pd.clone();
             let resp = self
                 .handle
-                .block_on(async move { pd.get_timestamp(pd::GetTimestampRequest { count: TSO_BATCH }).await })
-                .expect("pd tso unreachable")
-                .into_inner();
+                .block_on(async move {
+                    pd.call(|mut c| async move {
+                        c.get_timestamp(pd::GetTimestampRequest { count: TSO_BATCH }).await
+                    })
+                    .await
+                })
+                .map_err(|s| TsoUnavailable(s.message().to_string()))?;
             w.0 = resp.timestamp;
             w.1 = resp.timestamp + resp.count as u64;
         }
         let ts = w.0;
         w.0 += 1;
-        ts
+        Ok(ts)
     }
 }
 
@@ -164,7 +196,8 @@ struct Assignment {
 /// PD connection used for heartbeats (reporting this node's regions + serving address,
 /// and adopting the regions PD assigns back).
 struct PdHandle {
-    client: PdServiceClient<Channel>,
+    /// The leader-following connection shared by heartbeats, table creation and the oracle.
+    link: Arc<pd_link::PdLink>,
     node_id: u64,
     /// This node's advertised serving endpoint, handed to clients via PD for per-node
     /// routing (e.g. `"http://127.0.0.1:50051"`).
@@ -195,7 +228,16 @@ pub struct AppState {
     pub engine: Arc<Engine>,
     /// This node's id — used only to label server-side operation logs.
     node_id: u64,
-    clock: Arc<dyn TimestampSource>,
+    /// This data directory's store id ([`arcux_pd::format::claim_identity`]), sent with every
+    /// heartbeat so PD can refuse a second process claiming this node id.
+    store_id: String,
+    /// Fast-path writes this node has proposed and not yet resolved — see [`memlock`]. A read
+    /// whose snapshot includes one waits for it rather than missing it.
+    in_flight: Arc<memlock::InFlight>,
+    /// Where CP timestamps come from. Replaced once, by [`attach_pd`](Self::attach_pd), with PD's
+    /// oracle — every PD-connected node must share that one oracle, or two nodes can hand out the
+    /// same timestamp. Read through [`clock`](Self::clock), which clones one `Arc`.
+    clock: std::sync::RwLock<Arc<dyn TimestampSource>>,
     regions: Arc<RegionRegistry>,
     /// PD connection, set at most once — either at construction ([`open_with_pd`](Self::open_with_pd))
     /// or later via [`attach_pd`](Self::attach_pd), which is how a catalog node joins PD.
@@ -245,12 +287,16 @@ impl AppState {
     /// is the Phase-2 path used by the in-process tests and demos.
     pub fn open(opts: Options) -> arcux_engine::Result<Arc<AppState>> {
         arcux_pd::format::check_or_init(&opts.data_dir, "data").map_err(arcux_engine::Error::from)?;
+        let store_id = arcux_pd::format::claim_identity(&opts.data_dir, "node", 1)
+            .map_err(arcux_engine::Error::from)?;
         let regions = Arc::new(RegionRegistry::open(&opts.data_dir).map_err(arcux_engine::Error::from)?);
         let engine = Arc::new(Engine::open(opts)?);
         Ok(Arc::new(AppState {
             engine,
             node_id: 1,
-            clock: Arc::new(LocalClock::new()),
+            store_id,
+            in_flight: memlock::InFlight::new(),
+            clock: std::sync::RwLock::new(Arc::new(LocalClock::new())),
             regions,
             pd: std::sync::OnceLock::new(),
             hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
@@ -277,18 +323,21 @@ impl AppState {
         address: String,
     ) -> Result<Arc<AppState>, Box<dyn std::error::Error + Send + Sync>> {
         arcux_pd::format::check_or_init(&opts.data_dir, "data")?;
+        let store_id = arcux_pd::format::claim_identity(&opts.data_dir, "node", node_id)?;
         let regions = Arc::new(RegionRegistry::open_empty(&opts.data_dir, node_id)?);
         let engine = Arc::new(Engine::open(opts)?);
-        let client = PdServiceClient::connect(pd_endpoint).await?;
-        let clock: Arc<dyn TimestampSource> = Arc::new(PdClock::new(client.clone()));
+        let link = Arc::new(pd_link::PdLink::parse(&pd_endpoint)?);
+        let clock: Arc<dyn TimestampSource> = Arc::new(PdClock::new(link.clone()));
         // PD is the placement authority on this path: a fresh node starts with no regions and
         // adopts the set PD assigns it (unlike a catalog node — see `attach_pd`).
         let pd_handle = std::sync::OnceLock::new();
-        let _ = pd_handle.set(PdHandle { client, node_id, address, adopt_assignment: true });
+        let _ = pd_handle.set(PdHandle { link, node_id, address, adopt_assignment: true });
         let state = Arc::new(AppState {
             engine,
             node_id,
-            clock,
+            store_id,
+            in_flight: memlock::InFlight::new(),
+            clock: std::sync::RwLock::new(clock),
             regions,
             pd: pd_handle,
             hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
@@ -341,6 +390,9 @@ impl AppState {
         clock: Arc<dyn TimestampSource>,
     ) -> Result<Arc<AppState>, Box<dyn std::error::Error + Send + Sync>> {
         arcux_pd::format::check_or_init(&opts.data_dir, "data")?;
+        // Before anything is opened: a directory that belongs to another node id must not have
+        // its Raft log replayed — let alone voted with — under this one.
+        let store_id = arcux_pd::format::claim_identity(&opts.data_dir, "node", node_id)?;
         let data_dir = opts.data_dir.clone();
         let engine = Arc::new(Engine::open(opts)?);
         // Before the groups: each one's apply closure captures the catalog, to render the stored
@@ -402,7 +454,9 @@ impl AppState {
         Ok(Arc::new(AppState {
             engine,
             node_id,
-            clock,
+            store_id,
+            in_flight: memlock::InFlight::new(),
+            clock: std::sync::RwLock::new(clock),
             regions,
             pd: std::sync::OnceLock::new(),
             hb_interval_ms: std::sync::atomic::AtomicU64::new(DEFAULT_HEARTBEAT_MS),
@@ -854,18 +908,25 @@ impl AppState {
         if !group.is_leader() {
             return Ok((0, Some(not_leader(group.leader_id()))));
         }
-        let clock = self.clock.clone();
+        let clock = self.clock();
+        let stored_key = key.clone();
         let (commit_ts, data) = run_blocking(move || {
-            let start_ts = clock.now();
-            let commit_ts = clock.now();
+            let start_ts = clock.now()?;
+            let commit_ts = clock.now()?;
             let cmd = Command::Autocommit(committed_batch(&key, &value, start_ts, commit_ts));
-            (commit_ts, cmd.encode())
+            Ok::<_, TsoUnavailable>((commit_ts, cmd.encode()))
         })
-        .await?;
+        .await??;
+        // Announce the write before proposing it and until it resolves: this path commits
+        // without a lock, so between here and the entry applying there is nothing else to tell a
+        // reader at `read_ts >= commit_ts` that the write belongs in its snapshot. Missing it is
+        // how a transaction could read stale, write the key, and silently overwrite this put.
+        let _in_flight = self.in_flight.register(stored_key, commit_ts);
         match group.propose(data).await {
             ProposeResult::Applied(Ok(())) => Ok((commit_ts, None)),
             ProposeResult::Applied(Err(e)) => Ok((0, Some(classify_to_key(e)?))),
             ProposeResult::NotLeader { leader_hint } => Ok((0, Some(not_leader(leader_hint)))),
+            ProposeResult::Undetermined => Ok((0, Some(undetermined()))),
         }
     }
 
@@ -891,6 +952,7 @@ impl AppState {
             ProposeResult::Applied(Ok(())) => Ok(None),
             ProposeResult::Applied(Err(e)) => Ok(Some(classify_to_key(e)?)),
             ProposeResult::NotLeader { leader_hint } => Ok(Some(not_leader(leader_hint))),
+            ProposeResult::Undetermined => Ok(Some(undetermined())),
         }
     }
 
@@ -905,8 +967,8 @@ impl AppState {
         if !group.is_leader() {
             return Ok((0, Some(not_leader(group.leader_id()))));
         }
-        let clock = self.clock.clone();
-        let commit_ts = run_blocking(move || clock.now()).await?;
+        let clock = self.clock();
+        let commit_ts = run_blocking(move || clock.now()).await??;
         let cmd = Command::Commit {
             primary: req.primary,
             keys: req.keys,
@@ -917,6 +979,7 @@ impl AppState {
             ProposeResult::Applied(Ok(())) => Ok((commit_ts, None)),
             ProposeResult::Applied(Err(e)) => Ok((0, Some(classify_to_key(e)?))),
             ProposeResult::NotLeader { leader_hint } => Ok((0, Some(not_leader(leader_hint)))),
+            ProposeResult::Undetermined => Ok((0, Some(undetermined()))),
         }
     }
 
@@ -938,6 +1001,7 @@ impl AppState {
             ProposeResult::Applied(Ok(())) => Ok(None),
             ProposeResult::Applied(Err(e)) => Ok(Some(classify_to_key(e)?)),
             ProposeResult::NotLeader { leader_hint } => Ok(Some(not_leader(leader_hint))),
+            ProposeResult::Undetermined => Ok(Some(undetermined())),
         }
     }
 
@@ -953,8 +1017,11 @@ impl AppState {
         start_ts: u64,
         now_ts: u64,
     ) -> Result<kv::CheckTxnStatusResponse, Status> {
-        if !group.read_ready() {
-            return Ok(check_status_err(not_leader(group.leader_id())));
+        // A transaction's fate is the most consequential read there is — the caller acts on it
+        // by rolling the key forward or back — so it waits for the same leadership confirmation
+        // as any other linearizable read.
+        if let ReadResult::NotLeader { leader_hint } = group.read_index().await {
+            return Ok(check_status_err(not_leader(leader_hint)));
         }
         let engine = self.engine.clone();
         let p = primary.clone();
@@ -1029,19 +1096,33 @@ impl AppState {
             return Ok(());
         }
 
+        let req = pd::HeartbeatRequest {
+            node_id: pd.node_id,
+            regions: self.reported_regions(),
+            address: pd.address.clone(),
+            tables: Vec::new(),
+            store_id: self.store_id.clone(),
+        };
         let resp = pd
-            .client
-            .clone()
-            .heartbeat(pd::HeartbeatRequest {
-                node_id: pd.node_id,
-                regions: self.reported_regions(),
-                address: pd.address.clone(),
-                tables: Vec::new(),
+            .link
+            .call(|mut c| {
+                let req = req.clone();
+                async move { c.heartbeat(req).await }
             })
-            .await?
-            .into_inner();
-        let assigned: Vec<Region> =
-            resp.regions.iter().map(arcux_pd::convert::from_proto).collect();
+            .await?;
+        // PD echoes back what this node reported, so a heartbeat that overlaps a local split
+        // carries the *pre-split* epoch. The node is authoritative for its own boundaries (D10),
+        // so never adopt a region at an older epoch than the one held here — it would undo the
+        // split and start accepting writes routed with a stale epoch again.
+        let assigned: Vec<Region> = resp
+            .regions
+            .iter()
+            .map(arcux_pd::convert::from_proto)
+            .map(|r| match self.regions.by_id(r.id) {
+                Some(local) if local.epoch > r.epoch => local,
+                _ => r,
+            })
+            .collect();
         self.regions.adopt(assigned)?;
         Ok(())
     }
@@ -1177,19 +1258,22 @@ impl AppState {
         &self,
         pd: &PdHandle,
     ) -> Result<Assignment, Box<dyn std::error::Error + Send + Sync>> {
+        let req = pd::HeartbeatRequest {
+            node_id: pd.node_id,
+            regions: self.reported_regions(),
+            address: pd.address.clone(),
+            // A node declares no tables of its own: PD owns the catalog, and this field is
+            // what it used to hear from nodes that each had their own `--table` flags.
+            tables: Vec::new(),
+            store_id: self.store_id.clone(),
+        };
         let resp = pd
-            .client
-            .clone()
-            .heartbeat(pd::HeartbeatRequest {
-                node_id: pd.node_id,
-                regions: self.reported_regions(),
-                address: pd.address.clone(),
-                // A node declares no tables of its own: PD owns the catalog, and this field is
-                // what it used to hear from nodes that each had their own `--table` flags.
-                tables: Vec::new(),
+            .link
+            .call(|mut c| {
+                let req = req.clone();
+                async move { c.heartbeat(req).await }
             })
-            .await?
-            .into_inner();
+            .await?;
         Ok(Assignment {
             regions: resp.regions.iter().map(arcux_pd::convert::replica_set_from_proto).collect(),
             tables: resp
@@ -1241,25 +1325,26 @@ impl AppState {
     }
 
 
-    /// Connect a already-open node to PD for **placement reporting only**: it registers, then
-    /// heartbeats its regions and declared tables so PD holds a cluster-wide view and can
-    /// report nodes that disagree about a table's regime.
+    /// Connect an open node to PD: it registers, reconciles its regions against PD's
+    /// assignment on every heartbeat, and from here on takes **every CP timestamp from PD's
+    /// oracle**.
     ///
-    /// Deliberately does **not** adopt PD's answer (see [`PdHandle::adopt_assignment`]) and
-    /// deliberately does not change the timestamp source — this node keeps its local clock.
-    /// Both are what make a catalog node safe to attach today; PD driving placement and serving
-    /// timestamps here are separate changes.
+    /// `pd_endpoint` is one PD address or a comma-separated list (`a:2379,b:2380,c:2381`); the
+    /// link follows PD's leader either way. The clock swap is the point: a node that kept its own
+    /// clock could issue a timestamp another node also issued — observed live, 13 duplicates in
+    /// 800 writes across two nodes — and Percolator identifies a transaction by its `start_ts`.
+    /// (This reverses D35, from when PD was optional; since D53 every node has one.)
     ///
     /// Call this **before** [`serve_on`], which decides then whether to run the periodic
-    /// heartbeat task.
+    /// heartbeat task, and before serving anything, so no timestamp predates the swap.
     pub async fn attach_pd(
         &self,
         pd_endpoint: String,
         address: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let client = PdServiceClient::connect(pd_endpoint).await?;
+        let link = Arc::new(pd_link::PdLink::parse(&pd_endpoint)?);
         let handle = PdHandle {
-            client,
+            link: link.clone(),
             node_id: self.node_id,
             address,
             adopt_assignment: false,
@@ -1267,7 +1352,36 @@ impl AppState {
         if self.pd.set(handle).is_err() {
             return Err("attach_pd: this node is already connected to PD".into());
         }
-        self.heartbeat().await
+        *self.clock.write().expect("clock poisoned") = Arc::new(PdClock::new(link));
+        // PD refusing this node — a node id that belongs to another data directory, say — is an
+        // answer meant for a person, so surface its sentence rather than a debug-printed status.
+        self.heartbeat().await.map_err(|e| match e.downcast::<Status>() {
+            Ok(s) => s.message().to_string().into(),
+            Err(other) => other,
+        })
+    }
+
+    /// Wait out any fast-path write in `[start, end)` that belongs in a read at `read_ts` —
+    /// proposed, not yet applied here. The wait is one Raft round at most in practice; past the
+    /// deadline the caller is told to retry rather than held indefinitely.
+    async fn await_in_flight(&self, start: &[u8], end: &[u8], read_ts: u64) -> Result<(), Status> {
+        if !self.in_flight.blocks_read(start, end, read_ts) {
+            return Ok(());
+        }
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            if !self.in_flight.blocks_read(start, end, read_ts) {
+                return Ok(());
+            }
+        }
+        Err(Status::unavailable(
+            "a write that belongs in this read's snapshot is still in flight — retry",
+        ))
+    }
+
+    /// The timestamp source to use now — PD's oracle once attached. One `Arc` clone.
+    fn clock(&self) -> Arc<dyn TimestampSource> {
+        self.clock.read().expect("clock poisoned").clone()
     }
 
     /// Validate a request's routing context against this node's authoritative regions.
@@ -1290,6 +1404,27 @@ impl AppState {
     }
 }
 
+/// How a regime reads in an error a person will see.
+fn regime_name(regime: Regime) -> &'static str {
+    match regime {
+        Regime::Cp => "CP",
+        Regime::Ap => "AP",
+    }
+}
+
+/// A PD call's failure, passed to the client with PD's own status code — `already_exists`
+/// stays `already_exists` — rather than rewrapped into one opaque code with a transport dump in
+/// its message. A call that never reached PD gets a sentence instead.
+fn pd_status(s: Status) -> Status {
+    // Only a transport failure carries a source error; a status PD itself returned has none.
+    if std::error::Error::source(&s).is_some() {
+        return Status::unavailable(
+            "PD is unreachable — tables can only be created while PD is up",
+        );
+    }
+    Status::new(s.code(), s.message().to_string())
+}
+
 /// Build a `RegionStale` key-error carrying the authoritative epoch hint.
 fn region_stale(new_epoch: u64) -> KeyError {
     KeyError { kind: Some(Kind::RegionStale(RegionStale { new_epoch })) }
@@ -1308,6 +1443,19 @@ fn ap_no_txn() -> Status {
 fn not_leader(leader: Option<u64>) -> KeyError {
     let leader_hint = leader.map(|id| id.to_be_bytes().to_vec()).unwrap_or_default();
     KeyError { kind: Some(Kind::NotLeader(NotLeader { leader_hint })) }
+}
+
+/// Build an `Undetermined` key-error: the write is in a leader's log but its commit was never
+/// confirmed here. Deliberately **not** `NotLeader` — that tells a client to retry elsewhere,
+/// and this write may still commit, so a retry could apply it twice.
+fn undetermined() -> KeyError {
+    KeyError {
+        kind: Some(Kind::Undetermined(
+            "write appended but not confirmed committed — it may or may not have applied; read \
+             the key back to find out"
+                .to_string(),
+        )),
+    }
 }
 
 /// Build a `CheckTxnStatusResponse` for each fate.
@@ -1642,30 +1790,37 @@ impl KvApi {
         let Some(pd) = self.state.pd.get() else {
             return Err(Status::internal("create_table: PD handle vanished"));
         };
+        let req = pd::CreateTableRequest {
+            name: name.clone(),
+            regime: match regime {
+                Regime::Ap => pd::Regime::Ap as i32,
+                Regime::Cp => pd::Regime::Cp as i32,
+            },
+        };
         let resp = pd
-            .client
-            .clone()
-            .create_table(pd::CreateTableRequest {
-                name: name.clone(),
-                regime: match regime {
-                    Regime::Ap => pd::Regime::Ap as i32,
-                    Regime::Cp => pd::Regime::Cp as i32,
-                },
+            .link
+            .call(|mut c| {
+                let req = req.clone();
+                async move { c.create_table(req).await }
             })
             .await
-            .map_err(|e| Status::failed_precondition(format!("create_table via PD: {e}")))?
-            .into_inner();
-
-        // Adopt immediately rather than waiting for PD's push to land on *this* node — the caller
-        // is about to write to the table through this connection. `reconcile` installs the whole
-        // catalog PD sent; the insert below only covers the window where this node's heartbeat
-        // has not come back yet.
-        let _ = self.state.reconcile().await;
-        self.state.tables.insert(catalog::Table { id: resp.table_id, name, regime });
+            .map_err(pd_status)?;
 
         let region = resp
             .region
             .ok_or_else(|| Status::internal("create_table: PD returned no region"))?;
+
+        // Adopt immediately rather than waiting for PD's push to land on *this* node — the caller
+        // is about to write to the table through this connection. `reconcile` installs the whole
+        // catalog PD sent; the insert below only covers the window where this node's heartbeat
+        // has not come back yet. It records the regime **PD reports**, never the one requested:
+        // when a name already existed they differ, and this copy must not say otherwise.
+        let _ = self.state.reconcile().await;
+        let actual = match arcux_pd::convert::regime_from_proto(region.regime) {
+            arcux_pd::Regime::Ap => Regime::Ap,
+            arcux_pd::Regime::Cp => Regime::Cp,
+        };
+        self.state.tables.insert(catalog::Table { id: resp.table_id, name, regime: actual });
         Ok(Response::new(kv::CreateTableResponse {
             region: Some(kv::RegionInfo {
                 id: region.id,
@@ -1701,7 +1856,7 @@ impl KvService for KvApi {
         // start_ts comes from the cluster TSO; allocate on a blocking thread because a
         // PD-backed clock may do a blocking refill.
         let state = self.state.clone();
-        let start_ts = run_blocking(move || state.clock.now()).await?;
+        let start_ts = run_blocking(move || state.clock().now()).await??;
         Ok(Response::new(kv::BeginResponse { start_ts }))
     }
 
@@ -1762,6 +1917,10 @@ impl KvService for KvApi {
             return Ok(Response::new(kv::CommitResponse { commit_ts: 0, error: Some(ke) }));
         }
         let state = self.state.clone();
+        // Allocated before the engine work, and still after this transaction's prewrite (an
+        // earlier RPC), which is the ordering Percolator's commit timestamp needs.
+        let clock = self.state.clock();
+        let commit_ts = run_blocking(move || clock.now()).await??;
         let res = run_blocking(move || {
             // commit only reads each mutation's *key*; values are placeholders. The
             // primary must be mutations[0], so prepend it and skip any dup in `keys`.
@@ -1772,7 +1931,6 @@ impl KvService for KvApi {
                 }
             }
             let txn = Transaction::new(&state.engine, req.start_ts, muts)?;
-            let commit_ts = state.clock.now();
             txn.commit(commit_ts).map(|()| commit_ts)
         })
         .await?;
@@ -1826,11 +1984,15 @@ impl KvService for KvApi {
         // Replicated mode: read on the key's region leader (it has applied every committed
         // write, so the read is linearizable); a follower / unhosted region redirects.
         if self.state.raft.is_some() {
-            // Serve only on a *read-ready* leader (one past its election no-op), so the read
-            // reflects every committed write; otherwise redirect and let the client retry.
+            // Serve only once this leader has **confirmed** it still leads — a majority acking a
+            // heartbeat sent after the read arrived — and has applied everything committed by
+            // then. A leader cut off from the cluster believes it leads indefinitely, and
+            // answering from its own state returned values the rest had already replaced.
             let err = match self.state.group_for(&req.key) {
-                Some(g) if g.read_ready() => None,
-                Some(g) => Some(not_leader(g.leader_id())),
+                Some(g) => match g.read_index().await {
+                    ReadResult::Ready => None,
+                    ReadResult::NotLeader { leader_hint } => Some(not_leader(leader_hint)),
+                },
                 None => Some(region_stale(0)),
             };
             if let Some(error) = err {
@@ -1855,16 +2017,24 @@ impl KvService for KvApi {
         // would bypass Raft), so use the non-resolving read; the direct path resolves.
         let replicated = self.state.raft.is_some();
         let key = req.key.clone(); // retained for structured-lock reporting below
-        // Allocate read_ts and read in one blocking hop so the (possibly PD-backed)
-        // clock is never touched from the reactor, and read_ts is known on every path.
-        let (res, read_ts) = run_blocking(move || {
-            let read_ts = if req.read_ts == 0 { state.clock.now() } else { req.read_ts };
-            let res = if replicated {
+        // The timestamp first, on a blocking thread (a PD-backed oracle may refill), because it
+        // decides which in-flight writes this read must wait for.
+        let read_ts = if req.read_ts == 0 {
+            let clock = self.state.clock();
+            run_blocking(move || clock.now()).await??
+        } else {
+            req.read_ts
+        };
+        // `[key, key+\0)` — this key alone.
+        let mut after = key.clone();
+        after.push(0);
+        self.state.await_in_flight(&key, &after, read_ts).await?;
+        let res = run_blocking(move || {
+            if replicated {
                 state.engine.mvcc_get_unresolved(&req.key, read_ts)
             } else {
                 state.engine.mvcc_get(&req.key, read_ts)
-            };
-            (res, read_ts)
+            }
         })
         .await?;
 
@@ -2006,8 +2176,12 @@ impl KvService for KvApi {
             (true, false)
         } else if self.state.raft.is_some() {
             match self.state.group_for(&req.start_key) {
-                Some(g) if g.read_ready() => (false, false),
-                Some(_) => return Err(Status::unavailable("not the region leader; scan on the leader")),
+                Some(g) => match g.read_index().await {
+                    ReadResult::Ready => (false, false),
+                    ReadResult::NotLeader { .. } => {
+                        return Err(Status::unavailable("not the region leader; scan on the leader"))
+                    }
+                },
                 None => return Err(Status::failed_precondition("region not hosted on this node")),
             }
         } else {
@@ -2015,17 +2189,27 @@ impl KvService for KvApi {
         };
 
         let state = self.state.clone();
+        let read_ts = if use_max_ts {
+            u64::MAX
+        } else if req.read_ts == 0 {
+            let clock = self.state.clock();
+            run_blocking(move || clock.now()).await??
+        } else {
+            req.read_ts
+        };
+        // Same as `get`, over the whole range: a fast-path write inside it that belongs in this
+        // snapshot is not in the engine yet, and the scan would silently skip the row.
+        self.state.await_in_flight(&req.start_key, &req.end_key, read_ts).await?;
         let pairs = run_blocking(move || {
-            let read_ts = if use_max_ts {
-                u64::MAX
-            } else if req.read_ts == 0 {
-                state.clock.now()
-            } else {
-                req.read_ts
-            };
-            state.engine.scan(&req.start_key, &req.end_key, read_ts, req.limit as usize, resolve)
+            Ok::<_, TsoUnavailable>(state.engine.scan(
+                &req.start_key,
+                &req.end_key,
+                read_ts,
+                req.limit as usize,
+                resolve,
+            ))
         })
-        .await?
+        .await??
         .map_err(|e| Status::internal(format!("scan: {e}")))?;
 
         // Strip the id prefix: a client asked for keys in a table and gets back the keys it
@@ -2112,16 +2296,27 @@ impl KvService for KvApi {
                 "create_table: PD allocates table ids, and this node has none — start it with --pd",
             ));
         }
-        if self.state.tables.snapshot().id_of(&req.name).is_some() {
-            return Err(Status::already_exists(format!("table {:?} already exists", req.name)));
+        // A fast local answer for the case this node already knows about. Only a *different*
+        // regime is refused here: a same-regime re-create goes on to PD, which answers it with the
+        // existing table, so a client retrying after a lost reply gets the success it earned.
+        // This copy can lag PD — two creates racing through here both miss — so PD makes the
+        // authoritative check itself.
+        if let Some(existing) = self.state.tables.snapshot().regime_of(&req.name) {
+            if existing != regime {
+                return Err(Status::already_exists(format!(
+                    "table {:?} already exists as {}",
+                    req.name,
+                    regime_name(existing)
+                )));
+            }
         }
         self.create_table_via_pd(req.name, regime).await
     }
 
-    /// List this node's declared tables and their regimes. Node-local, mirroring
-    /// [`create_table`](Self::create_table)'s scope: with no PD-served catalog yet, a table
-    /// created live on another node isn't visible here. Reads in-memory state only — no engine
-    /// or routing work, and nothing to report to PD.
+    /// Every table and its regime, from this node's copy of PD's catalog — so a table created
+    /// through any node appears here once PD's assignment reaches this one (immediately, for the
+    /// node that forwarded the create). Reads in-memory state only — no engine or routing work,
+    /// which is why it skips `run_blocking`.
     async fn list_tables(
         &self,
         _request: Request<kv::ListTablesRequest>,
@@ -2139,7 +2334,7 @@ impl KvService for KvApi {
                 id: t.id,
             })
             .collect();
-        // Sorted, so the listing doesn't leak startup-flag/creation ordering.
+        // Name-sorted, so the listing reads the same whichever node answers it.
         tables.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(Response::new(kv::ListTablesResponse { tables }))
     }
@@ -2264,14 +2459,24 @@ impl KvApi {
     /// task, returning the engine result so callers can map errors uniformly.
     async fn autocommit(&self, m: Mutation) -> Result<Result<u64, Error>, Status> {
         let state = self.state.clone();
-        run_blocking(move || {
-            let start_ts = state.clock.now();
-            let txn = Transaction::new(&state.engine, start_ts, vec![m])?;
-            txn.prewrite(start_ts.saturating_add(AUTOCOMMIT_LEASE))?;
-            let commit_ts = state.clock.now();
-            txn.commit(commit_ts).map(|()| commit_ts)
+        let res = run_blocking(move || -> Result<Result<u64, Error>, TsoUnavailable> {
+            let clock = state.clock();
+            let start_ts = clock.now()?;
+            let txn = match Transaction::new(&state.engine, start_ts, vec![m]) {
+                Ok(t) => t,
+                Err(e) => return Ok(Err(e)),
+            };
+            if let Err(e) = txn.prewrite(start_ts.saturating_add(AUTOCOMMIT_LEASE)) {
+                return Ok(Err(e));
+            }
+            // After the prewrite, as Percolator requires. If the oracle fails here the lock
+            // stays until its lease expires and the next reader rolls it back — the same
+            // recovery as a coordinator that died between the two phases.
+            let commit_ts = clock.now()?;
+            Ok(txn.commit(commit_ts).map(|()| commit_ts))
         })
-        .await
+        .await?;
+        Ok(res?)
     }
 }
 
@@ -2429,7 +2634,7 @@ pub async fn serve(
     addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = AppState::open(opts)?;
-    let listener = TcpListener::bind(addr).await?;
+    let listener = arcux_pd::bind(addr, "arcux-server").await?;
     eprintln!("arcux-server listening on {} (direct mode, no PD)", listener.local_addr()?);
     serve_on(state, listener, shutdown_signal()).await?;
     Ok(())
@@ -2446,7 +2651,7 @@ pub async fn serve_with_pd(
     advertise: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Bind first so the advertised address reflects the real (possibly ephemeral) port.
-    let listener = TcpListener::bind(addr).await?;
+    let listener = arcux_pd::bind(addr, "arcux-server").await?;
     let bound = listener.local_addr()?;
     let address = advertise.unwrap_or_else(|| format!("http://{bound}"));
     let state =
@@ -2475,7 +2680,7 @@ pub async fn serve_catalog(
     advertise: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Bind first so the advertised address reflects the real (possibly ephemeral) port.
-    let listener = TcpListener::bind(addr).await?;
+    let listener = arcux_pd::bind(addr, "arcux-server").await?;
     let bound = listener.local_addr()?;
     let address = advertise.unwrap_or_else(|| format!("http://{bound}"));
 
